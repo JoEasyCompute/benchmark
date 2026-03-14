@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------
+# Config
+# -----------------------------
+ASSETS_DIR="${ASSETS_DIR:-$(pwd)/assets/blender}"
+RESULTS_DIR="${RESULTS_DIR:-${ASSETS_DIR}/results}"
+KERNEL_CACHE="${HOME}/.cache/cycles/kernels"
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+
+BMW_ZIP_URL="https://download.blender.org/demo/test/BMW27.blend.zip"
+CLASSROOM_ZIP_URL="https://download.blender.org/demo/test/classroom.zip"
+
+BMW_ZIP="${ASSETS_DIR}/BMW27.blend.zip"
+BMW_BLEND="${ASSETS_DIR}/BMW27.blend"
+
+CLASSROOM_ZIP="${ASSETS_DIR}/classroom.zip"
+CLASSROOM_DIR="${ASSETS_DIR}/classroom"
+CLASSROOM_BLEND="${CLASSROOM_DIR}/classroom.blend"
+
+# Dependencies we use
+NEEDED=(curl unzip)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+need_deps() {
+  for d in "${NEEDED[@]}"; do
+    command -v "$d" >/dev/null 2>&1 || { echo "[ERROR] Missing dependency: $d"; exit 1; }
+  done
+}
+
+ensure_dirs() {
+  mkdir -p "$ASSETS_DIR" "$RESULTS_DIR"
+}
+
+download_if_missing() {
+  # BMW27
+  if [[ ! -f "$BMW_BLEND" ]]; then
+    echo "[INFO] Downloading BMW27 scene..."
+    curl -L "$BMW_ZIP_URL" -o "$BMW_ZIP"
+    echo "[INFO] Extracting BMW27..."
+    unzip -o "$BMW_ZIP" -d "$ASSETS_DIR" >/dev/null
+    rm -f "$BMW_ZIP"
+  fi
+
+  # Classroom
+  if [[ ! -f "$CLASSROOM_BLEND" ]]; then
+    echo "[INFO] Downloading Classroom scene..."
+    curl -L "$CLASSROOM_ZIP_URL" -o "$CLASSROOM_ZIP"
+    echo "[INFO] Extracting Classroom..."
+    unzip -o "$CLASSROOM_ZIP" -d "$ASSETS_DIR" >/dev/null
+    rm -f "$CLASSROOM_ZIP"
+  fi
+
+  [[ -f "$BMW_BLEND" ]] || { echo "[WARN] Scene not found, skipping: $BMW_BLEND"; }
+  [[ -f "$CLASSROOM_BLEND" ]] || { echo "[WARN] Scene not found, skipping: $CLASSROOM_BLEND"; }
+}
+
+# Force CUDA GPU in Cycles via Python expression.
+# Blender 4.0 on Ubuntu repo has ('NONE','CUDA','HIP') — no OPTIX in this build.
+PY_GPU_EXPR=$'import bpy\n'\
+$'p=bpy.context.preferences.addons["cycles"].preferences\n'\
+$'p.compute_device_type="CUDA"\n'\
+$'p.get_devices()\n'\
+$'# enable only CUDA devices, disable CPU\n'\
+$'cuda_found=False\n'\
+$'for d in p.devices:\n'\
+$'    d.use = (d.type=="CUDA")\n'\
+$'    if d.type=="CUDA": cuda_found=True\n'\
+$'bpy.context.scene.cycles.device="GPU"\n'\
+$'print("compute_device_type=", p.compute_device_type)\n'\
+$'print("scene_device=", bpy.context.scene.cycles.device)\n'\
+$'print("devices=", [(d.type,d.name,d.use) for d in p.devices])\n'\
+$'import sys\n'\
+$'sys.stderr.write("\\n[PYCHK] CUDA_ENABLED=" + str(cuda_found) + "\\n")\n'
+
+run_one() {
+  local blend="$1"
+  local tag="$2"       # e.g. BMW27 or classroom
+  local label="$3"     # Cold or Warm
+
+  # We capture stdout+stderr to a temp file to both parse and show summary.
+  local log; log="$(mktemp)"
+  local outpat="${RESULTS_DIR}/${tag}_####"
+
+  # time in seconds (using bash builtins for portability)
+  local t0 t1 dt
+  t0=$(date +%s.%N)
+
+  "${BLENDER_BIN}" -b "${blend}" -E CYCLES \
+    --python-expr "${PY_GPU_EXPR}" \
+    -o "${outpat}" -f 1 >"${log}" 2>&1 || {
+      echo "[ERROR] Blender render failed for ${tag} (${label}). See log: ${log}"
+      cat "${log}"
+      exit 1
+    }
+
+  t1=$(date +%s.%N)
+  # Calculate elapsed with awk to avoid bc dependency
+  dt=$(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1 - t0)}')
+
+  # Basic GPU sanity checks
+  local used_cuda="no"
+  grep -q "CUDA kernel" "${log}" && used_cuda="yes"
+  grep -q "\[PYCHK\] CUDA_ENABLED=True" "${log}" && used_cuda="yes"
+
+  # Summarize
+  local img
+  img=$(grep -Eo "Saved: '.*\.png'" "${log}" | sed -E "s/^Saved: '(.*)'/\1/" | tail -n1)
+  echo "[TIME] ${tag} (${label}): ${dt}s, image: ${img:-<not found>}, GPU:${used_cuda}"
+
+  # Warn if CPU kernels were used
+  if grep -qi "Using AVX2 CPU kernels" "${log}"; then
+    echo "[WARN] Blender reported CPU kernels. GPU may not have been used. See log: ${log}"
+  else
+    rm -f "${log}"
+  fi
+
+  # Return timing via global var
+  echo "${dt}"
+}
+
+bench_scene() {
+  local blend="$1" tag="$2"
+
+  [[ -f "$blend" ]] || { echo "[SKIP] ${tag}: blend file not found (${blend})"; return; }
+
+  echo "[RUN] ${tag}: clearing Cycles kernel cache for a cold run ..."
+  rm -rf "${KERNEL_CACHE}"
+
+  echo "[RUN] ${tag}: Cold render (includes CUDA kernel compilation) ..."
+  local cold; cold=$(run_one "$blend" "$tag" "Cold")
+
+  echo "[RUN] ${tag}: Warm render (cached kernels) ..."
+  local warm; warm=$(run_one "$blend" "$tag" "Warm")
+
+  # Estimate kernel compile time
+  local compile
+  compile=$(awk -v c="$cold" -v w="$warm" 'BEGIN{d=c-w; if(d<0)d=0; printf "%.2f", d}')
+  echo "[REPORT] ${tag}: cold=${cold}s, warm=${warm}s, ~kernel_compile=${compile}s"
+}
+
+# -----------------------------
+# Main
+# -----------------------------
+need_deps
+ensure_dirs
+download_if_missing
+
+any=0
+if [[ -f "$BMW_BLEND" ]]; then
+  bench_scene "$BMW_BLEND" "BMW27"
+  any=1
+fi
+if [[ -f "$CLASSROOM_BLEND" ]]; then
+  bench_scene "$CLASSROOM_BLEND" "classroom"
+  any=1
+fi
+
+if [[ "$any" -eq 0 ]]; then
+  echo "[SKIP] No .blend scenes available."
+  exit 0
+fi
+
+echo "[OK] Blender benchmark finished."
+

@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# Config & paths
+# =========================
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ASSETS_DIR="$ROOT_DIR/assets/blender"
+RESULTS_DIR="$ASSETS_DIR/results"
+mkdir -p "$RESULTS_DIR"
+
+# Blender binary selection (override with: export BLENDER_BIN=/path/to/blender)
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+
+# Scenes and locations
+BMW_ZIP_URL="https://download.blender.org/demo/test/BMW27.blend.zip"
+CLASSROOM_ZIP_URL="https://download.blender.org/demo/test/classroom.zip"
+
+BMW_BLEND="$ASSETS_DIR/BMW27.blend"
+CLASSROOM_DIR="$ASSETS_DIR/classroom"
+CLASSROOM_BLEND="$CLASSROOM_DIR/classroom.blend"
+
+# Controls
+SKIP_COLD="${SKIP_COLD:-0}"          # set SKIP_COLD=1 to skip cold timings
+OUT_JSON="$RESULTS_DIR/bench_results.json"
+
+# =========================
+# Helpers
+# =========================
+need() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] Missing dependency: $1" >&2; exit 1; }; }
+
+ensure_deps() {
+  need curl
+  need unzip
+  need tar
+}
+
+ensure_blender() {
+  if ! command -v "$BLENDER_BIN" >/dev/null 2>&1; then
+    echo "[ERROR] Blender not found. Set BLENDER_BIN to a 4.2+ binary or add it to PATH." >&2
+    exit 1
+  fi
+}
+
+download_scenes() {
+  mkdir -p "$ASSETS_DIR"
+  # BMW27
+  if [ ! -f "$BMW_BLEND" ]; then
+    echo "[INFO] Downloading BMW27 scene..."
+    TMP_ZIP="$ASSETS_DIR/BMW27.blend.zip"
+    curl -L --fail -o "$TMP_ZIP" "$BMW_ZIP_URL"
+    echo "[INFO] Extracting BMW27..."
+    unzip -o "$TMP_ZIP" -d "$ASSETS_DIR" >/dev/null
+    rm -f "$TMP_ZIP"
+  fi
+  # Classroom
+  if [ ! -f "$CLASSROOM_BLEND" ]; then
+    echo "[INFO] Downloading Classroom scene..."
+    TMP_ZIP="$ASSETS_DIR/classroom.zip"
+    curl -L --fail -o "$TMP_ZIP" "$CLASSROOM_ZIP_URL"
+    echo "[INFO] Extracting Classroom..."
+    mkdir -p "$CLASSROOM_DIR"
+    unzip -o "$TMP_ZIP" -d "$CLASSROOM_DIR" >/dev/null
+    rm -f "$TMP_ZIP"
+    # Try to locate the .blend if the archive created nested folders.
+    if [ ! -f "$CLASSROOM_BLEND" ]; then
+      alt="$(find "$CLASSROOM_DIR" -maxdepth 3 -type f -name 'classroom.blend' | head -n1 || true)"
+      if [ -n "${alt:-}" ]; then
+        CLASSROOM_BLEND="$alt"
+      fi
+    fi
+    if [ ! -f "$CLASSROOM_BLEND" ]; then
+      echo "[WARN] Classroom blend not found after extraction."
+    fi
+  fi
+}
+
+# Count CUDA/OPTIX devices using Blender (works on 4.0–4.2+, even when has_cuda/has_optix is None)
+detect_backend_counts() {
+  "$BLENDER_BIN" -b --factory-startup -E CYCLES \
+    --python-expr "import bpy
+p=bpy.context.preferences.addons['cycles'].preferences
+p.get_devices()
+cuda=sum(1 for d in p.devices if d.type=='CUDA')
+optix=sum(1 for d in p.devices if d.type=='OPTIX')
+print('CUDA_COUNT='+str(cuda))
+print('OPTIX_COUNT='+str(optix))" -f 0 2>/dev/null | \
+    sed -n 's/.*\(CUDA_COUNT=[0-9]\+\).*/\1/p; s/.*\(OPTIX_COUNT=[0-9]\+\).*/\1/p'
+}
+
+backend_available() {
+  local which="$1"  # CUDA or OPTIX
+  local cuda_count=0 optix_count=0 line
+  while IFS= read -r line; do
+    case "$line" in
+      CUDA_COUNT=*)  cuda_count="${line#*=}" ;;
+      OPTIX_COUNT=*) optix_count="${line#*=}" ;;
+    esac
+  done < <(detect_backend_counts)
+  if [ "$which" = "CUDA" ]; then
+    [ "${cuda_count:-0}" -gt 0 ]
+  else
+    [ "${optix_count:-0}" -gt 0 ]
+  fi
+}
+
+# Python snippet to configure devices for a run.
+# It also prints 'enabled_count=<N>' and the devices list we parse later.
+gen_setup_expr() {
+  cat <<'PY'
+import bpy, os
+which = os.environ.get("CYCLES_BACKEND","CUDA")
+mode  = os.environ.get("CYCLES_MODE","single")
+p=bpy.context.preferences.addons['cycles'].preferences
+p.compute_device_type = which
+p.get_devices()
+enabled = 0
+for d in p.devices:
+    try:
+        if d.type == which:
+            use = (mode=='all') or (enabled == 0)
+            d.use = use
+            if use: enabled += 1
+        else:
+            d.use = False
+    except Exception:
+        pass
+bpy.context.scene.render.engine = 'CYCLES'
+bpy.context.scene.cycles.device = 'GPU'
+samples = int(os.environ.get("CYCLES_SAMPLES", "0"))
+if samples > 0:
+    bpy.context.scene.cycles.samples = samples
+print('compute_device_type=', p.compute_device_type)
+print('scene_device=', bpy.context.scene.cycles.device)
+print('enabled_count=', enabled)
+print('devices=', [(d.type,d.name,getattr(d,'use',None)) for d in p.devices])
+PY
+}
+
+# Run blender and return "elapsed|gpu_used|enabled_count|backend|label"
+run_timed() {
+  local scene_path="${1:-}"
+  local backend="${2:-}"
+  local mode="${3:-}"
+  local samples="${4:-0}"
+  local label="${5:-run}"
+
+  if [ -z "$scene_path" ] || [ -z "$backend" ] || [ -z "$mode" ]; then
+    echo "NaN|no|0|${backend:-UNK}|${label:-run}"
+    return 0
+  fi
+
+  local tmp_png; tmp_png="$(mktemp --suffix=.png)"
+  local tfile; tfile="$(mktemp)"
+  local logf;  logf="$(mktemp)"
+  local elapsed gpu_used enabled_count
+  gpu_used="no"; enabled_count=0
+
+  # Pre-set defaults so grep doesn't fail
+  echo "scene_device=" > "$logf"
+  echo "enabled_count=0" >> "$logf"
+
+  if ! CYCLES_BACKEND="$backend" CYCLES_MODE="$mode" CYCLES_SAMPLES="$samples" \
+    /usr/bin/time -f '%e' -o "$tfile" \
+    "$BLENDER_BIN" -b "$scene_path" -E CYCLES --factory-startup \
+      --python-expr "$(gen_setup_expr)" \
+      --debug-cycles -f 1 -o "$tmp_png" >"$logf" 2>&1; then
+    # On failure, still try to parse what we can
+    :
+  fi
+
+  elapsed="$(cat "$tfile" 2>/dev/null || echo "NaN")"
+
+  # Parse whether GPU was selected and how many devices were enabled
+  if grep -q '^scene_device= GPU' "$logf"; then
+    gpu_used="yes"
+  else
+    gpu_used="no"
+  fi
+  enabled_count="$(sed -n 's/^enabled_count=\s*\([0-9]\+\)\s*$/\1/p' "$logf" | head -n1 || echo 0)"
+  enabled_count="${enabled_count:-0}"
+
+  rm -f "$tfile" "$tmp_png" "$logf" || true
+
+  printf "%s|%s|%s|%s|%s\n" "$elapsed" "$gpu_used" "$enabled_count" "$backend" "$label"
+}
+
+# Pre-compile by doing a tiny render (1 sample) to fill kernels
+precompile_kernels() {
+  local scene_path="$1" backend="$2" mode="$3" scene_label="$4"
+  echo "[PREP] Pre-compiling ${backend} kernels for ${scene_label}.blend (${mode})..."
+  run_timed "$scene_path" "$backend" "$mode" 1 "compile" >/dev/null || true
+}
+
+# One benchmark bundle (cold + warm, respecting SKIP_COLD)
+bench_one() {
+  local scene_label="$1" scene_path="$2" backend="$3" mode="$4"
+  local cold="0.00" warm="0.00" compile="0.00" gpu_used="no" devs="0"
+
+  # Compile pass time
+  local comp_line; comp_line="$(run_timed "$scene_path" "$backend" "$mode" 1 "compile")"
+  compile="$(cut -d'|' -f1 <<<"$comp_line")"
+
+  if [ "${SKIP_COLD:-0}" -eq 0 ]; then
+    local cold_line; cold_line="$(run_timed "$scene_path" "$backend" "$mode" 0 "cold")"
+    cold="$(cut -d'|' -f1 <<<"$cold_line")"
+  fi
+
+  local warm_line; warm_line="$(run_timed "$scene_path" "$backend" "$mode" 0 "warm")"
+  warm="$(cut -d'|' -f1 <<<"$warm_line")"
+  gpu_used="$(cut -d'|' -f2 <<<"$warm_line")"
+  devs="$(cut -d'|' -f3 <<<"$warm_line")"
+
+  printf "[TIME] %s %s (%s, Warm): %ss, GPU:%s, devs:%s\n" "$scene_label" "$backend" "$mode" "$warm" "$gpu_used" "$devs"
+  echo "[REPORT] ${scene_label}/${backend}/${mode}: warm=${warm}s, cold=${cold}s, compile=${compile}s"
+
+  cat <<JSON
+{"scene":"$scene_label","backend":"$backend","mode":"$mode","cold":$(printf '%.2f' "${cold:-0}"),"warm":$(printf '%.2f' "${warm:-0}"),"compile":$(printf '%.2f' "${compile:-0}"),"gpu_used":"$gpu_used","device_count":${devs:-0}}
+JSON
+}
+
+# =========================
+# Main
+# =========================
+ensure_deps
+ensure_blender
+download_scenes
+
+declare -a SCENES=()
+[ -f "$BMW_BLEND" ] && SCENES+=("BMW27|$BMW_BLEND")
+[ -f "$CLASSROOM_BLEND" ] && SCENES+=("classroom|$CLASSROOM_BLEND")
+
+if [ "${#SCENES[@]}" -eq 0 ]; then
+  echo "[SKIP] No .blend scenes configured. Skipping."
+  echo "[]" > "$OUT_JSON"
+  exit 0
+fi
+
+CUDA_OK=0; OPTIX_OK=0
+backend_available "CUDA"  && CUDA_OK=1
+backend_available "OPTIX" && OPTIX_OK=1
+
+results=()
+for pair in "${SCENES[@]}"; do
+  scene_label="${pair%%|*}"
+  scene_path="${pair##*|}"
+
+  for backend in CUDA OPTIX; do
+    if [ "$backend" = "CUDA" ] && [ $CUDA_OK -eq 0 ]; then
+      echo "[SKIP] ${scene_label}/CUDA: backend not available."
+      continue
+    fi
+    if [ "$backend" = "OPTIX" ] && [ $OPTIX_OK -eq 0 ]; then
+      echo "[SKIP] ${scene_label}/OPTIX: backend not available."
+      continue
+    fi
+
+    for mode in single all; do
+      precompile_kernels "$scene_path" "$backend" "$mode" "$scene_label"
+      res="$(bench_one "$scene_label" "$scene_path" "$backend" "$mode")"
+      results+=("$res")
+    done
+  done
+done
+
+{
+  echo "[OK] Benchmark complete → $OUT_JSON"
+  printf "[\n"
+  for i in "${!results[@]}"; do
+    printf "  %s" "${results[$i]}"
+    if [ "$i" -lt "$(( ${#results[@]} - 1 ))" ]; then printf ","; fi
+    printf "\n"
+  done
+  printf "]\n"
+} | tee "$OUT_JSON" >/dev/null
+

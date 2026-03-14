@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ----------------------------------------------------------------------
+# Blender GPU Benchmark: auto-downloads demo scenes, pre-compiles kernels,
+# measures cold & warm render times, and outputs JSON results.
+# ----------------------------------------------------------------------
+
+ASSETS_DIR="${ASSETS_DIR:-$(pwd)/assets/blender}"
+RESULTS_DIR="${RESULTS_DIR:-${ASSETS_DIR}/results}"
+RESULT_JSON="${RESULTS_DIR}/bench_results.json"
+KERNEL_CACHE="${HOME}/.cache/cycles/kernels"
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+
+BMW_ZIP_URL="https://download.blender.org/demo/test/BMW27.blend.zip"
+CLASSROOM_ZIP_URL="https://download.blender.org/demo/test/classroom.zip"
+
+BMW_BLEND="${ASSETS_DIR}/BMW27.blend"
+CLASSROOM_BLEND="${ASSETS_DIR}/classroom/classroom.blend"
+
+NEEDED=(curl unzip jq)
+
+# ----------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------
+need_deps() {
+  for d in "${NEEDED[@]}"; do
+    command -v "$d" >/dev/null 2>&1 || { echo "[ERROR] Missing dependency: $d"; exit 1; }
+  done
+}
+
+ensure_dirs() { mkdir -p "$ASSETS_DIR" "$RESULTS_DIR"; }
+
+download_if_missing() {
+  if [[ ! -f "$BMW_BLEND" ]]; then
+    echo "[INFO] Downloading BMW27..."
+    curl -L "$BMW_ZIP_URL" -o "${ASSETS_DIR}/BMW27.blend.zip"
+    unzip -o "${ASSETS_DIR}/BMW27.blend.zip" -d "$ASSETS_DIR" >/dev/null
+    rm -f "${ASSETS_DIR}/BMW27.blend.zip"
+  fi
+  if [[ ! -f "$CLASSROOM_BLEND" ]]; then
+    echo "[INFO] Downloading Classroom..."
+    curl -L "$CLASSROOM_ZIP_URL" -o "${ASSETS_DIR}/classroom.zip"
+    unzip -o "${ASSETS_DIR}/classroom.zip" -d "$ASSETS_DIR" >/dev/null
+    rm -f "${ASSETS_DIR}/classroom.zip"
+  fi
+}
+
+PY_GPU_EXPR=$'import bpy\n'\
+$'p=bpy.context.preferences.addons["cycles"].preferences\n'\
+$'p.compute_device_type="CUDA"\n'\
+$'p.get_devices()\n'\
+$'cuda_found=False\n'\
+$'for d in p.devices:\n'\
+$'    d.use=(d.type=="CUDA")\n'\
+$'    if d.type=="CUDA": cuda_found=True\n'\
+$'bpy.context.scene.cycles.device="GPU"\n'\
+$'import sys; sys.stderr.write(f"\\n[PYCHK] CUDA_ENABLED={cuda_found}\\n")\n'
+
+# ----------------------------------------------------------------------
+# Precompile kernels (short 64×64, 1 sample)
+# ----------------------------------------------------------------------
+precompile_kernels() {
+  local blend="$1"
+  echo "[PREP] Pre-compiling CUDA kernels for $(basename "$blend")..."
+  "${BLENDER_BIN}" -b "$blend" -E CYCLES --python-expr $'
+import bpy
+p=bpy.context.preferences.addons["cycles"].preferences
+p.compute_device_type="CUDA"
+p.get_devices()
+for d in p.devices: d.use=(d.type=="CUDA")
+bpy.context.scene.cycles.device="GPU"
+sc=bpy.context.scene
+sc.cycles.samples=1
+sc.render.resolution_x=64
+sc.render.resolution_y=64
+bpy.ops.render.render(write_still=False)
+print("[PRECOMPILE DONE]")' >/dev/null 2>&1 || echo "[WARN] Precompile failed."
+}
+
+# ----------------------------------------------------------------------
+# Actual timed render
+# ----------------------------------------------------------------------
+run_one() {
+  local blend="$1" tag="$2" label="$3"
+  local log; log="$(mktemp)"
+  local outpat="${RESULTS_DIR}/${tag}_####"
+
+  local t0 t1 dt
+  t0=$(date +%s.%N)
+
+  "${BLENDER_BIN}" -b "$blend" -E CYCLES \
+    --python-expr "${PY_GPU_EXPR}" \
+    -o "${outpat}" -f 1 >"$log" 2>&1 || {
+      echo "[ERROR] Blender failed for ${tag} (${label}). See ${log}"
+      exit 1
+    }
+
+  t1=$(date +%s.%N)
+  dt=$(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1 - t0)}')
+
+  local gpu="no"
+  grep -q "\[PYCHK\] CUDA_ENABLED=True" "$log" && gpu="yes"
+  grep -q "CUDA kernel" "$log" && gpu="yes"
+
+  echo "[TIME] ${tag} (${label}): ${dt}s, GPU:${gpu}"
+
+  echo "${dt}"
+}
+
+# ----------------------------------------------------------------------
+# Benchmark scene (with optional SKIP_COLD=1)
+# ----------------------------------------------------------------------
+bench_scene() {
+  local blend="$1" tag="$2"
+  [[ -f "$blend" ]] || { echo "[SKIP] ${tag}: missing"; return; }
+
+  precompile_kernels "$blend"
+
+  local cold=0 warm=0 compile=0
+  if [[ "${SKIP_COLD:-0}" == "1" ]]; then
+    warm=$(run_one "$blend" "$tag" "Warm")
+    echo "[REPORT] ${tag}: warm=${warm}s (cold skipped)"
+  else
+    echo "[RUN] Clearing kernel cache for ${tag}..."
+    rm -rf "$KERNEL_CACHE"
+    cold=$(run_one "$blend" "$tag" "Cold")
+    warm=$(run_one "$blend" "$tag" "Warm")
+    compile=$(awk -v c="$cold" -v w="$warm" 'BEGIN{d=c-w; if(d<0)d=0; printf "%.2f", d}')
+    echo "[REPORT] ${tag}: cold=${cold}s warm=${warm}s compile≈${compile}s"
+  fi
+
+  # Append to JSON results
+  jq -cn --arg scene "$tag" --arg cold "$cold" --arg warm "$warm" --arg compile "$compile" \
+     '{scene:$scene, cold:($cold|tonumber), warm:($warm|tonumber), compile:($compile|tonumber)}'
+}
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+need_deps
+ensure_dirs
+download_if_missing
+
+echo "[" >"$RESULT_JSON"
+first=1
+
+for pair in "$BMW_BLEND:BMW27" "$CLASSROOM_BLEND:classroom"; do
+  blend="${pair%%:*}"
+  tag="${pair##*:}"
+  [[ -f "$blend" ]] || continue
+  res=$(bench_scene "$blend" "$tag")
+  [[ $first -eq 0 ]] && echo "," >>"$RESULT_JSON"
+  first=0
+  echo "$res" >>"$RESULT_JSON"
+done
+
+echo "]" >>"$RESULT_JSON"
+echo "[OK] Benchmark complete → ${RESULT_JSON}"
+jq . "$RESULT_JSON" || cat "$RESULT_JSON"

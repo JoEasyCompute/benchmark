@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import threading
+import time
+from typing import List
+
+import yaml
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+
+def make_prompt(tokenizer, target_tokens: int) -> tuple[str, int]:
+    base = "The quick brown fox jumps over the lazy dog. "
+    target_tokens = max(1, int(target_tokens))
+    text = base
+    while len(tokenizer.encode(text, add_special_tokens=False)) < target_tokens:
+        text += base
+
+    lo, hi = 1, len(text)
+    best = text
+    best_count = len(tokenizer.encode(text, add_special_tokens=False))
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid]
+        count = len(tokenizer.encode(candidate, add_special_tokens=False))
+        if count >= target_tokens:
+            best = candidate
+            best_count = count
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    return best, best_count
+
+# ---------- NVML power sampler ----------
+class PowerSampler:
+    def __init__(self, gpu_limit: int, interval_s: float = 0.5):
+        self.interval = interval_s
+        self.gpu_limit = max(1, int(gpu_limit))
+        self.samples = []  # watts (total across visible GPUs)
+        self._stop = threading.Event()
+        self._thr = None
+        self._ok = False
+        try:
+            import pynvml as N
+            self.N = N
+            N.nvmlInit()
+            self.handles = self._resolve_handles()
+            self._ok = True
+        except Exception:
+            self._ok = False
+
+    def _resolve_handles(self):
+        visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+        selected = visible[: self.gpu_limit] if visible else []
+        handles = []
+
+        if selected:
+            for item in selected:
+                try:
+                    if item.isdigit():
+                        handles.append(self.N.nvmlDeviceGetHandleByIndex(int(item)))
+                    else:
+                        handles.append(self.N.nvmlDeviceGetHandleByUUID(item.encode()))
+                except Exception:
+                    continue
+            if handles:
+                return handles
+
+        count = self.N.nvmlDeviceGetCount()
+        for i in range(min(self.gpu_limit, count)):
+            handles.append(self.N.nvmlDeviceGetHandleByIndex(i))
+        return handles
+
+    def _tick(self):
+        while not self._stop.is_set():
+            total_w = 0.0
+            if self._ok:
+                for h in self.handles:
+                    try:
+                        # powerUsage is in milliwatts
+                        mw = self.N.nvmlDeviceGetPowerUsage(h)
+                        total_w += (mw or 0.0) / 1000.0
+                    except Exception:
+                        pass
+            self.samples.append(total_w if total_w > 0 else 0.0)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._thr = threading.Thread(target=self._tick, daemon=True)
+        self._thr.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thr:
+            self._thr.join()
+        if self._ok:
+            try:
+                self.N.nvmlShutdown()
+            except Exception:
+                pass
+
+    def mean_watts(self) -> float:
+        return sum(self.samples)/len(self.samples) if self.samples else 0.0
+
+def detect_gpu_name() -> str:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    # fallback to NVML
+    try:
+        import pynvml as N
+        N.nvmlInit()
+        name = N.nvmlDeviceGetName(N.nvmlDeviceGetHandleByIndex(0)).decode()
+        N.nvmlShutdown()
+        return name
+    except Exception:
+        return "unknown"
+
+
+def write_metric(row):
+    os.makedirs("results", exist_ok=True)
+    with open("results/metrics.jsonl", "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
+              out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float):
+    llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=8192, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
+        tensor_parallel_size=tp, gpu_memory_utilization=gpu_mem_util, trust_remote_code=True, disable_log_stats=True)
+    sp = SamplingParams(
+        temperature=0.0,
+        max_tokens=out_len,
+        top_p=1.0,
+        repetition_penalty=1.0,
+    )
+    prompts = [prompt] * bs
+
+    # Warmup
+    t_warm = time.time() + warmup_s
+    while time.time() < t_warm:
+        _ = llm.generate(prompts, sp)
+
+    # Timed loop + power sampling
+    ps = PowerSampler(gpu_limit=tp, interval_s=0.5); ps.start()
+    gen_tokens = 0
+    reqs = 0
+    t0 = time.time()
+    t_end = t0 + duration_s
+    while time.time() < t_end:
+        outputs = llm.generate(prompts, sp)
+        reqs += len(outputs)
+        for out in outputs:
+            gen_tokens += len(out.outputs[0].token_ids)
+    elapsed = time.time() - t0
+    ps.stop()
+
+    gpu_name = detect_gpu_name()
+    mean_w = ps.mean_watts()
+    row = {
+        "suite": "llm_infer",
+        "status": "ok",
+        "model": model,
+        "dtype": dtype,
+        "tensor_parallel": tp,
+        "batch_size": bs,
+        "prompt_len": prompt_tokens,
+        "requested_prompt_len": requested_prompt_len,
+        "output_len": out_len,
+        "warmup_s": warmup_s,
+        "duration_s": duration_s,
+        "requests": reqs,
+        "reqs_per_s": reqs / elapsed if elapsed > 0 else 0.0,
+        "generated_tokens": gen_tokens,
+        "gen_tokens_per_s": gen_tokens / elapsed if elapsed > 0 else 0.0,
+        "mean_power_w": round(mean_w, 2),
+        "gen_tokens_per_watt": (gen_tokens / elapsed / mean_w) if mean_w > 1e-6 else 0.0,
+        "gpu_name": gpu_name,
+        "time_s": elapsed,
+    }
+
+    # Clean up
+    del llm
+    return row
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--duration", type=int, default=30)
+    ap.add_argument("--gpu-mem", type=float, default=0.95, help="gpu_memory_utilization for vLLM")
+    args = ap.parse_args()
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)["llm_infer"]
+
+    model = cfg["model"]
+    dtype = cfg.get("dtype", "float16")
+    prompt_len = int(cfg.get("prompt_len", 512))
+    out_len = int(cfg.get("output_len", 128))
+    batch_sizes: List[int] = list(map(int, cfg.get("batch_sizes", [1,4,16,64])))
+    tp_sizes: List[int] = list(map(int, cfg.get("tensor_parallel_sizes", [1])))
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    prompt, actual_prompt_tokens = make_prompt(tokenizer, prompt_len)
+
+    for tp in tp_sizes:
+        for bs in batch_sizes:
+            try:
+                row = run_combo(model, dtype, tp, bs, prompt, actual_prompt_tokens, prompt_len, out_len,
+                                args.warmup, args.duration, args.gpu_mem)
+                write_metric(row)
+                print(json.dumps(row, indent=2))
+            except Exception as e:
+                row = {
+                    "suite": "llm_infer",
+                    "status": "failed",
+                    "model": model,
+                    "dtype": dtype,
+                    "tensor_parallel": tp,
+                    "batch_size": bs,
+                    "prompt_len": actual_prompt_tokens,
+                    "requested_prompt_len": prompt_len,
+                    "output_len": out_len,
+                    "warmup_s": args.warmup,
+                    "duration_s": args.duration,
+                    "gpu_name": detect_gpu_name(),
+                    "error": str(e),
+                }
+                write_metric(row)
+                print(f"[ERROR] TP={tp} BS={bs}: {e}")
+
+if __name__ == "__main__":
+    main()

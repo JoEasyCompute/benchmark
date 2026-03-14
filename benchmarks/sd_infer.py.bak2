@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+Stable Diffusion inference benchmark (single-GPU by default).
+
+This version:
+- Uses `torch_dtype=` (diffusers 0.30.x expects this)
+- Forces a loader path that avoids transformers' `offload_state_dict`
+  via low_cpu_mem_usage=False and device_map=None.
+- Keeps multi-process layout and prints throughput.
+
+Examples:
+  python benchmarks/sd_infer.py --model runwayml/stable-diffusion-v1-5
+  python benchmarks/sd_infer.py --model stabilityai/stable-diffusion-xl-base-1.0 --width 1024 --height 1024 --steps 30 --it 2
+"""
+
+import argparse
+import multiprocessing as mp
+import os
+import signal
+import sys
+import time
+from queue import Empty
+from typing import Optional
+
+import torch
+from diffusers import (
+    StableDiffusionPipeline,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+)
+
+
+def _select_dtype(prefer_bf16: bool) -> torch.dtype:
+    """Choose dtype; default to fp16 for widest SD compatibility."""
+    if prefer_bf16 and torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+        return torch.bfloat16
+    return torch.float16
+
+
+def _maybe_set_scheduler(pipe, scheduler: str):
+    if not scheduler:
+        return pipe
+    s = scheduler.lower()
+    if "euler_a" in s or "euler-ancestral" in s:
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    elif "euler" in s:
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    return pipe
+
+
+def run_worker(
+    q: mp.Queue,
+    model: str,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    guidance: float,
+    batch_size: int,
+    iterations: int,
+    seed: Optional[int],
+    scheduler: Optional[str],
+    prefer_bf16: bool,
+    enable_xformers: bool,
+):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    torch.set_grad_enabled(False)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+    dtype = _select_dtype(prefer_bf16)
+    t0 = time.perf_counter()
+
+    # Avoid the offload_state_dict path by using low_cpu_mem_usage=False and device_map=None
+    # 1) Load with *no* dtype/offload kwargs so nothing is forwarded to submodules
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model,
+        use_safetensors=True,
+        device_map=None,            # keep simple, single-GPU
+        variant=None,
+        safety_checker=None,        # disable safety checker for speed
+    )
+
+    # 2) Then move everything to GPU with the desired dtype
+    pipe = pipe.to("cuda", dtype=dtype)
+
+    # Optional memory-efficient attention
+    if enable_xformers:
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            print(f"[WARN] xFormers not enabled: {e}", file=sys.stderr)
+
+    pipe = _maybe_set_scheduler(pipe, scheduler)
+
+    # Warmup
+    _ = pipe(
+        prompt="warmup image",
+        negative_prompt="",
+        height=min(height, 512),
+        width=min(width, 512),
+        num_inference_steps=10,
+        guidance_scale=guidance,
+        num_images_per_prompt=1,
+        generator=torch.Generator(device="cuda").manual_seed(1234),
+    )
+
+    load_s = time.perf_counter() - t0
+
+    # Main runs
+    g = torch.Generator(device="cuda")
+    if seed is not None:
+        g.manual_seed(seed)
+
+    times = []
+    total_images = iterations * batch_size
+
+    for _ in range(iterations):
+        t_iter = time.perf_counter()
+        _ = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            num_images_per_prompt=batch_size,
+            generator=g,
+        )
+        times.append(time.perf_counter() - t_iter)
+
+    imgs_per_sec = total_images / sum(times) if times else 0.0
+
+    # Clean shutdown
+    try:
+        pipe._execution_device = None
+        del pipe
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    q.put({
+        "model": model,
+        "dtype": str(dtype),
+        "load_seconds": round(load_s, 3),
+        "iters": iterations,
+        "batch_size": batch_size,
+        "steps": steps,
+        "hw": f"{width}x{height}",
+        "mean_s_per_iter": round(sum(times) / len(times), 4) if times else None,
+        "images_total": total_images,
+        "images_per_sec": round(imgs_per_sec, 3),
+    })
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, help="HF repo id or local path")
+    ap.add_argument("--prompt", default="A photo of a cute corgi wearing sunglasses, cinematic, high detail")
+    ap.add_argument("--neg", "--negative-prompt", dest="negative_prompt", default="")
+    ap.add_argument("--width", type=int, default=512)
+    ap.add_argument("--height", type=int, default=512)
+    ap.add_argument("--steps", type=int, default=25)
+    ap.add_argument("--cfg", "--guidance", dest="guidance", type=float, default=7.5)
+    ap.add_argument("--bs", "--batch-size", dest="batch_size", type=int, default=1)
+    ap.add_argument("--it", "--iterations", dest="iterations", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--scheduler", default="", help="euler, euler_a, ...")
+    ap.add_argument("--bf16", action="store_true", help="prefer bfloat16 if available")
+    ap.add_argument("--xformers", action="store_true", help="enable xFormers attention")
+    args = ap.parse_args()
+
+    if not torch.cuda.is_available():
+        print("CUDA not available", file=sys.stderr)
+        sys.exit(1)
+
+    mp.set_start_method("spawn", force=True)
+    q: mp.Queue = mp.Queue(maxsize=1)
+    p = mp.Process(
+        target=run_worker,
+        kwargs=dict(
+            q=q,
+            model=args.model,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            width=args.width,
+            height=args.height,
+            steps=args.steps,
+            guidance=args.guidance,
+            batch_size=args.batch_size,
+            iterations=args.iterations,
+            seed=args.seed,
+            scheduler=args.scheduler,
+            prefer_bf16=args.bf16,
+            enable_xformers=args.xformers,
+        ),
+        daemon=True,
+    )
+
+    def _sigint_handler(_signum, _frame):
+        try:
+            if p.is_alive():
+                p.terminate()
+        finally:
+            sys.exit(130)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    p.start()
+    try:
+        result = q.get(timeout=3600)
+    except Empty:
+        print("Worker timed out.", file=sys.stderr)
+        result = None
+    finally:
+        if p.is_alive():
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+
+    if result:
+        print("[RESULT]", result)
+        print(
+            f"[SD] model={result['model']} dtype={result['dtype']} "
+            f"{result['hw']} steps={result['steps']} bs={result['batch_size']} "
+            f"iters={result['iters']} load_s={result['load_seconds']} "
+            f"mean_iter_s={result['mean_s_per_iter']} img/s={result['images_per_sec']}"
+        )
+    else:
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

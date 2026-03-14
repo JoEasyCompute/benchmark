@@ -1,0 +1,45 @@
+# Benchmark configuration
+gpu_include: []           # [] = all visible
+repeat: 3                 # repeats per test to average
+results_dir: results
+
+llm_train:
+  dtype: bf16          # or fp16; both fine on 4090
+  hidden_size: 1024
+  n_layers: 12
+  n_heads: 16
+  seq_len: 512
+  batch_size: 4
+  steps: 100
+
+#llm_train:
+#  seq_len: 2048
+#  batch_size: 8
+#  steps: 50               # increase for steadier numbers
+#  dtype: bf16             # bf16/fp16/fp32
+#  world_sizes: [1, 2, 4]  # will skip sizes larger than available GPUs
+#  hidden_size: 3072
+#  n_layers: 24
+#  n_heads: 24
+
+llm_infer:
+  model: "mistralai/Mistral-7B-Instruct-v0.3"
+  dtype: float16
+  prompt_len: 512
+  output_len: 128
+  batch_sizes: [1, 4, 16, 64]
+  tensor_parallel_sizes: [1, 2, 4]
+
+sd_infer:
+  model: "stabilityai/stable-diffusion-2-1"
+  steps: 20
+  sizes: [512, 1024]
+  per_gpu_batch: 4
+  multi_gpu_mode: "replicated"  # replicated = one worker per GPU
+
+blender:
+  enabled: true
+  scenes:
+    # Provide local .blend scene paths if available
+    # - "/path/to/BMW27.blend"
+    # - "/path/to/classroom.blend"

@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------- Config ----------
+BLENDER_BIN="${BLENDER_BIN:-blender}"
+ASSETS_DIR="${ASSETS_DIR:-$(pwd)/assets/blender}"
+RESULTS_DIR="${RESULTS_DIR:-$ASSETS_DIR/results}"
+SCENES=(
+  "$ASSETS_DIR/BMW27.blend:BMW27"
+  "$ASSETS_DIR/classroom/classroom.blend:classroom"
+)
+RUN_BACKENDS=("CUDA" "OPTIX")     # OPTIX will auto-skip if unavailable
+RUN_MODES=("single" "all")        # single GPU first, then all GPUs
+COLD_FRAMES=1
+WARM_FRAMES=1
+SKIP_COLD="${SKIP_COLD:-0}"       # set SKIP_COLD=1 to skip cold runs
+# -----------------------------
+
+mkdir -p "$RESULTS_DIR"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] Missing dependency: $1"; exit 1; }; }
+need jq
+need awk
+need grep
+need sed
+need "${BLENDER_BIN}"
+
+# ---------- Helpers ----------
+# time_cmd prints elapsed seconds to stdout and returns cmd exit code
+time_cmd() {
+  /usr/bin/time -f "%e" -o /tmp/.bench_time.$$ "$@" >/dev/null 2>&1 || return $?
+  cat /tmp/.bench_time.$$
+}
+
+# Returns 0 if backend is available, 1 otherwise.
+backend_available() {
+  local backend="$1"
+  "$BLENDER_BIN" -b -E CYCLES --python-expr \
+"import bpy
+prefs=bpy.context.preferences.addons['cycles'].preferences
+try:
+    prefs.compute_device_type='$backend'
+    prefs.get_devices()
+    print([ (d.type,d.name) for d in prefs.devices ])
+except Exception as e:
+    print('ERR', e)" \
+  2>/dev/null | grep -q "$backend"
+}
+
+# Enable devices per backend+mode. Prints count of enabled devices.
+# mode=single → enable the first matching device only
+# mode=all    → enable all matching devices
+enable_devices_py() {
+  local backend="$1"   # CUDA|OPTIX
+  local mode="$2"      # single|all
+  cat <<'PY' | sed "s/__BACKEND__/$backend/g" | sed "s/__MODE__/$mode/g"
+import bpy, sys
+prefs=bpy.context.preferences.addons['cycles'].preferences
+prefs.compute_device_type='__BACKEND__'
+prefs.get_devices()
+
+enabled=0
+first=True
+for d in prefs.devices:
+    if d.type=='__BACKEND__':
+        use = (first or '__MODE__'=='all')
+        d.use = use
+        if use:
+            enabled += 1
+        first = False
+    else:
+        d.use = False
+
+bpy.context.scene.cycles.device = 'GPU'
+print('ENABLED_COUNT', enabled)
+PY
+}
+
+# Returns "yes" if GPU used, else "no" by inspecting debug log
+# Detect GPU usage by looking at a given log file (preferred), or by
+# running a debug render with the same scene+device settings.
+detect_gpu_used() {
+  local scene_path="$1" backend="$2" mode="$3" log_path="${4:-}"
+
+  if [[ -n "$log_path" && -f "$log_path" ]]; then
+    if grep -Eqi "Using .*CPU kernels" "$log_path"; then
+      echo "no"; return
+    fi
+    if grep -Eqi "CUDA|OPTIX|NVIDIA|cuDNN|rtcore|optix" "$log_path"; then
+      echo "yes"; return
+    fi
+    echo "no"; return
+  fi
+
+  # Fallback: run a tiny debug render with same device prefs and scene.
+  local py_expr
+  py_expr="$(enable_devices_py "$backend" "$mode")"
+  "$BLENDER_BIN" -b "$scene_path" -E CYCLES --debug-cycles --python-expr "$py_expr" -f 1 \
+    > /tmp/.bench_dbg.$$ 2>&1 || true
+
+  if grep -Eqi "Using .*CPU kernels" /tmp/.bench_dbg.$$; then
+    echo "no"
+  elif grep -Eqi "CUDA|OPTIX|NVIDIA|cuDNN|rtcore|optix" /tmp/.bench_dbg.$$; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
+# One render pass; echoes: "<seconds> <gpu_yes_no>"
+render_once() {
+  local scene_path="$1" backend="$2" mode="$3" frames="$4"
+  local py_expr
+  py_expr="$(enable_devices_py "$backend" "$mode")"
+
+  # Apply device prefs (dry run) and capture enabled count
+  "$BLENDER_BIN" -b "$scene_path" -E CYCLES --python-expr "$py_expr" -f 0 \
+    > /tmp/.devset.$$ 2>&1 || true
+  local enabled_count
+  enabled_count="$(grep -Eo 'ENABLED_COUNT [0-9]+' /tmp/.devset.$$ | awk '{print $2}' || echo 0)"
+
+  # Timed render — keep the log so we can parse it
+  local runlog="/tmp/.bench_runlog.$$"
+  local secs
+  /usr/bin/time -f "%e" -o /tmp/.bench_time.$$ \
+    "$BLENDER_BIN" -b "$scene_path" -E CYCLES -f "$frames" \
+    > "$runlog" 2>&1 || true
+  secs="$(cat /tmp/.bench_time.$$ 2>/dev/null || echo 0.00)"
+
+  # Detect GPU usage from the *same* render log
+  local gpu_used
+  gpu_used="$(detect_gpu_used "$scene_path" "$backend" "$mode" "$runlog")"
+
+  echo "$secs $gpu_used $enabled_count"
+}
+
+# Pre-compile kernels (CUDA/OPTIX) to reduce warm-run cost
+precompile_kernels() {
+  local scene_path="$1" backend="$2" mode="$3"
+  local py_expr
+  py_expr="$(enable_devices_py "$backend" "$mode")"
+  echo "[PREP] Pre-compiling $backend kernels for $(basename "$scene_path") ($mode)..."
+  # This render is thrown away; goal is just kernel cache fill
+  "$BLENDER_BIN" -b "$scene_path" -E CYCLES --python-expr "$py_expr" -f 1 >/dev/null 2>&1 || true
+}
+
+# Append a JSON row to results file
+append_json() {
+  local file="$1" scene="$2" backend="$3" mode="$4" cold="$5" warm="$6" compile="$7" gpu="$8" devs="$9"
+  jq --arg scene "$scene" \
+     --arg backend "$backend" \
+     --arg mode "$mode" \
+     --argjson cold "$cold" \
+     --argjson warm "$warm" \
+     --argjson compile "$compile" \
+     --arg gpu "$gpu" \
+     --argjson devices "$devs" \
+     '. + [{"scene":$scene,"backend":$backend,"mode":$mode,"cold":$cold,"warm":$warm,"compile":$compile,"gpu_used":$gpu,"device_count":$devices}]' \
+     "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
+
+RESULTS_JSON="$RESULTS_DIR/bench_results.json"
+echo "[]" > "$RESULTS_JSON"
+
+# ---------- Run ----------
+for entry in "${SCENES[@]}"; do
+  IFS=":" read -r scene_path scene_name <<< "$entry"
+  if [[ ! -f "$scene_path" ]]; then
+    echo "[SKIP] Scene not found: $scene_path"
+    continue
+  fi
+
+  for backend in "${RUN_BACKENDS[@]}"; do
+    if ! backend_available "$backend"; then
+      echo "[SKIP] $scene_name/$backend: backend not available."
+      continue
+    fi
+
+    for mode in "${RUN_MODES[@]}"; do
+      # COLD
+      cold_secs="0.00"; cold_gpu="no"; cold_devs=0; compile_secs="0.00"
+      if [[ "$SKIP_COLD" != "1" ]]; then
+        read -r cold_secs cold_gpu cold_devs < <(render_once "$scene_path" "$backend" "$mode" "$COLD_FRAMES")
+        echo "[TIME] $scene_name $backend ($mode, Cold): ${cold_secs}s, GPU:${cold_gpu}, devs:${cold_devs}"
+      else
+        # If we skip cold, at least warm up the kernels explicitly for consistency
+        precompile_kernels "$scene_path" "$backend" "$mode"
+      fi
+
+      # Compile step (explicit precompile timing — optional, cheap to estimate)
+      # We do a minimal timed call to approximate compile cost when SKIP_COLD=1
+      if [[ "$SKIP_COLD" == "1" ]]; then
+        compile_secs="$(time_cmd "$BLENDER_BIN" -b "$scene_path" -E CYCLES --python-expr "$(enable_devices_py "$backend" "$mode")" -f 1 || true)"
+      else
+        compile_secs="0.00"
+      fi
+
+      # WARM
+      read -r warm_secs warm_gpu warm_devs < <(render_once "$scene_path" "$backend" "$mode" "$WARM_FRAMES")
+      echo "[TIME] $scene_name $backend ($mode, Warm): ${warm_secs}s, GPU:${warm_gpu}, devs:${warm_devs}"
+
+      # Report + JSON
+      echo "[REPORT] $scene_name/$backend/$mode: warm=${warm_secs}s, cold=${cold_secs}s, compile=${compile_secs}s"
+      append_json "$RESULTS_JSON" "$scene_name" "$backend" "$mode" \
+        "${cold_secs:-0}" "${warm_secs:-0}" "${compile_secs:-0}" "${warm_gpu}" "${warm_devs}"
+    done
+  done
+done
+
+echo "[OK] Benchmark complete → $RESULTS_JSON"
+jq . "$RESULTS_JSON"
+
