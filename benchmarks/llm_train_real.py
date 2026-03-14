@@ -13,6 +13,10 @@ from transformers import AutoModelForCausalLM
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
+def detect_backend() -> str:
+    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+
+
 def resolve_model_revision(model) -> str | None:
     try:
         return model.config._commit_hash
@@ -43,14 +47,16 @@ def main():
         print("[SKIP] llm_train_real disabled in config")
         return
 
+    backend = detect_backend()
     if not torch.cuda.is_available():
         metric = {
             "benchmark_schema_version": 2,
             "suite": "llm_train_real",
             "status": "failed",
+            "gpu_backend": backend,
             "model": cfg.get("model"),
             "model_source": detect_model_source(cfg.get("model", "")),
-            "error": "CUDA not available",
+            "error": "GPU runtime not available via torch",
         }
         os.makedirs("results", exist_ok=True)
         with open("results/metrics.jsonl", "a") as f:
@@ -111,6 +117,7 @@ def main():
         "benchmark_schema_version": 2,
         "suite": "llm_train_real",
         "status": "ok",
+        "gpu_backend": backend,
         "model": model_name,
         "model_source": detect_model_source(model_name),
         "model_revision": model_revision,

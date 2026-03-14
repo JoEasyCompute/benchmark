@@ -45,6 +45,26 @@ Assumptions:
 - Python 3.10, 3.11, or 3.12 is available
 - Blender is optional; the Blender benchmark is skipped if `blender` is not on `PATH`
 
+## Backend Support
+
+The harness is intended to support both:
+- NVIDIA GPUs through CUDA
+- AMD GPUs through ROCm / HIP
+
+Backend selection is controlled by `gpu_backend` in [config.yaml](./config.yaml):
+- `auto`: detect from `nvidia-smi` or `rocm-smi`
+- `nvidia`
+- `amd`
+
+What "supported" means in the current codebase:
+- `run_all.sh` selects backend-specific visible-device env vars and host tooling
+- benchmark result rows now include `gpu_backend` so cross-vendor comparisons remain explicit in `metrics.jsonl`, `metrics.csv`, and summaries
+- Blender switches between `CUDA` and `HIP` based on the selected backend
+
+Important caveat:
+- practical support still depends on your installed ROCm/CUDA stack, PyTorch build, vLLM build, Diffusers stack, and Blender build on the target machine
+- AMD support should be treated as implementation-level support that still requires runtime validation on a real ROCm host
+
 ## Runtime Flow
 
 `run_all.sh` does the following:
@@ -103,6 +123,7 @@ Notes:
 - Controlled by `llm_train_real.enabled` in `config.yaml`
 - Disabled by default because it increases runtime and model-download requirements
 - Currently single-GPU in the active orchestration flow
+- Intended to run on either NVIDIA or AMD as long as the installed PyTorch build exposes a working GPU runtime
 
 ### 2. LLM Inference
 
@@ -119,6 +140,7 @@ Notes:
 - Prompt length is now tokenizer-verified; results include both requested and actual prompt token counts
 - Failures for oversized TP or batch settings are recorded as structured failed rows in `metrics.jsonl`
 - Latency fields are measured per `generate()` batch call; `batch_latency_per_item_proxy_*` is a simple batch-latency-per-item proxy, not a true online per-request latency measurement
+- Power sampling is currently NVIDIA-only through NVML; on AMD the benchmark still runs, but power-related fields may be zero or unavailable
 
 ### 3. Stable Diffusion
 
@@ -136,6 +158,7 @@ Notes:
 - The script writes structured rows directly to `metrics.jsonl`
 - Failed SD runs are recorded as structured failed rows
 - `emit_worker_rows: true` adds one `sd_infer_worker` row per GPU in replicated mode in addition to the aggregate row
+- BF16 selection on AMD depends on the installed runtime and device support; when support cannot be inferred cleanly, the benchmark still emits the chosen dtype and reason fields
 
 ### 4. Blender
 
@@ -229,16 +252,57 @@ System requirements:
 - `check_system_requirements.py` verifies the Linux GPU host assumptions and required binaries such as `nvidia-smi` or `rocm-smi` and `stdbuf`.
 - Missing required host tools are a hard stop before benchmark execution begins.
 
+Post-run validation:
+- `validate_run_artifacts.py` checks a completed run folder for missing artifacts, backend mismatches, missing suite rows, failed/skipped rows, and AMD power-metric caveats before you compare runs across vendors.
+
+## Smoke-Test Checklist
+
+Use this before trusting cross-vendor comparisons:
+
+1. On the target machine, set `gpu_backend` in [config.yaml](./config.yaml) to the intended backend instead of relying on `auto` during initial validation.
+2. Run `bash run_all.sh --smoke`.
+3. Confirm the run folder contains `machine_state.json`, `runtime_estimate.json`, `meta.json`, and `results/metrics.jsonl`.
+4. Check `meta.json` and verify `gpu_backend` and GPU model match the host you intended to benchmark.
+5. Check `results/metrics.jsonl` and confirm each active suite writes rows with the expected `gpu_backend`, `status`, and `gpu_count`.
+6. Review `logs/llm_train*.log`, `logs/llm_infer_vllm*.log`, `logs/sd_infer*.log`, and `logs/blender*.log` for backend-specific runtime errors.
+7. On AMD hosts, verify whether `llm_infer` power fields are unavailable rather than silently assuming they are comparable to NVIDIA.
+8. Only after smoke passes on both vendors should you run the full benchmark configuration for comparison.
+
+After the smoke run, validate the produced run folder:
+
+```bash
+python3 validate_run_artifacts.py results/<run_id>
+```
+
+If you want to assert the intended backend explicitly:
+
+```bash
+python3 validate_run_artifacts.py results/<run_id> --expected-backend amd
+python3 validate_run_artifacts.py results/<run_id> --expected-backend nvidia
+```
+
+Exit codes:
+- `0`: no issues detected
+- `1`: warnings detected; the run may still be usable, but comparison caveats need review
+- `2`: errors detected; do not trust the run for comparison until fixed
+
+For a fair NVIDIA vs AMD comparison:
+- keep model ids, prompt lengths, output lengths, image sizes, steps, repeat count, and visible GPU count aligned
+- compare rows by `suite`, `status`, `gpu_backend`, `gpu_count`, and the workload-defining config fields rather than by run folder name alone
+- treat missing power metrics as a reporting limitation, not as zero-power performance
+
 ## Current Documentation vs Implementation
 
 The following reflects the code as it exists now:
 - The active vLLM benchmark entrypoint is `benchmarks/llm_infer_vllm.py`, not a `.sh` wrapper.
 - The default orchestrated flow is mostly single-process and sequential.
 - Blender benchmarking is integrated through `benchmarks/blender_bench_cuda.sh`.
+- Post-run artifact validation is available through `validate_run_artifacts.py`.
 
 ## Notes
 
 - Some Hugging Face models may require authentication or gated access.
 - The repo already contains large assets and prior results under `assets/` and `results/`.
-- There is no formal test suite at the moment.
+- There are lightweight repository tests under `tests/`, but they do not replace runtime validation on a real GPU host.
 - If a dependency is missing, some sections may skip or fail independently while other suites still run.
+- `validate_run_artifacts.py` is intended to catch obvious comparison hazards quickly, not to prove that two runs are methodologically identical.

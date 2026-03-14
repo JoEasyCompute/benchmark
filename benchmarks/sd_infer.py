@@ -35,6 +35,14 @@ from diffusers import (
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 
 
+def detect_backend() -> str:
+    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+
+
+def gpu_runtime_available() -> bool:
+    return bool(torch.cuda.is_available())
+
+
 def write_metric(row, metrics_path: str):
     os.makedirs(os.path.dirname(metrics_path) or ".", exist_ok=True)
     with open(metrics_path, "a") as f:
@@ -42,10 +50,14 @@ def write_metric(row, metrics_path: str):
 
 
 def _select_dtype(prefer_bf16: bool, device_index: int) -> torch.dtype:
-    """Use bf16 on >= Ada if requested; else fp16."""
-    if prefer_bf16 and torch.cuda.is_available():
-        major = torch.cuda.get_device_capability(device_index)[0]
-        if major >= 8:  # Ampere+ supports bf16 well; 4090 is Ada (SM89)
+    """Prefer bf16 when explicitly requested and the runtime appears to support it."""
+    if prefer_bf16 and gpu_runtime_available():
+        try:
+            major = torch.cuda.get_device_capability(device_index)[0]
+            if major >= 8:
+                return torch.bfloat16
+        except Exception:
+            # ROCm may not expose CUDA SM capability semantics; keep bf16 when requested.
             return torch.bfloat16
     return torch.float16
 
@@ -53,10 +65,13 @@ def _select_dtype(prefer_bf16: bool, device_index: int) -> torch.dtype:
 def _dtype_reason(prefer_bf16: bool, selected_dtype: torch.dtype, device_index: int) -> str:
     if selected_dtype == torch.bfloat16:
         return "bf16_requested_and_supported"
-    if prefer_bf16 and torch.cuda.is_available():
-        major = torch.cuda.get_device_capability(device_index)[0]
-        if major < 8:
-            return "bf16_requested_but_not_supported"
+    if prefer_bf16 and gpu_runtime_available():
+        try:
+            major = torch.cuda.get_device_capability(device_index)[0]
+            if major < 8:
+                return "bf16_requested_but_not_supported"
+        except Exception:
+            return "bf16_requested_but_runtime_support_unknown"
     return "default_fp16"
 
 
@@ -218,6 +233,7 @@ def run_worker(
                 "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "ok",
+                "gpu_backend": detect_backend(),
                 "model": model,
                 "dtype": str(dtype),
                 "dtype_reason": dtype_reason,
@@ -248,6 +264,7 @@ def run_worker(
                 "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
+                "gpu_backend": detect_backend(),
                 "model": model,
                 "bf16_requested": prefer_bf16,
                 "xformers_requested": enable_xformers,
@@ -270,6 +287,7 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
         "benchmark_schema_version": 2,
         "suite": "sd_infer",
         "status": "ok" if len(ok_results) == worker_count and not failed_results else "failed",
+        "gpu_backend": detect_backend(),
         "model": args.model,
         "iters": args.iterations,
         "per_gpu_batch_size": args.batch_size,
@@ -358,13 +376,14 @@ def main():
     ap.add_argument("--emit-worker-rows", action="store_true")
     args = ap.parse_args()
 
-    if not torch.cuda.is_available():
-        print("CUDA not available", file=sys.stderr)
+    if not gpu_runtime_available():
+        print("GPU runtime not available via torch", file=sys.stderr)
         write_metric(
             {
                 "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
+                "gpu_backend": detect_backend(),
                 "model": args.model,
                 "bf16_requested": args.bf16,
                 "xformers_requested": args.xformers,
@@ -383,7 +402,7 @@ def main():
                 "end_to_end_time_s": 0.0,
                 "workers_ok": 0,
                 "workers_failed": 1,
-                "error": "CUDA not available",
+                "error": "GPU runtime not available via torch",
             },
             args.metrics_path,
         )
@@ -472,6 +491,7 @@ def main():
                 "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
+                "gpu_backend": detect_backend(),
                 "model": args.model,
                 "bf16_requested": args.bf16,
                 "xformers_requested": args.xformers,

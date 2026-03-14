@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-import os, time, json, yaml, argparse, torch
+import argparse
+import json
+import os
+import time
+
+import torch
 import torch.distributed as dist
+import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
 # Enable TensorFloat32 on Ampere/Lovelace for better speed without extra memory
-torch.backends.cuda.matmul.allow_tf32 = True  # ★ optional perf tweak
+if hasattr(torch.backends, "cuda"):
+    torch.backends.cuda.matmul.allow_tf32 = True
 
 class SyntheticCausal(Dataset):
     def __init__(self, num_tokens=10_000_000, seq_len=2048, vocab=50257):
@@ -39,6 +46,14 @@ def init_dist():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
+
+def detect_backend() -> str:
+    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+
+
+def visible_device_env_var() -> str:
+    return "HIP_VISIBLE_DEVICES" if detect_backend() == "amd" else "CUDA_VISIBLE_DEVICES"
+
 @torch.no_grad()
 def tokens_per_sec(num_tokens, elapsed):
     return num_tokens / elapsed if elapsed > 0 else 0.0
@@ -57,8 +72,9 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0")) if world_size > 1 else 0
     rank = int(os.environ.get("RANK", "0")) if world_size > 1 else 0
-    visible_device_env = "HIP_VISIBLE_DEVICES" if os.environ.get("HIP_VISIBLE_DEVICES") else "CUDA_VISIBLE_DEVICES"
-    cuda_visible_devices = os.environ.get(visible_device_env, "")
+    backend = detect_backend()
+    visible_device_env = visible_device_env_var()
+    visible_devices = os.environ.get(visible_device_env, "")
 
     # ★ FIX 1: Correct dtype mapping
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg["dtype"]]
@@ -128,8 +144,10 @@ def main():
         "steps": steps,
         "world_size": world_size,
         "gpu_count": world_size,
+        "gpu_backend": backend,
         "visible_device_env": visible_device_env,
-        "cuda_visible_devices": cuda_visible_devices,
+        "visible_devices": visible_devices,
+        "cuda_visible_devices": visible_devices,
         "distributed_backend": "nccl" if world_size > 1 else None,
         "tokens_per_step": tokens_per_step,
         "steps_per_sec": n / elapsed if elapsed > 0 else 0.0,

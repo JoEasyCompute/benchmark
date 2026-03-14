@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import threading
 import time
 import traceback
@@ -16,6 +17,10 @@ try:
 except Exception:
     LLM = None
     SamplingParams = None
+
+
+def detect_backend() -> str:
+    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
 
 
 def make_prompt(tokenizer, target_tokens: int) -> tuple[str, int]:
@@ -50,7 +55,7 @@ class PowerSampler:
         self._stop = threading.Event()
         self._thr = None
         self._ok = False
-        self.backend = "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+        self.backend = detect_backend()
         try:
             if self.backend == "nvidia":
                 import pynvml as N
@@ -125,10 +130,24 @@ def detect_gpu_name() -> str:
             return torch.cuda.get_device_name(0)
     except Exception:
         pass
-    # fallback to NVML
+    if detect_backend() == "amd":
+        try:
+            out = subprocess.check_output(
+                ["rocm-smi", "--showproductname", "--json"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            payload = json.loads(out)
+            card = payload.get("card") or payload
+            if isinstance(card, dict):
+                for value in card.values():
+                    if isinstance(value, dict):
+                        product = value.get("Card series") or value.get("Card model") or value.get("Product Name")
+                        if product:
+                            return str(product)
+        except Exception:
+            pass
     try:
-        if os.environ.get("HIP_VISIBLE_DEVICES"):
-            return "amd_gpu"
         import pynvml as N
         N.nvmlInit()
         name = N.nvmlDeviceGetName(N.nvmlDeviceGetHandleByIndex(0)).decode()
@@ -159,7 +178,7 @@ def percentile(values, pct):
 
 def classify_failure(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}".lower()
-    if "out of memory" in text or "cuda error: out of memory" in text:
+    if "out of memory" in text or "cuda error: out of memory" in text or "hip out of memory" in text:
         return "oom"
     if "tensor_parallel_size" in text or "tensor parallel" in text:
         return "tensor_parallel_invalid"
@@ -167,8 +186,8 @@ def classify_failure(exc: Exception) -> str:
         return "model_unavailable"
     if "trust_remote_code" in text:
         return "remote_code_requirement"
-    if "cuda" in text:
-        return "cuda_runtime_error"
+    if "cuda" in text or "hip" in text or "rocm" in text:
+        return "gpu_runtime_error"
     return "unknown"
 
 
@@ -215,6 +234,7 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         "benchmark_schema_version": 2,
         "suite": "llm_infer",
         "status": "ok",
+        "gpu_backend": detect_backend(),
         "model": model,
         "dtype": dtype,
         "tensor_parallel": tp,
@@ -261,6 +281,7 @@ def main():
             "suite": "llm_infer",
             "status": "failed",
             "failure_kind": "dependency_unavailable",
+            "gpu_backend": detect_backend(),
             "model": cfg.get("model"),
             "dtype": cfg.get("dtype", "float16"),
             "error_type": "ImportError",
@@ -293,6 +314,7 @@ def main():
                     "suite": "llm_infer",
                     "status": "failed",
                     "failure_kind": classify_failure(e),
+                    "gpu_backend": detect_backend(),
                     "model": model,
                     "dtype": dtype,
                     "tensor_parallel": tp,
