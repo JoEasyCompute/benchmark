@@ -61,7 +61,8 @@ def _dtype_reason(prefer_bf16: bool, selected_dtype: torch.dtype, device_index: 
 
 
 def visible_gpu_count() -> int:
-    visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible = [x.strip() for x in visible_env.split(",") if x.strip()]
     if visible:
         return len(visible)
     return torch.cuda.device_count()

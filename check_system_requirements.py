@@ -10,8 +10,8 @@ try:
 except ModuleNotFoundError:
     raise SystemExit("[SYSTEM][ERROR] Missing dependency: PyYAML. Run env_setup.sh or activate the project venv.")
 
-
-REQUIRED_BINS = ("nvidia-smi", "stdbuf", "tee", "hostname")
+from gpu_platform import blender_backend, detect_backend, system_tool
+REQUIRED_BINS = ("stdbuf", "tee", "hostname")
 OPTIONAL_BINS = ("lscpu", "free")
 
 
@@ -23,14 +23,19 @@ def main():
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f) or {}
+    backend = detect_backend(cfg.get("gpu_backend", "auto"))
 
     payload = {"status": "ok", "checks": [], "warnings": [], "errors": []}
     payload["checks"].append({"platform": platform.platform()})
+    payload["checks"].append({"gpu_backend": backend})
 
     if platform.system() != "Linux":
-        payload["errors"].append("Linux host required for the pinned CUDA benchmark environment")
+        payload["errors"].append("Linux host required for the benchmark environment")
 
-    for name in REQUIRED_BINS:
+    gpu_tool = system_tool(backend)
+    required_bins = (gpu_tool, *REQUIRED_BINS)
+
+    for name in required_bins:
         path = shutil.which(name)
         payload["checks"].append({"binary": name, "path": path})
         if not path:
@@ -48,6 +53,7 @@ def main():
         payload["checks"].append({"binary": "blender", "path": blender_path})
         if not blender_path:
             payload["warnings"].append("blender not found on PATH; Blender benchmark will be skipped")
+        payload["checks"].append({"blender_backend": blender_backend(backend)})
 
         time_path = Path("/usr/bin/time")
         payload["checks"].append({"binary": "/usr/bin/time", "path": str(time_path) if time_path.exists() else None})

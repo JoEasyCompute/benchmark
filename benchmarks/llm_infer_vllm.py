@@ -9,8 +9,13 @@ import traceback
 from typing import List
 
 import yaml
-from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
+
+try:
+    from vllm import LLM, SamplingParams
+except Exception:
+    LLM = None
+    SamplingParams = None
 
 
 def make_prompt(tokenizer, target_tokens: int) -> tuple[str, int]:
@@ -45,17 +50,20 @@ class PowerSampler:
         self._stop = threading.Event()
         self._thr = None
         self._ok = False
+        self.backend = "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
         try:
-            import pynvml as N
-            self.N = N
-            N.nvmlInit()
-            self.handles = self._resolve_handles()
-            self._ok = True
+            if self.backend == "nvidia":
+                import pynvml as N
+                self.N = N
+                N.nvmlInit()
+                self.handles = self._resolve_handles()
+                self._ok = True
         except Exception:
             self._ok = False
 
     def _resolve_handles(self):
-        visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+        visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        visible = [x.strip() for x in visible_env.split(",") if x.strip()]
         selected = visible[: self.gpu_limit] if visible else []
         handles = []
 
@@ -79,7 +87,7 @@ class PowerSampler:
     def _tick(self):
         while not self._stop.is_set():
             total_w = 0.0
-            if self._ok:
+            if self._ok and self.backend == "nvidia":
                 for h in self.handles:
                     try:
                         # powerUsage is in milliwatts
@@ -119,6 +127,8 @@ def detect_gpu_name() -> str:
         pass
     # fallback to NVML
     try:
+        if os.environ.get("HIP_VISIBLE_DEVICES"):
+            return "amd_gpu"
         import pynvml as N
         N.nvmlInit()
         name = N.nvmlDeviceGetName(N.nvmlDeviceGetHandleByIndex(0)).decode()
@@ -245,6 +255,21 @@ def main():
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)["llm_infer"]
+    if LLM is None or SamplingParams is None:
+        row = {
+            "benchmark_schema_version": 2,
+            "suite": "llm_infer",
+            "status": "failed",
+            "failure_kind": "dependency_unavailable",
+            "model": cfg.get("model"),
+            "dtype": cfg.get("dtype", "float16"),
+            "error_type": "ImportError",
+            "error": "vllm is not importable in the current environment",
+            "gpu_name": detect_gpu_name(),
+        }
+        write_metric(row)
+        print("[ERROR] vllm is not importable in the current environment")
+        raise SystemExit(1)
 
     model = cfg["model"]
     dtype = cfg.get("dtype", "float16")

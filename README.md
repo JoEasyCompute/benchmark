@@ -28,7 +28,7 @@ bash run_all.sh
 ```
 
 On the first run, `run_all.sh` bootstraps `.venv` automatically by invoking `env_setup.sh` if the repo environment is missing or incomplete.
-That auto-bootstrap path is intended for supported Linux + NVIDIA hosts.
+That auto-bootstrap path is intended for supported Linux GPU hosts and now supports both NVIDIA/CUDA and AMD/ROCm setups through `gpu_backend`.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
 
 For a quick validation run, use:
@@ -41,8 +41,7 @@ Smoke mode writes an `effective_config.yaml` into the run folder and reduces rep
 
 Assumptions:
 - Linux benchmark host
-- NVIDIA drivers are already installed
-- CUDA-compatible GPUs are visible to `nvidia-smi`
+- NVIDIA drivers with `nvidia-smi` or AMD ROCm with `rocm-smi` are already installed
 - Python 3.10, 3.11, or 3.12 is available
 - Blender is optional; the Blender benchmark is skipped if `blender` is not on `PATH`
 
@@ -89,6 +88,7 @@ Multi-GPU:
 - `run_all.sh` now launches this suite with DDP via `python -m torch.distributed.run` for each configured `llm_train.world_sizes` value
 - Training scaling is controlled by `llm_train.world_sizes` in `config.yaml`
 - The root `gpu_include` list constrains which local GPU indices are visible to the run
+- The root `gpu_backend` selects `nvidia`, `amd`, or `auto`
 
 ### 1b. Real-Model LLM Training
 
@@ -144,7 +144,7 @@ File: [benchmarks/blender_bench_cuda.sh](./benchmarks/blender_bench_cuda.sh)
 What it does:
 - Runs Blender in background mode against bundled scenes
 - Measures wall-clock render time with `/usr/bin/time`
-- Compares one CUDA GPU vs all CUDA GPUs
+- Compares one GPU vs all GPUs using the configured Blender backend (`CUDA` for NVIDIA, `HIP` for AMD)
 
 Notes:
 - Scene selection now comes from `config.yaml` when `blender.scenes` is provided; otherwise it falls back to bundled scenes
@@ -156,6 +156,7 @@ Notes:
 Primary configuration lives in [config.yaml](./config.yaml).
 
 Main sections:
+- `gpu_backend`
 - `preflight`
 - `llm_train`
 - `llm_train_real`
@@ -203,13 +204,13 @@ It also builds repeat-level summaries grouped by benchmark configuration and sta
 - Accelerate
 - pandas / PyYAML / tqdm / safetensors
 
-The script assumes system-level CUDA and driver setup are already handled outside the repo.
+The script assumes system-level GPU driver setup is already handled outside the repo. It chooses CUDA or ROCm wheels based on `gpu_backend`.
 
 ## Metadata
 
 Each run writes `meta.json` with:
 - platform, kernel, Python version, and basic OS details
-- `nvidia-smi`, CPU, and memory snapshots
+- backend-specific GPU tool snapshots (`nvidia-smi` or `rocm-smi`), CPU, and memory snapshots
 - captured software versions for key tools and libraries such as PyTorch, vLLM, Diffusers, Transformers, xFormers, tokenizers, and Blender when available
 
 ## Preflight
@@ -225,7 +226,7 @@ Machine-state inspection:
 - `preflight.machine_state_strict: true` turns machine-state warnings into a hard stop before benchmark execution.
 
 System requirements:
-- `check_system_requirements.py` verifies the Linux + NVIDIA benchmark host assumptions and required binaries such as `nvidia-smi` and `stdbuf`.
+- `check_system_requirements.py` verifies the Linux GPU host assumptions and required binaries such as `nvidia-smi` or `rocm-smi` and `stdbuf`.
 - Missing required host tools are a hard stop before benchmark execution begins.
 
 ## Current Documentation vs Implementation

@@ -16,6 +16,7 @@ SKIP_COLD="${SKIP_COLD:-0}"
 DEBUG="${DEBUG:-0}"
 BLENDER_ENABLED="${BLENDER_ENABLED:-1}"
 BLENDER_SCENES_JSON="${BLENDER_SCENES_JSON:-[]}"
+BLENDER_GPU_BACKEND="${BLENDER_GPU_BACKEND:-CUDA}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -63,21 +64,22 @@ resolve_scene_path() {
   return 1
 }
 
-# Build the python expr to select CUDA devices (single/all) and set GPU rendering
-py_expr_cuda() { # $1=mode single|all  (mode is referenced via env CUDA_BENCH_MODE)
+# Build the python expr to select GPU devices (single/all) and set GPU rendering
+py_expr_gpu() {
   cat <<'PY'
 import bpy, os
 p=bpy.context.preferences.addons['cycles'].preferences
-p.compute_device_type='CUDA'
+backend=os.environ.get('BLENDER_GPU_BACKEND','CUDA')
+p.compute_device_type=backend
 p.get_devices()
 # disable all first
 for d in p.devices:
     if hasattr(d,'use'):
         d.use=False
-use_all = os.environ.get('CUDA_BENCH_MODE','single') == 'all'
+use_all = os.environ.get('BLENDER_BENCH_MODE','single') == 'all'
 count = 0
 for d in p.devices:
-    if d.type=='CUDA':
+    if d.type==backend:
         if use_all:
             d.use=True
         else:
@@ -97,16 +99,16 @@ run_and_time() { # $1=scene_path  $2=label  $3=mode single|all
   tmpout="$(mktemp)"
   trap 'rm -f "$tmpout"' RETURN
 
-  cmd=( "$BLENDER_BIN" -b "$scpath" -E CYCLES --python-expr "$(py_expr_cuda "$mode")" -f "$FRAME" )
+  cmd=( "$BLENDER_BIN" -b "$scpath" -E CYCLES --python-expr "$(py_expr_gpu "$mode")" -f "$FRAME" )
   echo "[RUN] $label ($mode)" >&2
 
   if [[ "$DEBUG" == "1" ]]; then
-    echo "  CMD: CUDA_BENCH_MODE=$mode /usr/bin/time -f %e -o $tmpout \\" >&2
+    echo "  CMD: BLENDER_BENCH_MODE=$mode BLENDER_GPU_BACKEND=$BLENDER_GPU_BACKEND /usr/bin/time -f %e -o $tmpout \\" >&2
     printf '       %q ' "${cmd[@]}" >&2; echo >&2
   fi
 
   rc=0
-  CUDA_BENCH_MODE="$mode" /usr/bin/time -f '%e' -o "$tmpout" \
+  BLENDER_BENCH_MODE="$mode" BLENDER_GPU_BACKEND="$BLENDER_GPU_BACKEND" /usr/bin/time -f '%e' -o "$tmpout" \
     "${cmd[@]}" >/dev/null 2>&1 || rc=$?
 
   tm="$(tr -d ' \t\r\n' < "$tmpout" 2>/dev/null || true)"
@@ -165,33 +167,33 @@ write_metric_row() {
 for scene in "${SCENES[@]}"; do
   if ! scpath="$(resolve_scene_path "$scene")"; then
     echo "[WARN] missing scene $SCENES_DIR/$scene — skipping" >&2
-    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"$(basename "$scene")\",\"backend\":\"CUDA\",\"error\":\"missing scene\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
+    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"$(basename "$scene")\",\"backend\":\"$BLENDER_GPU_BACKEND\",\"error\":\"missing scene\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
     continue
   fi
   base="$(basename "$scene")"
 
-  # CUDA single
-  [[ "${SKIP_COLD}" == "1" ]] && echo "[SKIP] ${base} CUDA (single): cold run skipped." >&2
-  read -r rc t <<<"$(run_and_time "$scpath" "${base} CUDA (single)" "single")"
+  # single GPU
+  [[ "${SKIP_COLD}" == "1" ]] && echo "[SKIP] ${base} ${BLENDER_GPU_BACKEND} (single): cold run skipped." >&2
+  read -r rc t <<<"$(run_and_time "$scpath" "${base} ${BLENDER_GPU_BACKEND} (single)" "single")"
   if [[ -n "${t:-}" ]]; then
     [[ $first -eq 0 ]] && results+=","
     first=0
-    results+="{\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"single\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc}"
-    write_metric_row "{\"suite\":\"blender\",\"status\":\"$([[ "$rc" -eq 0 ]] && echo ok || echo failed)\",\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"single\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc,\"time_s\":$t,\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
+    results+="{\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"single\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc}"
+    write_metric_row "{\"suite\":\"blender\",\"status\":\"$([[ "$rc" -eq 0 ]] && echo ok || echo failed)\",\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"single\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc,\"time_s\":$t,\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
   else
-    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"single\",\"rc\":$rc,\"error\":\"missing timing output\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
+    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"single\",\"rc\":$rc,\"error\":\"missing timing output\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
   fi
 
-  # CUDA all
-  [[ "${SKIP_COLD}" == "1" ]] && echo "[SKIP] ${base} CUDA (all): cold run skipped." >&2
-  read -r rc t <<<"$(run_and_time "$scpath" "${base} CUDA (all)" "all")"
+  # all GPUs
+  [[ "${SKIP_COLD}" == "1" ]] && echo "[SKIP] ${base} ${BLENDER_GPU_BACKEND} (all): cold run skipped." >&2
+  read -r rc t <<<"$(run_and_time "$scpath" "${base} ${BLENDER_GPU_BACKEND} (all)" "all")"
   if [[ -n "${t:-}" ]]; then
     [[ $first -eq 0 ]] && results+=","
     first=0
-    results+="{\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"all\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc}"
-    write_metric_row "{\"suite\":\"blender\",\"status\":\"$([[ "$rc" -eq 0 ]] && echo ok || echo failed)\",\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"all\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc,\"time_s\":$t,\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
+    results+="{\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"all\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc}"
+    write_metric_row "{\"suite\":\"blender\",\"status\":\"$([[ "$rc" -eq 0 ]] && echo ok || echo failed)\",\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"all\",\"cold\":0.0,\"warm\":$t,\"compile\":0.0,\"rc\":$rc,\"time_s\":$t,\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
   else
-    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"${base}\",\"backend\":\"CUDA\",\"mode\":\"all\",\"rc\":$rc,\"error\":\"missing timing output\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
+    write_metric_row "{\"suite\":\"blender\",\"status\":\"failed\",\"scene\":\"${base}\",\"backend\":\"${BLENDER_GPU_BACKEND}\",\"mode\":\"all\",\"rc\":$rc,\"error\":\"missing timing output\",\"repeat_index\":$REPEAT_INDEX,\"repeat_count\":$REPEAT_COUNT}"
   fi
 done
 

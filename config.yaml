@@ -1,4 +1,5 @@
 # Benchmark configuration
+gpu_backend: auto        # auto, nvidia, amd
 gpu_include: []           # [] = all visible
 repeat: 3                 # repeats per test to average
 results_dir: results
@@ -52,6 +53,7 @@ sd_infer:
 
 blender:
   enabled: true
+  backend: auto
   scenes:
     # Provide local .blend scene paths if available
     # - "/path/to/BMW27.blend"

@@ -35,9 +35,11 @@ def main():
     expect_keys(
         "root",
         cfg,
-        {"gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "smoke_mode"},
+        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "smoke_mode"},
         errors,
     )
+    if cfg.get("gpu_backend", "auto") not in {"auto", "nvidia", "amd"}:
+        errors.append("gpu_backend must be one of auto, nvidia, amd")
 
     if not is_pos_int(cfg.get("repeat", 1)):
         errors.append("repeat must be a positive integer")
@@ -154,9 +156,11 @@ def main():
     if not isinstance(blender, dict):
         errors.append("blender must be a mapping if provided")
     else:
-        expect_keys("blender", blender, {"enabled", "scenes"}, errors)
+        expect_keys("blender", blender, {"enabled", "backend", "scenes"}, errors)
         if "enabled" in blender and not isinstance(blender["enabled"], bool):
             errors.append("blender.enabled must be true or false")
+        if blender.get("backend", "auto") not in {"auto", "cuda", "hip"}:
+            errors.append("blender.backend must be one of auto, cuda, hip")
         scenes = blender.get("scenes", [])
         if scenes is not None and (not isinstance(scenes, list) or not all(isinstance(x, str) for x in scenes)):
             errors.append("blender.scenes must be a list of strings")

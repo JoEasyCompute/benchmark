@@ -9,22 +9,15 @@ try:
 except ModuleNotFoundError:
     raise SystemExit("[ESTIMATE][ERROR] Missing dependency: PyYAML. Run env_setup.sh or activate the project venv.")
 
+from gpu_platform import detect_backend, query_gpu_ids
+
 
 def visible_gpu_count():
-    visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible = [x.strip() for x in visible_env.split(",") if x.strip()]
     if visible:
         return len(visible)
-    try:
-        import subprocess
-
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        return len([line for line in out.splitlines() if line.strip()])
-    except Exception:
-        return 0
+    return len(query_gpu_ids(detect_backend("auto")))
 
 
 def add_range(acc, low_s, likely_s, high_s):

@@ -57,7 +57,8 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0")) if world_size > 1 else 0
     rank = int(os.environ.get("RANK", "0")) if world_size > 1 else 0
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_device_env = "HIP_VISIBLE_DEVICES" if os.environ.get("HIP_VISIBLE_DEVICES") else "CUDA_VISIBLE_DEVICES"
+    cuda_visible_devices = os.environ.get(visible_device_env, "")
 
     # ★ FIX 1: Correct dtype mapping
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg["dtype"]]
@@ -127,6 +128,7 @@ def main():
         "steps": steps,
         "world_size": world_size,
         "gpu_count": world_size,
+        "visible_device_env": visible_device_env,
         "cuda_visible_devices": cuda_visible_devices,
         "distributed_backend": "nccl" if world_size > 1 else None,
         "tokens_per_step": tokens_per_step,

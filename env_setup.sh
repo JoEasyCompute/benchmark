@@ -8,6 +8,7 @@ set -euo pipefail
 
 VENV_DIR="${VENV_DIR:-.venv}"
 PYTHON_BIN="${PYTHON_BIN:-}"
+GPU_BACKEND="${GPU_BACKEND:-auto}"
 
 pick_python_bin() {
   local candidate
@@ -33,7 +34,7 @@ pick_python_bin() {
 
 ensure_supported_host() {
   if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "[ENV][ERROR] This pinned environment is only supported on Linux benchmark hosts with NVIDIA/CUDA available." >&2
+    echo "[ENV][ERROR] This benchmark environment is only supported on Linux GPU hosts." >&2
     exit 1
   fi
 }
@@ -62,6 +63,16 @@ PY
 ensure_supported_host
 PYTHON_BIN="$(pick_python_bin)"
 ensure_supported_venv
+if [[ "$GPU_BACKEND" == "auto" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_BACKEND="nvidia"
+  elif command -v rocm-smi >/dev/null 2>&1; then
+    GPU_BACKEND="amd"
+  else
+    echo "[ENV][ERROR] Could not detect a supported GPU backend. Expected nvidia-smi or rocm-smi." >&2
+    exit 1
+  fi
+fi
 
 # Create venv if missing
 if [[ ! -d "$VENV_DIR" ]]; then
@@ -78,14 +89,24 @@ pip install --upgrade pip wheel
 # setuptools pinned for vLLM compatibility
 pip install "setuptools<80,>=77.0.3"
 
-# Torch/cu128 stack (Ada/4090 friendly)
-pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
-  "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
+# Torch stack
+if [[ "$GPU_BACKEND" == "amd" ]]; then
+  pip install --extra-index-url https://download.pytorch.org/whl/rocm6.3 \
+    "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
+else
+  pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+    "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
+fi
 
-# vLLM + xformers (match your working versions)
-pip install \
-  "vllm==0.11.0" \
-  "xformers==0.0.32.post1"
+# Optional acceleration stack
+if [[ "$GPU_BACKEND" == "nvidia" ]]; then
+  pip install \
+    "vllm==0.11.0" \
+    "xformers==0.0.32.post1"
+else
+  pip install "vllm==0.11.0" || echo "[ENV][WARN] vLLM install failed; llm_infer_vllm may be unavailable on this AMD host"
+  pip install "xformers==0.0.32.post1" || echo "[ENV][WARN] xformers install failed; SD will continue without it"
+fi
 
 # Stable Diffusion trio (pins that avoid CLIP offload kw issues)
 # --no-deps prevents pulling mismatched transitive deps
@@ -95,23 +116,41 @@ pip install --upgrade --no-deps \
   "accelerate==1.10.1"
 
 # Bench deps
-pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0" "nvidia-ml-py>=12.560.30"
+if [[ "$GPU_BACKEND" == "nvidia" ]]; then
+  pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0" "nvidia-ml-py>=12.560.30"
+else
+  pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0"
+fi
 
 echo "---- versions ----"
 python - <<'PY'
-import torch, torchvision, torchaudio, setuptools, xformers
-import transformers, diffusers, accelerate, pynvml
+import os
+import torch, torchvision, torchaudio, setuptools
+import transformers, diffusers, accelerate
 import tokenizers
 print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
 print("torchaudio", torchaudio.__version__)
 print("setuptools", setuptools.__version__)
-print("xformers", xformers.__version__)
 print("transformers", transformers.__version__)
 print("tokenizers", tokenizers.__version__)
 print("diffusers", diffusers.__version__)
 print("accelerate", accelerate.__version__)
-print("pynvml", pynvml.__version__)
+try:
+    import xformers
+    print("xformers", xformers.__version__)
+except Exception:
+    print("xformers", None)
+try:
+    import vllm
+    print("vllm", vllm.__version__)
+except Exception:
+    print("vllm", None)
+try:
+    import pynvml
+    print("pynvml", pynvml.__version__)
+except Exception:
+    print("pynvml", None)
 PY
 
 # This will warn if anything is still mismatched (ok to continue if warnings appear for optional extras)

@@ -8,6 +8,7 @@ VENV_DIR="$BASE_DIR/.venv"
 ENV_SETUP_SCRIPT="$BASE_DIR/env_setup.sh"
 BASE_CONFIG_PATH="$BASE_DIR/config.yaml"
 CONFIG_UTILS="$BASE_DIR/config_utils.py"
+GPU_PLATFORM="$BASE_DIR/gpu_platform.py"
 SMOKE_MODE=0
 
 while [[ $# -gt 0 ]]; do
@@ -25,9 +26,10 @@ done
 
 ensure_python_env() {
   local py_bin="$VENV_DIR/bin/python"
+  local backend="$1"
   if [[ ! -x "$py_bin" ]]; then
     echo "[SETUP] Python environment missing; running env_setup.sh"
-    bash "$ENV_SETUP_SCRIPT"
+    GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
     return
   fi
 
@@ -35,22 +37,19 @@ ensure_python_env() {
 import accelerate
 import diffusers
 import pandas
-import pynvml
 import safetensors
 import torch
 import transformers
 import tqdm
-import vllm
-import xformers
 import yaml
 PY
   then
     echo "[SETUP] Python environment incomplete; running env_setup.sh"
-    bash "$ENV_SETUP_SCRIPT"
+    GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
   fi
 }
-
-ensure_python_env
+GPU_BACKEND="$(python3 "$GPU_PLATFORM" detect-backend --backend "$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path gpu_backend --default '"auto"' --format text)")"
+ensure_python_env "$GPU_BACKEND"
 
 # Activate repo venv
 # shellcheck disable=SC1090
@@ -65,25 +64,17 @@ RESULTS_ROOT="${RESULTS_ROOT:-results}"
 REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path repeat --default '1' --format text)"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
 readarray -t GPU_INCLUDE_VALUES < <(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path gpu_include --default '[]' --format lines)
+VISIBLE_ENV_VAR="$(python3 "$GPU_PLATFORM" visible-env-var --backend "$GPU_BACKEND")"
+GPU_SYSTEM_TOOL="$(python3 "$GPU_PLATFORM" system-tool --backend "$GPU_BACKEND")"
+BLENDER_BACKEND_CFG="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path blender.backend --default '"auto"' --format text)"
+if [[ "$BLENDER_BACKEND_CFG" == "auto" ]]; then
+  BLENDER_GPU_BACKEND="$(python3 "$GPU_PLATFORM" blender-backend --backend "$GPU_BACKEND")"
+else
+  BLENDER_GPU_BACKEND="${BLENDER_BACKEND_CFG^^}"
+fi
 
 detect_all_gpu_ids() {
-  python3 - <<'PY'
-import subprocess
-
-try:
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
-        text=True,
-        stderr=subprocess.DEVNULL,
-    ).strip()
-except Exception:
-    out = ""
-
-for line in out.splitlines():
-    line = line.strip()
-    if line:
-        print(line)
-PY
+  python3 "$GPU_PLATFORM" gpu-ids --backend "$GPU_BACKEND"
 }
 
 readarray -t ALL_GPU_IDS < <(detect_all_gpu_ids)
@@ -92,9 +83,9 @@ if [[ "${#GPU_INCLUDE_VALUES[@]}" -gt 0 ]]; then
   SELECTED_GPU_IDS=("${GPU_INCLUDE_VALUES[@]}")
 fi
 if [[ "${#SELECTED_GPU_IDS[@]}" -gt 0 ]]; then
-  CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${SELECTED_GPU_IDS[*]}")"
-  export CUDA_VISIBLE_DEVICES
-  echo "[INFO] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+  SELECTED_GPU_CSV="$(IFS=,; echo "${SELECTED_GPU_IDS[*]}")"
+  export "$VISIBLE_ENV_VAR=$SELECTED_GPU_CSV"
+  echo "[INFO] $VISIBLE_ENV_VAR=$SELECTED_GPU_CSV"
 fi
 VISIBLE_GPU_COUNT="${#SELECTED_GPU_IDS[@]}"
 if [[ "$VISIBLE_GPU_COUNT" -eq 0 ]]; then
@@ -108,7 +99,7 @@ DATE="$(date +%Y%m%d_%H%M%S)"
 
 # GPU count + first model name
 GPU_COUNT="${VISIBLE_GPU_COUNT}"
-GPU_MODEL="$(CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || echo '')"
+GPU_MODEL="$(python3 "$GPU_PLATFORM" gpu-names --backend "$GPU_BACKEND" --visible-devices "${SELECTED_GPU_CSV:-}" | head -n1 || echo '')"
 
 # Compact the model name aggressively:
 # - strip "NVIDIA", "GeForce", "RTX", "Ada Generation", "Graphics"
@@ -159,16 +150,22 @@ fi
 python3 "$BASE_DIR/estimate_runtime.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/runtime_estimate.json"
 python3 "$BASE_DIR/check_system_requirements.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/system_requirements.json"
 if [[ "$MACHINE_STATE_STRICT" == "1" ]]; then
-  python3 "$BASE_DIR/check_machine_state.py" --strict --json-out "$RUN_DIR/machine_state.json"
+  python3 "$BASE_DIR/check_machine_state.py" --config "$RUN_CONFIG_PATH" --strict --json-out "$RUN_DIR/machine_state.json"
 else
-  python3 "$BASE_DIR/check_machine_state.py" --json-out "$RUN_DIR/machine_state.json"
+  python3 "$BASE_DIR/check_machine_state.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/machine_state.json"
 fi
 
 # --- System metadata snapshot ---
 meta_file="$RUN_DIR/meta.json"
-python3 - <<'PY' >"$meta_file"
+python3 - "$GPU_BACKEND" "$GPU_SYSTEM_TOOL" "$VISIBLE_ENV_VAR" "${SELECTED_GPU_CSV:-}" <<'PY' >"$meta_file"
 import json, os, subprocess, platform, time
 from importlib.metadata import PackageNotFoundError, version
+import sys
+
+backend = sys.argv[1]
+gpu_tool = sys.argv[2]
+visible_env_var = sys.argv[3]
+visible_csv = sys.argv[4]
 
 def cmd(x):
     try:
@@ -184,7 +181,16 @@ def pkg(name):
     except Exception:
         return None
 
-gpu = cmd("nvidia-smi --query-gpu=index,name,driver_version,pstate,temperature.gpu,power.draw --format=csv,noheader")
+env = os.environ.copy()
+if visible_csv:
+    env[visible_env_var] = visible_csv
+try:
+    if backend == "amd":
+        gpu = subprocess.check_output([gpu_tool, "--showproductname", "--showtemp", "--showuse", "--json"], text=True, stderr=subprocess.DEVNULL, env=env).strip()
+    else:
+        gpu = subprocess.check_output([gpu_tool, "--query-gpu=index,name,driver_version,pstate,temperature.gpu,power.draw", "--format=csv,noheader"], text=True, stderr=subprocess.DEVNULL, env=env).strip()
+except Exception:
+    gpu = ""
 cpu = cmd("lscpu")
 mem = cmd("free -h")
 osrel = cmd("cat /etc/os-release")
@@ -194,6 +200,7 @@ data = {
     "platform": platform.platform(),
     "kernel": platform.release(),
     "python": platform.python_version(),
+    "gpu_backend": backend,
     "gpu_smi": gpu,
     "cpu_lscpu": cpu,
     "mem_free": mem,
@@ -212,7 +219,7 @@ data = {
         "pandas": pkg("pandas"),
         "safetensors": pkg("safetensors"),
         "blender": blender_version or None,
-        "nvidia_smi": cmd("nvidia-smi --version | head -n1"),
+        gpu_tool: cmd(f"{gpu_tool} --version | head -n1"),
     },
 }
 print(json.dumps(data, indent=2))
@@ -304,11 +311,11 @@ PY
     train_gpu_csv="$(IFS=,; echo "${train_gpu_ids[*]}")"
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     if [[ "$world_size" -gt 1 ]]; then
-      run_and_log "llm_train_ws${world_size}_r${rep}" env CUDA_VISIBLE_DEVICES="$train_gpu_csv" \
+      run_and_log "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
         python3 -m torch.distributed.run --standalone --nproc_per_node "$world_size" \
         "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     else
-      run_and_log "llm_train_ws${world_size}_r${rep}" env CUDA_VISIBLE_DEVICES="$train_gpu_csv" \
+      run_and_log "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
         python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     fi
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
@@ -366,14 +373,15 @@ if command -v blender >/dev/null 2>&1; then
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"
+  export BLENDER_GPU_BACKEND
   export BLENDER_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.enabled --default 'true' --format bool-int)"
   export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-    export RESULTS_JSON="$RUN_DIR/results/blender_bench_cuda_r${rep}.json"
+    export RESULTS_JSON="$RUN_DIR/results/blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}.json"
     export REPEAT_INDEX="$rep"
     export REPEAT_COUNT
-    run_and_log "blender_bench_cuda_r${rep}" bash "$BENCH_DIR/blender_bench_cuda.sh"
+    run_and_log "blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}" bash "$BENCH_DIR/blender_bench_cuda.sh"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "blender" "$rep" "$REPEAT_COUNT"
   done
 else
@@ -400,5 +408,5 @@ echo "        - Summary JSON:  $RUN_DIR/metrics_summary.json"
 echo "        - Runtime Est.:  $RUN_DIR/runtime_estimate.json"
 echo "        - System Reqs:   $RUN_DIR/system_requirements.json"
 echo "        - Machine State: $RUN_DIR/machine_state.json"
-echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_cuda_r*.json (if ran)"
+echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_*.json (if ran)"
 echo "        - Logs:          $RUN_DIR/logs/*.log"

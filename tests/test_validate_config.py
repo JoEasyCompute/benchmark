@@ -25,6 +25,7 @@ class ValidateConfigTest(unittest.TestCase):
     def test_valid_config_passes(self):
         result = self.run_validate(
             """
+            gpu_backend: amd
             repeat: 1
             results_dir: results
             preflight:
@@ -60,6 +61,7 @@ class ValidateConfigTest(unittest.TestCase):
               emit_worker_rows: false
             blender:
               enabled: true
+              backend: hip
               scenes: []
             """
         )
@@ -69,6 +71,7 @@ class ValidateConfigTest(unittest.TestCase):
     def test_unknown_key_fails(self):
         result = self.run_validate(
             """
+            gpu_backend: invalid
             repeat: 1
             results_dir: results
             bogus: true
@@ -99,6 +102,7 @@ class ValidateConfigTest(unittest.TestCase):
             """
         )
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gpu_backend must be one of auto, nvidia, amd", result.stderr)
         self.assertIn("unsupported key 'bogus'", result.stderr)
 
 
