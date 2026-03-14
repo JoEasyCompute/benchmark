@@ -10,6 +10,8 @@ if [[ -z "${VIRTUAL_ENV:-}" && -f "$BASE_DIR/.venv/bin/activate" ]]; then
   source "$BASE_DIR/.venv/bin/activate"
 fi
 
+python3 "$BASE_DIR/validate_config.py" --config "$BASE_DIR/config.yaml"
+
 # Determine results root from config.yaml (fallback: results)
 RESULTS_ROOT="$(python3 - <<'PY'
 import yaml, os
@@ -68,6 +70,8 @@ RUN_ID="${DATE}_${HOST}_${GPU_TAG}"
 RUN_DIR="$BASE_DIR/${RESULTS_ROOT}/${RUN_ID}"
 mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
+
+python3 "$BASE_DIR/estimate_runtime.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/runtime_estimate.json"
 
 # --- System metadata snapshot ---
 meta_file="$RUN_DIR/meta.json"
@@ -274,5 +278,6 @@ echo "        - Unified JSONL: $RUN_DIR/results/metrics.jsonl"
 echo "        - CSV:           $RUN_DIR/metrics.csv"
 echo "        - Summary CSV:   $RUN_DIR/metrics_summary.csv"
 echo "        - Summary JSON:  $RUN_DIR/metrics_summary.json"
+echo "        - Runtime Est.:  $RUN_DIR/runtime_estimate.json"
 echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_cuda_r*.json (if ran)"
 echo "        - Logs:          $RUN_DIR/logs/*.log"
