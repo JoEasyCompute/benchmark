@@ -6,6 +6,21 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$BASE_DIR/benchmarks"
 VENV_DIR="$BASE_DIR/.venv"
 ENV_SETUP_SCRIPT="$BASE_DIR/env_setup.sh"
+BASE_CONFIG_PATH="$BASE_DIR/config.yaml"
+SMOKE_MODE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --smoke)
+      SMOKE_MODE=1
+      shift
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 ensure_python_env() {
   local py_bin="$VENV_DIR/bin/python"
@@ -40,7 +55,7 @@ ensure_python_env
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
 
-python3 "$BASE_DIR/validate_config.py" --config "$BASE_DIR/config.yaml"
+python3 "$BASE_DIR/validate_config.py" --config "$BASE_CONFIG_PATH"
 MACHINE_STATE_STRICT="$(python3 - <<'PY'
 import yaml
 cfg = yaml.safe_load(open("config.yaml")) or {}
@@ -107,8 +122,84 @@ RUN_DIR="$BASE_DIR/${RESULTS_ROOT}/${RUN_ID}"
 mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
-python3 "$BASE_DIR/estimate_runtime.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/runtime_estimate.json"
-python3 "$BASE_DIR/check_system_requirements.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/system_requirements.json"
+RUN_CONFIG_PATH="$RUN_DIR/effective_config.yaml"
+python3 - "$BASE_CONFIG_PATH" "$RUN_CONFIG_PATH" "$SMOKE_MODE" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+smoke_mode = sys.argv[3] == "1"
+
+cfg = yaml.safe_load(src.read_text()) or {}
+cfg["smoke_mode"] = smoke_mode
+
+if smoke_mode:
+    cfg["repeat"] = 1
+
+    llm_train = cfg.get("llm_train") or {}
+    llm_train["steps"] = min(int(llm_train.get("steps", 1) or 1), 2)
+    llm_train["batch_size"] = min(int(llm_train.get("batch_size", 1) or 1), 1)
+    llm_train["seq_len"] = min(int(llm_train.get("seq_len", 128) or 128), 128)
+    cfg["llm_train"] = llm_train
+
+    llm_train_real = cfg.get("llm_train_real") or {}
+    if llm_train_real.get("enabled", False):
+        llm_train_real["steps"] = min(int(llm_train_real.get("steps", 1) or 1), 1)
+        llm_train_real["batch_size"] = min(int(llm_train_real.get("batch_size", 1) or 1), 1)
+        llm_train_real["seq_len"] = min(int(llm_train_real.get("seq_len", 128) or 128), 128)
+        cfg["llm_train_real"] = llm_train_real
+
+    llm_infer = cfg.get("llm_infer") or {}
+    batch_sizes = llm_infer.get("batch_sizes") or [1]
+    tp_sizes = llm_infer.get("tensor_parallel_sizes") or [1]
+    llm_infer["batch_sizes"] = [int(batch_sizes[0])]
+    llm_infer["tensor_parallel_sizes"] = [int(tp_sizes[0])]
+    llm_infer["prompt_len"] = min(int(llm_infer.get("prompt_len", 64) or 64), 64)
+    llm_infer["output_len"] = min(int(llm_infer.get("output_len", 32) or 32), 32)
+    cfg["llm_infer"] = llm_infer
+
+    sd_infer = cfg.get("sd_infer") or {}
+    sizes = sd_infer.get("sizes") or [512]
+    sd_infer["sizes"] = [int(sizes[0])]
+    sd_infer["steps"] = min(int(sd_infer.get("steps", 4) or 4), 4)
+    sd_infer["per_gpu_batch"] = 1
+    cfg["sd_infer"] = sd_infer
+
+    blender = cfg.get("blender") or {}
+    scenes = blender.get("scenes") or []
+    if scenes:
+        blender["scenes"] = [scenes[0]]
+    cfg["blender"] = blender
+
+dst.write_text(yaml.safe_dump(cfg, sort_keys=False))
+PY
+echo "[INFO] Effective config: $RUN_CONFIG_PATH"
+if [[ "$SMOKE_MODE" == "1" ]]; then
+  echo "[INFO] Smoke mode enabled"
+fi
+REPEAT_COUNT="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f) or {}
+print(int(cfg.get("repeat", 1)))
+PY
+)"
+LLM_INFER_WARMUP_S=5
+LLM_INFER_DURATION_S=30
+SD_ITERATIONS=5
+if [[ "$SMOKE_MODE" == "1" ]]; then
+  LLM_INFER_WARMUP_S=1
+  LLM_INFER_DURATION_S=2
+  SD_ITERATIONS=1
+fi
+
+python3 "$BASE_DIR/estimate_runtime.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/runtime_estimate.json"
+python3 "$BASE_DIR/check_system_requirements.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/system_requirements.json"
 if [[ "$MACHINE_STATE_STRICT" == "1" ]]; then
   python3 "$BASE_DIR/check_machine_state.py" --strict --json-out "$RUN_DIR/machine_state.json"
 else
@@ -218,20 +309,21 @@ PY
 # --- 1) LLM Training ---
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-  run_and_log "llm_train_r${rep}" python3 "$BENCH_DIR/llm_train.py" --config "$BASE_DIR/config.yaml"
+  run_and_log "llm_train_r${rep}" python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
 done
 
-LLM_TRAIN_REAL_ENABLED="$(python3 - <<'PY'
+LLM_TRAIN_REAL_ENABLED="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg = yaml.safe_load(open("config.yaml")) or {}
+import sys
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
 print(1 if cfg.get("llm_train_real", {}).get("enabled", False) else 0)
 PY
 )"
 if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-    run_and_log "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$BASE_DIR/config.yaml"
+    run_and_log "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$RUN_CONFIG_PATH"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train_real" "$rep" "$REPEAT_COUNT"
   done
 fi
@@ -239,44 +331,50 @@ fi
 # --- 2) LLM Inference (vLLM) ---
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-  run_and_log "llm_infer_vllm_r${rep}" python3 "$BENCH_DIR/llm_infer_vllm.py" --config "$BASE_DIR/config.yaml" --warmup 5 --duration 30
+  run_and_log "llm_infer_vllm_r${rep}" python3 "$BENCH_DIR/llm_infer_vllm.py" --config "$RUN_CONFIG_PATH" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_infer" "$rep" "$REPEAT_COUNT"
 done
 
 # --- 3) Stable Diffusion Inference ---
-readarray -t SD_SIZES < <(python3 - <<'PY'
+readarray -t SD_SIZES < <(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print("\n".join(map(str,cfg.get("sd_infer",{}).get("sizes",[512]))))
 PY
 )
-SD_MODEL="$(python3 - <<'PY'
+SD_MODEL="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print(cfg.get("sd_infer",{}).get("model","stabilityai/stable-diffusion-2-1"))
 PY
 )"
-SD_STEPS="$(python3 - <<'PY'
+SD_STEPS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print(cfg.get("sd_infer",{}).get("steps",20))
 PY
 )"
-SD_BS="$(python3 - <<'PY'
+SD_BS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print(cfg.get("sd_infer",{}).get("per_gpu_batch",1))
 PY
 )"
-SD_MULTI_GPU_MODE="$(python3 - <<'PY'
+SD_MULTI_GPU_MODE="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print(cfg.get("sd_infer",{}).get("multi_gpu_mode","single"))
 PY
 )"
-SD_EMIT_WORKER_ROWS="$(python3 - <<'PY'
+SD_EMIT_WORKER_ROWS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg=yaml.safe_load(open("config.yaml"))
+import sys
+cfg=yaml.safe_load(open(sys.argv[1]))
 print(1 if cfg.get("sd_infer",{}).get("emit_worker_rows", False) else 0)
 PY
 )"
@@ -286,7 +384,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
     if [[ "$SD_EMIT_WORKER_ROWS" == "1" ]]; then
       run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
         --model "$SD_MODEL" --width "$sz" --height "$sz" \
-        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations 5 \
+        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
         --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
         --multi-gpu-mode "$SD_MULTI_GPU_MODE" \
@@ -294,7 +392,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
     else
       run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
         --model "$SD_MODEL" --width "$sz" --height "$sz" \
-        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations 5 \
+        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
         --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
         --multi-gpu-mode "$SD_MULTI_GPU_MODE"
@@ -308,15 +406,17 @@ if command -v blender >/dev/null 2>&1; then
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"
-  export BLENDER_ENABLED="$(python3 - <<'PY'
+  export BLENDER_ENABLED="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import yaml
-cfg = yaml.safe_load(open("config.yaml")) or {}
+import sys
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
 print(1 if cfg.get("blender", {}).get("enabled", True) else 0)
 PY
 )"
-  export BLENDER_SCENES_JSON="$(python3 - <<'PY'
+  export BLENDER_SCENES_JSON="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
 import json, yaml
-cfg = yaml.safe_load(open("config.yaml")) or {}
+import sys
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
 scenes = cfg.get("blender", {}).get("scenes") or []
 print(json.dumps(scenes))
 PY

@@ -31,6 +31,14 @@ On the first run, `run_all.sh` bootstraps `.venv` automatically by invoking `env
 That auto-bootstrap path is intended for supported Linux + NVIDIA hosts.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
 
+For a quick validation run, use:
+
+```bash
+bash run_all.sh --smoke
+```
+
+Smoke mode writes an `effective_config.yaml` into the run folder and reduces repeat counts, per-suite durations, and sweep breadth so you can validate the harness without paying full benchmark cost.
+
 Assumptions:
 - Linux benchmark host
 - NVIDIA drivers are already installed
@@ -45,11 +53,12 @@ Assumptions:
 1. Bootstraps `.venv` via `env_setup.sh` if needed, then activates it.
 2. Reads `results_dir` from `config.yaml`.
 3. Creates a unique run directory under `results/` using timestamp, hostname, GPU count, and GPU model.
-4. Writes a system snapshot to `meta.json`.
-5. Runs the benchmark scripts in sequence.
-6. Saves per-benchmark logs under `logs/`.
-7. Saves structured outputs under `results/` inside the run directory.
-8. Runs `harness.py` to produce consolidated raw and repeat-summary outputs.
+4. Writes an `effective_config.yaml` for the run, applying smoke-mode overrides when requested.
+5. Writes a system snapshot to `meta.json`.
+6. Runs the benchmark scripts in sequence.
+7. Saves per-benchmark logs under `logs/`.
+8. Saves structured outputs under `results/` inside the run directory.
+9. Runs `harness.py` to produce consolidated raw and repeat-summary outputs.
 
 The run directory is the main artifact unit for the repo.
 
@@ -166,6 +175,7 @@ results/<timestamp>_<host>_<gpu-tag>/
 
 Typical contents:
 - `meta.json`: machine snapshot plus captured software versions
+- `effective_config.yaml`: the exact config used for that run, including smoke-mode overrides
 - `machine_state.json`: preflight machine-state warnings/checks
 - `logs/*.log`: per-suite logs
 - `results/metrics.jsonl`: unified structured metrics for all active suites
