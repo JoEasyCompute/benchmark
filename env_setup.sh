@@ -7,10 +7,65 @@
 set -euo pipefail
 
 VENV_DIR="${VENV_DIR:-.venv}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+
+pick_python_bin() {
+  local candidate
+  if [[ -n "$PYTHON_BIN" ]]; then
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+      command -v "$PYTHON_BIN"
+      return 0
+    fi
+    echo "[ENV][ERROR] Requested PYTHON_BIN '$PYTHON_BIN' is not on PATH" >&2
+    exit 1
+  fi
+
+  for candidate in python3.12 python3.11 python3.10; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+
+  echo "[ENV][ERROR] No supported Python interpreter found. Install python3.10, python3.11, or python3.12." >&2
+  exit 1
+}
+
+ensure_supported_host() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "[ENV][ERROR] This pinned environment is only supported on Linux benchmark hosts with NVIDIA/CUDA available." >&2
+    exit 1
+  fi
+}
+
+ensure_supported_venv() {
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    return 0
+  fi
+
+  local version
+  version="$("$VENV_DIR/bin/python" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+
+  case "$version" in
+    3.10|3.11|3.12) return 0 ;;
+  esac
+
+  echo "[ENV][ERROR] Existing $VENV_DIR uses unsupported Python $version." >&2
+  echo "[ENV][ERROR] Remove or replace $VENV_DIR, then rerun env_setup.sh with Python 3.10-3.12." >&2
+  exit 1
+}
+
+ensure_supported_host
+PYTHON_BIN="$(pick_python_bin)"
+ensure_supported_venv
 
 # Create venv if missing
 if [[ ! -d "$VENV_DIR" ]]; then
-  python3 -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
@@ -40,12 +95,12 @@ pip install --upgrade --no-deps \
   "accelerate==1.10.1"
 
 # Bench deps
-pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0"
+pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0" "nvidia-ml-py>=12.560.30"
 
 echo "---- versions ----"
 python - <<'PY'
 import torch, torchvision, torchaudio, setuptools, xformers
-import transformers, diffusers, accelerate
+import transformers, diffusers, accelerate, pynvml
 import tokenizers
 print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
@@ -56,10 +111,10 @@ print("transformers", transformers.__version__)
 print("tokenizers", tokenizers.__version__)
 print("diffusers", diffusers.__version__)
 print("accelerate", accelerate.__version__)
+print("pynvml", pynvml.__version__)
 PY
 
 # This will warn if anything is still mismatched (ok to continue if warnings appear for optional extras)
 pip check || true
 
 echo "Environment ready."
-

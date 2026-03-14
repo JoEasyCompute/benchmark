@@ -24,21 +24,25 @@ This is not a packaged Python project. It is a collection of scripts plus local 
 
 ```bash
 cd /path/to/benchmark
-bash env_setup.sh
 bash run_all.sh
 ```
 
+On the first run, `run_all.sh` bootstraps `.venv` automatically by invoking `env_setup.sh` if the repo environment is missing or incomplete.
+That auto-bootstrap path is intended for supported Linux + NVIDIA hosts.
+You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
+
 Assumptions:
+- Linux benchmark host
 - NVIDIA drivers are already installed
 - CUDA-compatible GPUs are visible to `nvidia-smi`
-- Python 3 is available
+- Python 3.10, 3.11, or 3.12 is available
 - Blender is optional; the Blender benchmark is skipped if `blender` is not on `PATH`
 
 ## Runtime Flow
 
 `run_all.sh` does the following:
 
-1. Activates `.venv` if present.
+1. Bootstraps `.venv` via `env_setup.sh` if needed, then activates it.
 2. Reads `results_dir` from `config.yaml`.
 3. Creates a unique run directory under `results/` using timestamp, hostname, GPU count, and GPU model.
 4. Writes a system snapshot to `meta.json`.
@@ -52,6 +56,7 @@ The run directory is the main artifact unit for the repo.
 If `repeat` is greater than 1 in `config.yaml`, the orchestrator reruns each suite that many times and tags emitted rows with `repeat_index` and `repeat_count`.
 
 Before benchmark execution, the harness also performs config validation, runtime estimation, and machine-state inspection.
+It now also runs a system-requirements preflight that fails fast on unsupported hosts or missing required binaries.
 
 ## Benchmark Suites
 
@@ -169,6 +174,7 @@ Typical contents:
 - `metrics_summary.csv`: repeat-level summary CSV with mean/stdev/min/max for tracked metrics
 - `metrics_summary.json`: repeat-level summary JSON
 - `runtime_estimate.json`: estimated runtime breakdown for the configured run
+- `system_requirements.json`: required/optional host-tool checks for the configured run
 
 `harness.py` builds the CSV by reading:
 - `results/metrics.jsonl`
@@ -206,6 +212,10 @@ Runtime estimation:
 Machine-state inspection:
 - `check_machine_state.py` records GPU machine-state warnings to `machine_state.json`.
 - `preflight.machine_state_strict: true` turns machine-state warnings into a hard stop before benchmark execution.
+
+System requirements:
+- `check_system_requirements.py` verifies the Linux + NVIDIA benchmark host assumptions and required binaries such as `nvidia-smi` and `stdbuf`.
+- Missing required host tools are a hard stop before benchmark execution begins.
 
 ## Current Documentation vs Implementation
 

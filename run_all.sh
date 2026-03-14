@@ -4,11 +4,41 @@ set -Eeuo pipefail
 # --- Setup ---
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$BASE_DIR/benchmarks"
+VENV_DIR="$BASE_DIR/.venv"
+ENV_SETUP_SCRIPT="$BASE_DIR/env_setup.sh"
 
-# Activate venv if available
-if [[ -z "${VIRTUAL_ENV:-}" && -f "$BASE_DIR/.venv/bin/activate" ]]; then
-  source "$BASE_DIR/.venv/bin/activate"
-fi
+ensure_python_env() {
+  local py_bin="$VENV_DIR/bin/python"
+  if [[ ! -x "$py_bin" ]]; then
+    echo "[SETUP] Python environment missing; running env_setup.sh"
+    bash "$ENV_SETUP_SCRIPT"
+    return
+  fi
+
+  if ! "$py_bin" - <<'PY' >/dev/null 2>&1
+import accelerate
+import diffusers
+import pandas
+import pynvml
+import safetensors
+import torch
+import transformers
+import tqdm
+import vllm
+import xformers
+import yaml
+PY
+  then
+    echo "[SETUP] Python environment incomplete; running env_setup.sh"
+    bash "$ENV_SETUP_SCRIPT"
+  fi
+}
+
+ensure_python_env
+
+# Activate repo venv
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
 
 python3 "$BASE_DIR/validate_config.py" --config "$BASE_DIR/config.yaml"
 MACHINE_STATE_STRICT="$(python3 - <<'PY'
@@ -78,6 +108,7 @@ mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
 python3 "$BASE_DIR/estimate_runtime.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/runtime_estimate.json"
+python3 "$BASE_DIR/check_system_requirements.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/system_requirements.json"
 if [[ "$MACHINE_STATE_STRICT" == "1" ]]; then
   python3 "$BASE_DIR/check_machine_state.py" --strict --json-out "$RUN_DIR/machine_state.json"
 else
@@ -320,6 +351,7 @@ echo "        - CSV:           $RUN_DIR/metrics.csv"
 echo "        - Summary CSV:   $RUN_DIR/metrics_summary.csv"
 echo "        - Summary JSON:  $RUN_DIR/metrics_summary.json"
 echo "        - Runtime Est.:  $RUN_DIR/runtime_estimate.json"
+echo "        - System Reqs:   $RUN_DIR/system_requirements.json"
 echo "        - Machine State: $RUN_DIR/machine_state.json"
 echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_cuda_r*.json (if ran)"
 echo "        - Logs:          $RUN_DIR/logs/*.log"
