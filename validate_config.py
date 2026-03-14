@@ -31,7 +31,7 @@ def main():
     expect_keys(
         "root",
         cfg,
-        {"gpu_include", "repeat", "results_dir", "llm_train", "llm_infer", "sd_infer", "blender"},
+        {"gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender"},
         errors,
     )
 
@@ -39,6 +39,15 @@ def main():
         errors.append("repeat must be a positive integer")
     if not isinstance(cfg.get("results_dir", "results"), str) or not cfg.get("results_dir", "results").strip():
         errors.append("results_dir must be a non-empty string")
+
+    preflight = cfg.get("preflight", {})
+    if preflight is not None:
+        if not isinstance(preflight, dict):
+            errors.append("preflight must be a mapping if provided")
+        else:
+            expect_keys("preflight", preflight, {"machine_state_strict"}, errors)
+            if "machine_state_strict" in preflight and not isinstance(preflight["machine_state_strict"], bool):
+                errors.append("preflight.machine_state_strict must be true or false")
 
     llm_train = cfg.get("llm_train")
     if not isinstance(llm_train, dict):
@@ -58,6 +67,28 @@ def main():
         if is_pos_int(llm_train.get("hidden_size")) and is_pos_int(llm_train.get("n_heads")):
             if llm_train["hidden_size"] % llm_train["n_heads"] != 0:
                 errors.append("llm_train.hidden_size must be divisible by llm_train.n_heads")
+
+    llm_train_real = cfg.get("llm_train_real", {})
+    if llm_train_real is not None:
+        if not isinstance(llm_train_real, dict):
+            errors.append("llm_train_real must be a mapping if provided")
+        else:
+            expect_keys(
+                "llm_train_real",
+                llm_train_real,
+                {"enabled", "model", "dtype", "seq_len", "batch_size", "steps"},
+                errors,
+            )
+            if "enabled" in llm_train_real and not isinstance(llm_train_real["enabled"], bool):
+                errors.append("llm_train_real.enabled must be true or false")
+            if llm_train_real.get("enabled", False):
+                if not isinstance(llm_train_real.get("model"), str) or not llm_train_real["model"].strip():
+                    errors.append("llm_train_real.model must be a non-empty string when enabled")
+                if llm_train_real.get("dtype") not in {"bf16", "fp16", "fp32"}:
+                    errors.append("llm_train_real.dtype must be one of bf16, fp16, fp32")
+                for key in ("seq_len", "batch_size", "steps"):
+                    if not is_pos_int(llm_train_real.get(key)):
+                        errors.append(f"llm_train_real.{key} must be a positive integer when enabled")
 
     llm_infer = cfg.get("llm_infer")
     if not isinstance(llm_infer, dict):
@@ -88,7 +119,7 @@ def main():
         expect_keys(
             "sd_infer",
             sd_infer,
-            {"model", "steps", "sizes", "per_gpu_batch", "multi_gpu_mode"},
+            {"model", "steps", "sizes", "per_gpu_batch", "multi_gpu_mode", "emit_worker_rows"},
             errors,
         )
         if not isinstance(sd_infer.get("model"), str) or not sd_infer["model"].strip():
@@ -102,6 +133,8 @@ def main():
             errors.append("sd_infer.per_gpu_batch must be a positive integer")
         if sd_infer.get("multi_gpu_mode", "single") not in {"single", "replicated"}:
             errors.append("sd_infer.multi_gpu_mode must be 'single' or 'replicated'")
+        if "emit_worker_rows" in sd_infer and not isinstance(sd_infer["emit_worker_rows"], bool):
+            errors.append("sd_infer.emit_worker_rows must be true or false")
 
     blender = cfg.get("blender", {})
     if not isinstance(blender, dict):

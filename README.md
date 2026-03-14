@@ -51,6 +51,8 @@ The run directory is the main artifact unit for the repo.
 
 If `repeat` is greater than 1 in `config.yaml`, the orchestrator reruns each suite that many times and tags emitted rows with `repeat_index` and `repeat_count`.
 
+Before benchmark execution, the harness also performs config validation, runtime estimation, and machine-state inspection.
+
 ## Benchmark Suites
 
 ### 1. LLM Training
@@ -73,6 +75,20 @@ Multi-GPU:
 - The script supports DDP if launched with `torchrun`
 - The current `run_all.sh` invocation runs it as a normal single-process Python script
 
+### 1b. Real-Model LLM Training
+
+File: [benchmarks/llm_train_real.py](./benchmarks/llm_train_real.py)
+
+What it does:
+- Loads a real causal LM from Hugging Face
+- Runs synthetic token batches through actual model weights
+- Measures forward/backward/update throughput
+
+Notes:
+- Controlled by `llm_train_real.enabled` in `config.yaml`
+- Disabled by default because it increases runtime and model-download requirements
+- Currently single-GPU in the active orchestration flow
+
 ### 2. LLM Inference
 
 File: [benchmarks/llm_infer_vllm.py](./benchmarks/llm_infer_vllm.py)
@@ -81,12 +97,13 @@ What it does:
 - Loads a model through vLLM
 - Sweeps configured batch sizes and tensor-parallel sizes
 - Warms up, then runs repeated synchronous `generate()` calls for a fixed duration
-- Records requests/sec, generated tokens/sec, average power, and tokens/watt
+- Records requests/sec, generated tokens/sec, batch latency stats, average power, and tokens/watt
 
 Notes:
 - This is an offline throughput-style benchmark, not an interactive latency benchmark
 - Prompt length is now tokenizer-verified; results include both requested and actual prompt token counts
 - Failures for oversized TP or batch settings are recorded as structured failed rows in `metrics.jsonl`
+- Latency fields are measured per `generate()` batch call; `item_latency_*` is a simple batch-latency-per-item proxy, not a true online per-request latency measurement
 
 ### 3. Stable Diffusion
 
@@ -103,6 +120,7 @@ Notes:
 - If only one GPU is visible, replicated mode falls back to single-GPU execution
 - The script writes structured rows directly to `metrics.jsonl`
 - Failed SD runs are recorded as structured failed rows
+- `emit_worker_rows: true` adds one `sd_infer_worker` row per GPU in replicated mode in addition to the aggregate row
 
 ### 4. Blender
 
@@ -123,13 +141,15 @@ Notes:
 Primary configuration lives in [config.yaml](./config.yaml).
 
 Main sections:
+- `preflight`
 - `llm_train`
+- `llm_train_real`
 - `llm_infer`
 - `sd_infer`
 - `blender`
 
 Important caveat:
-- Not every field in `config.yaml` is currently consumed by the active scripts. In particular, the Stable Diffusion `multi_gpu_mode` setting is still descriptive only in the active flow.
+- `llm_train_real` is optional and disabled by default because it adds significant runtime and depends on model availability.
 
 ## Outputs
 
@@ -141,12 +161,14 @@ results/<timestamp>_<host>_<gpu-tag>/
 
 Typical contents:
 - `meta.json`: machine snapshot plus captured software versions
+- `machine_state.json`: preflight machine-state warnings/checks
 - `logs/*.log`: per-suite logs
 - `results/metrics.jsonl`: unified structured metrics for all active suites
 - `results/*.json`: suite-specific JSON outputs such as Blender repeat files
 - `metrics.csv`: consolidated CSV copied to the run root
 - `metrics_summary.csv`: repeat-level summary CSV with mean/stdev/min/max for tracked metrics
 - `metrics_summary.json`: repeat-level summary JSON
+- `runtime_estimate.json`: estimated runtime breakdown for the configured run
 
 `harness.py` builds the CSV by reading:
 - `results/metrics.jsonl`
@@ -172,6 +194,18 @@ Each run writes `meta.json` with:
 - platform, kernel, Python version, and basic OS details
 - `nvidia-smi`, CPU, and memory snapshots
 - captured software versions for key tools and libraries such as PyTorch, vLLM, Diffusers, Transformers, xFormers, tokenizers, and Blender when available
+
+## Preflight
+
+Config validation:
+- `validate_config.py` checks supported keys, required sections, and basic value constraints before the run begins.
+
+Runtime estimation:
+- `estimate_runtime.py` writes a rough per-suite and total runtime estimate to `runtime_estimate.json`.
+
+Machine-state inspection:
+- `check_machine_state.py` records GPU machine-state warnings to `machine_state.json`.
+- `preflight.machine_state_strict: true` turns machine-state warnings into a hard stop before benchmark execution.
 
 ## Current Documentation vs Implementation
 

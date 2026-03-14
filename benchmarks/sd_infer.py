@@ -268,6 +268,20 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
     return row
 
 
+def worker_result_rows(results, args, mode):
+    rows = []
+    for row in results:
+        worker_row = dict(row)
+        worker_row["suite"] = "sd_infer_worker"
+        worker_row["repeat_index"] = args.repeat_index
+        worker_row["repeat_count"] = args.repeat_count
+        worker_row["multi_gpu_mode"] = mode
+        worker_row["per_gpu_batch_size"] = args.batch_size
+        worker_row["gpu_count"] = 1
+        rows.append(worker_row)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF repo id or local path")
@@ -287,6 +301,7 @@ def main():
     ap.add_argument("--repeat-index", type=int, default=1)
     ap.add_argument("--repeat-count", type=int, default=1)
     ap.add_argument("--multi-gpu-mode", default="single", help="single or replicated")
+    ap.add_argument("--emit-worker-rows", action="store_true")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -376,6 +391,9 @@ def main():
     wall_time_s = time.perf_counter() - start
 
     if results is not None:
+        if args.emit_worker_rows and len(results) > 1:
+            for row in worker_result_rows(results, args, actual_mode):
+                write_metric(row, args.metrics_path)
         result = aggregate_results(results, args, worker_count, actual_mode, wall_time_s)
         write_metric(result, args.metrics_path)
         print("[RESULT]", result)

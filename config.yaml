@@ -3,6 +3,9 @@ gpu_include: []           # [] = all visible
 repeat: 3                 # repeats per test to average
 results_dir: results
 
+preflight:
+  machine_state_strict: false
+
 llm_train:
   dtype: bf16          # or fp16; both fine on 4090
   hidden_size: 1024
@@ -11,6 +14,14 @@ llm_train:
   seq_len: 512
   batch_size: 4
   steps: 100
+
+llm_train_real:
+  enabled: false
+  model: "gpt2"
+  dtype: fp16
+  seq_len: 512
+  batch_size: 2
+  steps: 20
 
 #llm_train:
 #  seq_len: 2048
@@ -36,6 +47,7 @@ sd_infer:
   sizes: [512, 1024]
   per_gpu_batch: 4
   multi_gpu_mode: "replicated"  # replicated = one worker per GPU
+  emit_worker_rows: false
 
 blender:
   enabled: true

@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import statistics
 import threading
 import time
 from typing import List
@@ -129,6 +130,19 @@ def write_metric(row):
         f.write(json.dumps(row) + "\n")
 
 
+def percentile(values, pct):
+    if not values:
+        return 0.0
+    values = sorted(values)
+    if len(values) == 1:
+        return float(values[0])
+    pos = (len(values) - 1) * pct
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    frac = pos - lo
+    return float(values[lo] * (1.0 - frac) + values[hi] * frac)
+
+
 def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
               out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float):
     llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=8192, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
@@ -150,10 +164,13 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
     ps = PowerSampler(gpu_limit=tp, interval_s=0.5); ps.start()
     gen_tokens = 0
     reqs = 0
+    batch_latencies_ms = []
     t0 = time.time()
     t_end = t0 + duration_s
     while time.time() < t_end:
+        t_batch = time.perf_counter()
         outputs = llm.generate(prompts, sp)
+        batch_latencies_ms.append((time.perf_counter() - t_batch) * 1000.0)
         reqs += len(outputs)
         for out in outputs:
             gen_tokens += len(out.outputs[0].token_ids)
@@ -178,6 +195,13 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         "reqs_per_s": reqs / elapsed if elapsed > 0 else 0.0,
         "generated_tokens": gen_tokens,
         "gen_tokens_per_s": gen_tokens / elapsed if elapsed > 0 else 0.0,
+        "batch_latency_ms_mean": round(statistics.fmean(batch_latencies_ms), 3) if batch_latencies_ms else 0.0,
+        "batch_latency_ms_p50": round(percentile(batch_latencies_ms, 0.50), 3),
+        "batch_latency_ms_p95": round(percentile(batch_latencies_ms, 0.95), 3),
+        "item_latency_ms_mean": round(statistics.fmean(batch_latencies_ms) / bs, 3) if batch_latencies_ms else 0.0,
+        "item_latency_ms_p50": round(percentile(batch_latencies_ms, 0.50) / bs, 3) if batch_latencies_ms else 0.0,
+        "item_latency_ms_p95": round(percentile(batch_latencies_ms, 0.95) / bs, 3) if batch_latencies_ms else 0.0,
+        "latency_samples": len(batch_latencies_ms),
         "mean_power_w": round(mean_w, 2),
         "gen_tokens_per_watt": (gen_tokens / elapsed / mean_w) if mean_w > 1e-6 else 0.0,
         "gpu_name": gpu_name,

@@ -62,6 +62,18 @@ def main():
     sections.append({"suite": "llm_train", **train_total})
     add_range(totals, train_total["min_s"], train_total["likely_s"], train_total["max_s"])
 
+    llm_train_real = cfg.get("llm_train_real", {})
+    if llm_train_real.get("enabled", False):
+        real_steps = int(llm_train_real.get("steps", 0) or 0)
+        real_per_repeat = {
+            "min_s": max(60.0, real_steps * 3.0),
+            "likely_s": max(180.0, real_steps * 8.0),
+            "max_s": max(600.0, real_steps * 20.0),
+        }
+        real_total = {k: v * repeat for k, v in real_per_repeat.items()}
+        sections.append({"suite": "llm_train_real", **real_total})
+        add_range(totals, real_total["min_s"], real_total["likely_s"], real_total["max_s"])
+
     llm_infer = cfg.get("llm_infer", {})
     combos = len(llm_infer.get("batch_sizes", [])) * len(llm_infer.get("tensor_parallel_sizes", []))
     infer_per_combo = {"min_s": 35.0, "likely_s": 55.0, "max_s": 95.0}

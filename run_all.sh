@@ -11,6 +11,12 @@ if [[ -z "${VIRTUAL_ENV:-}" && -f "$BASE_DIR/.venv/bin/activate" ]]; then
 fi
 
 python3 "$BASE_DIR/validate_config.py" --config "$BASE_DIR/config.yaml"
+MACHINE_STATE_STRICT="$(python3 - <<'PY'
+import yaml
+cfg = yaml.safe_load(open("config.yaml")) or {}
+print(1 if cfg.get("preflight", {}).get("machine_state_strict", False) else 0)
+PY
+)"
 
 # Determine results root from config.yaml (fallback: results)
 RESULTS_ROOT="$(python3 - <<'PY'
@@ -72,6 +78,11 @@ mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
 python3 "$BASE_DIR/estimate_runtime.py" --config "$BASE_DIR/config.yaml" --json-out "$RUN_DIR/runtime_estimate.json"
+if [[ "$MACHINE_STATE_STRICT" == "1" ]]; then
+  python3 "$BASE_DIR/check_machine_state.py" --strict --json-out "$RUN_DIR/machine_state.json"
+else
+  python3 "$BASE_DIR/check_machine_state.py" --json-out "$RUN_DIR/machine_state.json"
+fi
 
 # --- System metadata snapshot ---
 meta_file="$RUN_DIR/meta.json"
@@ -180,6 +191,20 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
 done
 
+LLM_TRAIN_REAL_ENABLED="$(python3 - <<'PY'
+import yaml
+cfg = yaml.safe_load(open("config.yaml")) or {}
+print(1 if cfg.get("llm_train_real", {}).get("enabled", False) else 0)
+PY
+)"
+if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
+  for rep in $(seq 1 "$REPEAT_COUNT"); do
+    start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
+    run_and_log "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$BASE_DIR/config.yaml"
+    annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train_real" "$rep" "$REPEAT_COUNT"
+  done
+fi
+
 # --- 2) LLM Inference (vLLM) ---
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
@@ -218,15 +243,31 @@ cfg=yaml.safe_load(open("config.yaml"))
 print(cfg.get("sd_infer",{}).get("multi_gpu_mode","single"))
 PY
 )"
+SD_EMIT_WORKER_ROWS="$(python3 - <<'PY'
+import yaml
+cfg=yaml.safe_load(open("config.yaml"))
+print(1 if cfg.get("sd_infer",{}).get("emit_worker_rows", False) else 0)
+PY
+)"
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   for sz in "${SD_SIZES[@]}"; do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-    run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
-      --model "$SD_MODEL" --width "$sz" --height "$sz" \
-      --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations 5 \
-      --metrics-path "$RUN_DIR/results/metrics.jsonl" \
-      --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
-      --multi-gpu-mode "$SD_MULTI_GPU_MODE"
+    if [[ "$SD_EMIT_WORKER_ROWS" == "1" ]]; then
+      run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
+        --model "$SD_MODEL" --width "$sz" --height "$sz" \
+        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations 5 \
+        --metrics-path "$RUN_DIR/results/metrics.jsonl" \
+        --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
+        --multi-gpu-mode "$SD_MULTI_GPU_MODE" \
+        --emit-worker-rows
+    else
+      run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
+        --model "$SD_MODEL" --width "$sz" --height "$sz" \
+        --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations 5 \
+        --metrics-path "$RUN_DIR/results/metrics.jsonl" \
+        --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
+        --multi-gpu-mode "$SD_MULTI_GPU_MODE"
+    fi
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "sd_infer" "$rep" "$REPEAT_COUNT"
   done
 done
@@ -279,5 +320,6 @@ echo "        - CSV:           $RUN_DIR/metrics.csv"
 echo "        - Summary CSV:   $RUN_DIR/metrics_summary.csv"
 echo "        - Summary JSON:  $RUN_DIR/metrics_summary.json"
 echo "        - Runtime Est.:  $RUN_DIR/runtime_estimate.json"
+echo "        - Machine State: $RUN_DIR/machine_state.json"
 echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_cuda_r*.json (if ran)"
 echo "        - Logs:          $RUN_DIR/logs/*.log"
