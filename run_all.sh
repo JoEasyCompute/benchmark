@@ -7,6 +7,7 @@ BENCH_DIR="$BASE_DIR/benchmarks"
 VENV_DIR="$BASE_DIR/.venv"
 ENV_SETUP_SCRIPT="$BASE_DIR/env_setup.sh"
 BASE_CONFIG_PATH="$BASE_DIR/config.yaml"
+CONFIG_UTILS="$BASE_DIR/config_utils.py"
 SMOKE_MODE=0
 
 while [[ $# -gt 0 ]]; do
@@ -56,35 +57,12 @@ ensure_python_env
 source "$VENV_DIR/bin/activate"
 
 python3 "$BASE_DIR/validate_config.py" --config "$BASE_CONFIG_PATH"
-MACHINE_STATE_STRICT="$(python3 - <<'PY'
-import yaml
-cfg = yaml.safe_load(open("config.yaml")) or {}
-print(1 if cfg.get("preflight", {}).get("machine_state_strict", False) else 0)
-PY
-)"
+MACHINE_STATE_STRICT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path preflight.machine_state_strict --default 'false' --format bool-int)"
 
 # Determine results root from config.yaml (fallback: results)
-RESULTS_ROOT="$(python3 - <<'PY'
-import yaml, os
-p=os.path.join("config.yaml")
-try:
-    with open(p) as f: cfg=yaml.safe_load(f)
-    print(cfg.get("results_dir","results"))
-except Exception:
-    print("results")
-PY
-)"
+RESULTS_ROOT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path results_dir --default '"results"' --format text)"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
-REPEAT_COUNT="$(python3 - <<'PY'
-import yaml, os
-p=os.path.join("config.yaml")
-try:
-    with open(p) as f: cfg=yaml.safe_load(f) or {}
-    print(int(cfg.get("repeat", 1)))
-except Exception:
-    print(1)
-PY
-)"
+REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path repeat --default '1' --format text)"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
 
 # Build a unique run directory
@@ -123,72 +101,16 @@ mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
 RUN_CONFIG_PATH="$RUN_DIR/effective_config.yaml"
-python3 - "$BASE_CONFIG_PATH" "$RUN_CONFIG_PATH" "$SMOKE_MODE" <<'PY'
-import sys
-from pathlib import Path
-
-import yaml
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-smoke_mode = sys.argv[3] == "1"
-
-cfg = yaml.safe_load(src.read_text()) or {}
-cfg["smoke_mode"] = smoke_mode
-
-if smoke_mode:
-    cfg["repeat"] = 1
-
-    llm_train = cfg.get("llm_train") or {}
-    llm_train["steps"] = min(int(llm_train.get("steps", 1) or 1), 2)
-    llm_train["batch_size"] = min(int(llm_train.get("batch_size", 1) or 1), 1)
-    llm_train["seq_len"] = min(int(llm_train.get("seq_len", 128) or 128), 128)
-    cfg["llm_train"] = llm_train
-
-    llm_train_real = cfg.get("llm_train_real") or {}
-    if llm_train_real.get("enabled", False):
-        llm_train_real["steps"] = min(int(llm_train_real.get("steps", 1) or 1), 1)
-        llm_train_real["batch_size"] = min(int(llm_train_real.get("batch_size", 1) or 1), 1)
-        llm_train_real["seq_len"] = min(int(llm_train_real.get("seq_len", 128) or 128), 128)
-        cfg["llm_train_real"] = llm_train_real
-
-    llm_infer = cfg.get("llm_infer") or {}
-    batch_sizes = llm_infer.get("batch_sizes") or [1]
-    tp_sizes = llm_infer.get("tensor_parallel_sizes") or [1]
-    llm_infer["batch_sizes"] = [int(batch_sizes[0])]
-    llm_infer["tensor_parallel_sizes"] = [int(tp_sizes[0])]
-    llm_infer["prompt_len"] = min(int(llm_infer.get("prompt_len", 64) or 64), 64)
-    llm_infer["output_len"] = min(int(llm_infer.get("output_len", 32) or 32), 32)
-    cfg["llm_infer"] = llm_infer
-
-    sd_infer = cfg.get("sd_infer") or {}
-    sizes = sd_infer.get("sizes") or [512]
-    sd_infer["sizes"] = [int(sizes[0])]
-    sd_infer["steps"] = min(int(sd_infer.get("steps", 4) or 4), 4)
-    sd_infer["per_gpu_batch"] = 1
-    cfg["sd_infer"] = sd_infer
-
-    blender = cfg.get("blender") or {}
-    scenes = blender.get("scenes") or []
-    if scenes:
-        blender["scenes"] = [scenes[0]]
-    cfg["blender"] = blender
-
-dst.write_text(yaml.safe_dump(cfg, sort_keys=False))
-PY
+if [[ "$SMOKE_MODE" == "1" ]]; then
+  python3 "$CONFIG_UTILS" write-effective --config "$BASE_CONFIG_PATH" --output "$RUN_CONFIG_PATH" --smoke
+else
+  python3 "$CONFIG_UTILS" write-effective --config "$BASE_CONFIG_PATH" --output "$RUN_CONFIG_PATH"
+fi
 echo "[INFO] Effective config: $RUN_CONFIG_PATH"
 if [[ "$SMOKE_MODE" == "1" ]]; then
   echo "[INFO] Smoke mode enabled"
 fi
-REPEAT_COUNT="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import sys
-import yaml
-
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-print(int(cfg.get("repeat", 1)))
-PY
-)"
+REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path repeat --default '1' --format text)"
 LLM_INFER_WARMUP_S=5
 LLM_INFER_DURATION_S=30
 SD_ITERATIONS=5
@@ -313,13 +235,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
 done
 
-LLM_TRAIN_REAL_ENABLED="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg = yaml.safe_load(open(sys.argv[1])) or {}
-print(1 if cfg.get("llm_train_real", {}).get("enabled", False) else 0)
-PY
-)"
+LLM_TRAIN_REAL_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train_real.enabled --default 'false' --format bool-int)"
 if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
@@ -336,48 +252,12 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
 done
 
 # --- 3) Stable Diffusion Inference ---
-readarray -t SD_SIZES < <(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print("\n".join(map(str,cfg.get("sd_infer",{}).get("sizes",[512]))))
-PY
-)
-SD_MODEL="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print(cfg.get("sd_infer",{}).get("model","stabilityai/stable-diffusion-2-1"))
-PY
-)"
-SD_STEPS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print(cfg.get("sd_infer",{}).get("steps",20))
-PY
-)"
-SD_BS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print(cfg.get("sd_infer",{}).get("per_gpu_batch",1))
-PY
-)"
-SD_MULTI_GPU_MODE="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print(cfg.get("sd_infer",{}).get("multi_gpu_mode","single"))
-PY
-)"
-SD_EMIT_WORKER_ROWS="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg=yaml.safe_load(open(sys.argv[1]))
-print(1 if cfg.get("sd_infer",{}).get("emit_worker_rows", False) else 0)
-PY
-)"
+readarray -t SD_SIZES < <(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.sizes --default '[512]' --format lines)
+SD_MODEL="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.model --default '"stabilityai/stable-diffusion-2-1"' --format text)"
+SD_STEPS="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.steps --default '20' --format text)"
+SD_BS="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.per_gpu_batch --default '1' --format text)"
+SD_MULTI_GPU_MODE="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.multi_gpu_mode --default '"single"' --format text)"
+SD_EMIT_WORKER_ROWS="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.emit_worker_rows --default 'false' --format bool-int)"
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   for sz in "${SD_SIZES[@]}"; do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
@@ -406,21 +286,8 @@ if command -v blender >/dev/null 2>&1; then
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"
-  export BLENDER_ENABLED="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import yaml
-import sys
-cfg = yaml.safe_load(open(sys.argv[1])) or {}
-print(1 if cfg.get("blender", {}).get("enabled", True) else 0)
-PY
-)"
-  export BLENDER_SCENES_JSON="$(python3 - "$RUN_CONFIG_PATH" <<'PY'
-import json, yaml
-import sys
-cfg = yaml.safe_load(open(sys.argv[1])) or {}
-scenes = cfg.get("blender", {}).get("scenes") or []
-print(json.dumps(scenes))
-PY
-)"
+  export BLENDER_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.enabled --default 'true' --format bool-int)"
+  export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     export RESULTS_JSON="$RUN_DIR/results/blender_bench_cuda_r${rep}.json"

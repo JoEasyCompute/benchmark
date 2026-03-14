@@ -31,7 +31,7 @@ def main():
     expect_keys(
         "root",
         cfg,
-        {"gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender"},
+        {"gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "smoke_mode"},
         errors,
     )
 
@@ -39,6 +39,8 @@ def main():
         errors.append("repeat must be a positive integer")
     if not isinstance(cfg.get("results_dir", "results"), str) or not cfg.get("results_dir", "results").strip():
         errors.append("results_dir must be a non-empty string")
+    if "smoke_mode" in cfg and not isinstance(cfg["smoke_mode"], bool):
+        errors.append("smoke_mode must be true or false")
 
     preflight = cfg.get("preflight", {})
     if preflight is not None:
