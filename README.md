@@ -86,8 +86,9 @@ What it is not:
 - A benchmark of a real pretrained model, real data pipeline, or production training stack
 
 Multi-GPU:
-- The script supports DDP if launched with `torchrun`
-- The current `run_all.sh` invocation runs it as a normal single-process Python script
+- `run_all.sh` now launches this suite with DDP via `python -m torch.distributed.run` for each configured `llm_train.world_sizes` value
+- Training scaling is controlled by `llm_train.world_sizes` in `config.yaml`
+- The root `gpu_include` list constrains which local GPU indices are visible to the run
 
 ### 1b. Real-Model LLM Training
 
@@ -117,7 +118,7 @@ Notes:
 - This is an offline throughput-style benchmark, not an interactive latency benchmark
 - Prompt length is now tokenizer-verified; results include both requested and actual prompt token counts
 - Failures for oversized TP or batch settings are recorded as structured failed rows in `metrics.jsonl`
-- Latency fields are measured per `generate()` batch call; `item_latency_*` is a simple batch-latency-per-item proxy, not a true online per-request latency measurement
+- Latency fields are measured per `generate()` batch call; `batch_latency_per_item_proxy_*` is a simple batch-latency-per-item proxy, not a true online per-request latency measurement
 
 ### 3. Stable Diffusion
 

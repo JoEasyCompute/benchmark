@@ -50,6 +50,16 @@ def _select_dtype(prefer_bf16: bool, device_index: int) -> torch.dtype:
     return torch.float16
 
 
+def _dtype_reason(prefer_bf16: bool, selected_dtype: torch.dtype, device_index: int) -> str:
+    if selected_dtype == torch.bfloat16:
+        return "bf16_requested_and_supported"
+    if prefer_bf16 and torch.cuda.is_available():
+        major = torch.cuda.get_device_capability(device_index)[0]
+        if major < 8:
+            return "bf16_requested_but_not_supported"
+    return "default_fp16"
+
+
 def visible_gpu_count() -> int:
     visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
     if visible:
@@ -67,6 +77,10 @@ def _maybe_set_scheduler(pipe, scheduler_flag: str):
     elif "euler" in s:
         pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
     return pipe
+
+
+def _scheduler_name(scheduler_obj) -> str:
+    return scheduler_obj.__class__.__name__
 
 
 def run_worker(
@@ -96,6 +110,7 @@ def run_worker(
         device = f"cuda:{device_index}"
 
         dtype = _select_dtype(prefer_bf16, device_index)
+        dtype_reason = _dtype_reason(prefer_bf16, dtype, device_index)
         t0 = time.perf_counter()
 
         # --- Manual assembly to avoid offload_state_dict being forwarded ---
@@ -106,12 +121,14 @@ def run_worker(
         feature_extractor = CLIPImageProcessor.from_pretrained(model, subfolder="feature_extractor")
 
         # Load a scheduler from the repo (or derive sensible defaults)
+        scheduler_source = "model_repo"
         try:
             sd_scheduler = EulerDiscreteScheduler.from_pretrained(model, subfolder="scheduler")
         except Exception:
             try:
                 sd_scheduler = PNDMScheduler.from_pretrained(model, subfolder="scheduler")
             except Exception:
+                scheduler_source = "built_in_fallback"
                 # Fallback defaults commonly used for SD1.5
                 sd_scheduler = EulerDiscreteScheduler.from_config(
                     {
@@ -136,14 +153,21 @@ def run_worker(
         )
 
         pipe = pipe.to(device, dtype=dtype)
+        scheduler_name_before_override = _scheduler_name(pipe.scheduler)
+        xformers_enabled = False
+        xformers_error = None
 
         if enable_xformers:
             try:
                 pipe.enable_xformers_memory_efficient_attention()
+                xformers_enabled = True
             except Exception as e:
+                xformers_error = str(e)
                 print(f"[WARN] xFormers not enabled: {e}", file=sys.stderr)
 
         pipe = _maybe_set_scheduler(pipe, scheduler)
+        scheduler_name_after_override = _scheduler_name(pipe.scheduler)
+        scheduler_override = (scheduler or "").strip().lower() or None
 
         _ = pipe(
             prompt="warmup image",
@@ -190,10 +214,21 @@ def run_worker(
 
         q.put(
             {
+                "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "ok",
                 "model": model,
                 "dtype": str(dtype),
+                "dtype_reason": dtype_reason,
+                "bf16_requested": prefer_bf16,
+                "xformers_requested": enable_xformers,
+                "xformers_enabled": xformers_enabled,
+                "xformers_error": xformers_error,
+                "scheduler_source": scheduler_source,
+                "scheduler_override": scheduler_override,
+                "scheduler_name": scheduler_name_after_override,
+                "base_scheduler_name": scheduler_name_before_override,
+                "guidance_scale": guidance,
                 "load_seconds": round(load_s, 3),
                 "iters": iterations,
                 "batch_size": batch_size,
@@ -209,9 +244,14 @@ def run_worker(
     except Exception as e:
         q.put(
             {
+                "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
                 "model": model,
+                "bf16_requested": prefer_bf16,
+                "xformers_requested": enable_xformers,
+                "scheduler_override": (scheduler or "").strip().lower() or None,
+                "guidance_scale": guidance,
                 "batch_size": batch_size,
                 "steps": steps,
                 "hw": f"{width}x{height}",
@@ -226,6 +266,7 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
     failed_results = [row for row in results if row.get("status") != "ok"]
 
     row = {
+        "benchmark_schema_version": 2,
         "suite": "sd_infer",
         "status": "ok" if len(ok_results) == worker_count and not failed_results else "failed",
         "model": args.model,
@@ -250,6 +291,15 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
         row.update(
             {
                 "dtype": ok_results[0].get("dtype"),
+                "dtype_reason": ok_results[0].get("dtype_reason"),
+                "bf16_requested": ok_results[0].get("bf16_requested"),
+                "xformers_requested": ok_results[0].get("xformers_requested"),
+                "xformers_enabled": all(bool(r.get("xformers_enabled")) for r in ok_results),
+                "scheduler_source": ok_results[0].get("scheduler_source"),
+                "scheduler_override": ok_results[0].get("scheduler_override"),
+                "scheduler_name": ok_results[0].get("scheduler_name"),
+                "base_scheduler_name": ok_results[0].get("base_scheduler_name"),
+                "guidance_scale": ok_results[0].get("guidance_scale"),
                 "load_seconds": round(max(float(r.get("load_seconds", 0.0)) for r in ok_results), 3),
                 "mean_s_per_iter": round(
                     sum(float(r.get("mean_s_per_iter") or 0.0) for r in ok_results) / len(ok_results), 4
@@ -264,6 +314,9 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
         row["error"] = " | ".join(
             f"gpu{r.get('gpu_index', '?')}: {r.get('error', 'unknown error')}" for r in failed_results
         )
+        xformers_errors = [r.get("xformers_error") for r in failed_results if r.get("xformers_error")]
+        if xformers_errors:
+            row["xformers_error"] = " | ".join(xformers_errors)
 
     return row
 
@@ -308,9 +361,14 @@ def main():
         print("CUDA not available", file=sys.stderr)
         write_metric(
             {
+                "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
                 "model": args.model,
+                "bf16_requested": args.bf16,
+                "xformers_requested": args.xformers,
+                "scheduler_override": (args.scheduler or "").strip().lower() or None,
+                "guidance_scale": args.guidance,
                 "iters": args.iterations,
                 "per_gpu_batch_size": args.batch_size,
                 "batch_size": args.batch_size,
@@ -410,9 +468,14 @@ def main():
     else:
         write_metric(
             {
+                "benchmark_schema_version": 2,
                 "suite": "sd_infer",
                 "status": "failed",
                 "model": args.model,
+                "bf16_requested": args.bf16,
+                "xformers_requested": args.xformers,
+                "scheduler_override": (args.scheduler or "").strip().lower() or None,
+                "guidance_scale": args.guidance,
                 "iters": args.iterations,
                 "per_gpu_batch_size": args.batch_size,
                 "batch_size": args.batch_size,

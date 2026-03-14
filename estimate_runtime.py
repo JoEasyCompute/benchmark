@@ -53,13 +53,15 @@ def main():
 
     llm_train = cfg.get("llm_train", {})
     steps = int(llm_train.get("steps", 0) or 0)
+    requested_world_sizes = [int(v) for v in (llm_train.get("world_sizes") or [1])]
+    train_world_sizes = [ws for ws in requested_world_sizes if ws <= max(1, gpu_count)] or [1]
     train_per_repeat = {
         "min_s": max(30.0, steps * 0.8),
         "likely_s": max(60.0, steps * 1.5),
         "max_s": max(150.0, steps * 3.0),
     }
-    train_total = {k: v * repeat for k, v in train_per_repeat.items()}
-    sections.append({"suite": "llm_train", **train_total})
+    train_total = {k: v * repeat * len(train_world_sizes) for k, v in train_per_repeat.items()}
+    sections.append({"suite": "llm_train", "world_sizes": train_world_sizes, **train_total})
     add_range(totals, train_total["min_s"], train_total["likely_s"], train_total["max_s"])
 
     llm_train_real = cfg.get("llm_train_real", {})

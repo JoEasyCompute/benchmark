@@ -64,6 +64,42 @@ RESULTS_ROOT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path 
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
 REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path repeat --default '1' --format text)"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
+readarray -t GPU_INCLUDE_VALUES < <(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path gpu_include --default '[]' --format lines)
+
+detect_all_gpu_ids() {
+  python3 - <<'PY'
+import subprocess
+
+try:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    ).strip()
+except Exception:
+    out = ""
+
+for line in out.splitlines():
+    line = line.strip()
+    if line:
+        print(line)
+PY
+}
+
+readarray -t ALL_GPU_IDS < <(detect_all_gpu_ids)
+SELECTED_GPU_IDS=("${ALL_GPU_IDS[@]}")
+if [[ "${#GPU_INCLUDE_VALUES[@]}" -gt 0 ]]; then
+  SELECTED_GPU_IDS=("${GPU_INCLUDE_VALUES[@]}")
+fi
+if [[ "${#SELECTED_GPU_IDS[@]}" -gt 0 ]]; then
+  CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${SELECTED_GPU_IDS[*]}")"
+  export CUDA_VISIBLE_DEVICES
+  echo "[INFO] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+fi
+VISIBLE_GPU_COUNT="${#SELECTED_GPU_IDS[@]}"
+if [[ "$VISIBLE_GPU_COUNT" -eq 0 ]]; then
+  VISIBLE_GPU_COUNT=0
+fi
 
 # Build a unique run directory
 # --- Build a unique, length-safe run directory ---
@@ -71,8 +107,8 @@ HOST="$(hostname -s)"
 DATE="$(date +%Y%m%d_%H%M%S)"
 
 # GPU count + first model name
-GPU_COUNT="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
-GPU_MODEL="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || echo '')"
+GPU_COUNT="${VISIBLE_GPU_COUNT}"
+GPU_MODEL="$(CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || echo '')"
 
 # Compact the model name aggressively:
 # - strip "NVIDIA", "GeForce", "RTX", "Ada Generation", "Graphics"
@@ -228,11 +264,55 @@ fp.write_text("".join(line + "\n" for line in lines))
 PY
 }
 
+append_jsonl_row () {
+  local fp="$1" payload="$2"
+  mkdir -p "$(dirname "$fp")"
+  printf '%s\n' "$payload" >> "$fp"
+}
+
 # --- 1) LLM Training ---
+readarray -t TRAIN_WORLD_SIZES < <(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train.world_sizes --default '[1]' --format lines)
 for rep in $(seq 1 "$REPEAT_COUNT"); do
-  start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-  run_and_log "llm_train_r${rep}" python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
-  annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
+  for world_size in "${TRAIN_WORLD_SIZES[@]}"; do
+    if [[ "$world_size" -gt "$VISIBLE_GPU_COUNT" ]]; then
+      echo "[SKIP] llm_train world_size=$world_size exceeds visible GPUs ($VISIBLE_GPU_COUNT)"
+      append_jsonl_row "$RUN_DIR/results/metrics.jsonl" "$(python3 - <<'PY' "$world_size" "$VISIBLE_GPU_COUNT" "$rep" "$REPEAT_COUNT"
+import json
+import sys
+
+world_size = int(sys.argv[1])
+visible_gpu_count = int(sys.argv[2])
+repeat_index = int(sys.argv[3])
+repeat_count = int(sys.argv[4])
+
+print(json.dumps({
+    "benchmark_schema_version": 2,
+    "suite": "llm_train",
+    "status": "skipped",
+    "skip_reason": "insufficient_visible_gpus",
+    "requested_world_size": world_size,
+    "visible_gpu_count": visible_gpu_count,
+    "repeat_index": repeat_index,
+    "repeat_count": repeat_count,
+}))
+PY
+)"
+      continue
+    fi
+
+    train_gpu_ids=("${SELECTED_GPU_IDS[@]:0:$world_size}")
+    train_gpu_csv="$(IFS=,; echo "${train_gpu_ids[*]}")"
+    start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
+    if [[ "$world_size" -gt 1 ]]; then
+      run_and_log "llm_train_ws${world_size}_r${rep}" env CUDA_VISIBLE_DEVICES="$train_gpu_csv" \
+        python3 -m torch.distributed.run --standalone --nproc_per_node "$world_size" \
+        "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
+    else
+      run_and_log "llm_train_ws${world_size}_r${rep}" env CUDA_VISIBLE_DEVICES="$train_gpu_csv" \
+        python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
+    fi
+    annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
+  done
 done
 
 LLM_TRAIN_REAL_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train_real.enabled --default 'false' --format bool-int)"

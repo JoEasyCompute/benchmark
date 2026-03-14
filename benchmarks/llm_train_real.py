@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+from pathlib import Path
 
 import torch
 import yaml
@@ -10,6 +11,24 @@ from transformers import AutoModelForCausalLM
 
 
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+
+
+def resolve_model_revision(model) -> str | None:
+    try:
+        return model.config._commit_hash
+    except Exception:
+        return None
+
+
+def estimate_param_count(model) -> int:
+    try:
+        return int(sum(p.numel() for p in model.parameters()))
+    except Exception:
+        return 0
+
+
+def detect_model_source(model_name: str) -> str:
+    return "local_path" if Path(model_name).exists() else "huggingface"
 
 
 def main():
@@ -26,9 +45,11 @@ def main():
 
     if not torch.cuda.is_available():
         metric = {
+            "benchmark_schema_version": 2,
             "suite": "llm_train_real",
             "status": "failed",
             "model": cfg.get("model"),
+            "model_source": detect_model_source(cfg.get("model", "")),
             "error": "CUDA not available",
         }
         os.makedirs("results", exist_ok=True)
@@ -55,6 +76,13 @@ def main():
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     vocab_size = getattr(model.config, "vocab_size", 50257)
+    model_revision = resolve_model_revision(model)
+    model_family = getattr(model.config, "model_type", None)
+    param_count = estimate_param_count(model)
+    hidden_size = getattr(model.config, "hidden_size", None)
+    num_layers = getattr(model.config, "num_hidden_layers", None)
+    num_attention_heads = getattr(model.config, "num_attention_heads", None)
+    max_position_embeddings = getattr(model.config, "max_position_embeddings", None)
 
     def sample_batch():
         x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
@@ -80,9 +108,19 @@ def main():
 
     tokens_per_step = batch_size * seq_len
     metric = {
+        "benchmark_schema_version": 2,
         "suite": "llm_train_real",
         "status": "ok",
         "model": model_name,
+        "model_source": detect_model_source(model_name),
+        "model_revision": model_revision,
+        "model_family": model_family,
+        "param_count": param_count,
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_layers,
+        "num_attention_heads": num_attention_heads,
+        "max_position_embeddings": max_position_embeddings,
+        "vocab_size": vocab_size,
         "dtype": dtype_name,
         "seq_len": seq_len,
         "batch_size": batch_size,

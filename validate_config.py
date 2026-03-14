@@ -13,6 +13,10 @@ def is_pos_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def is_nonneg_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def expect_keys(section_name, data, allowed, errors):
     unknown = sorted(set(data) - set(allowed))
     for key in unknown:
@@ -39,6 +43,11 @@ def main():
         errors.append("repeat must be a positive integer")
     if not isinstance(cfg.get("results_dir", "results"), str) or not cfg.get("results_dir", "results").strip():
         errors.append("results_dir must be a non-empty string")
+    gpu_include = cfg.get("gpu_include", [])
+    if not isinstance(gpu_include, list) or not all(is_nonneg_int(v) for v in gpu_include):
+        errors.append("gpu_include must be a list of non-negative integers")
+    elif len(set(gpu_include)) != len(gpu_include):
+        errors.append("gpu_include must not contain duplicates")
     if "smoke_mode" in cfg and not isinstance(cfg["smoke_mode"], bool):
         errors.append("smoke_mode must be true or false")
 
@@ -58,11 +67,14 @@ def main():
         expect_keys(
             "llm_train",
             llm_train,
-            {"dtype", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"},
+            {"dtype", "world_sizes", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"},
             errors,
         )
         if llm_train.get("dtype") not in {"bf16", "fp16", "fp32"}:
             errors.append("llm_train.dtype must be one of bf16, fp16, fp32")
+        world_sizes = llm_train.get("world_sizes", [1])
+        if not isinstance(world_sizes, list) or not world_sizes or not all(is_pos_int(v) for v in world_sizes):
+            errors.append("llm_train.world_sizes must be a non-empty list of positive integers")
         for key in ("hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"):
             if not is_pos_int(llm_train.get(key)):
                 errors.append(f"llm_train.{key} must be a positive integer")

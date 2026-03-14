@@ -5,6 +5,7 @@ import os
 import statistics
 import threading
 import time
+import traceback
 from typing import List
 
 import yaml
@@ -106,6 +107,9 @@ class PowerSampler:
     def mean_watts(self) -> float:
         return sum(self.samples)/len(self.samples) if self.samples else 0.0
 
+    def available(self) -> bool:
+        return self._ok and bool(getattr(self, "handles", []))
+
 def detect_gpu_name() -> str:
     try:
         import torch
@@ -141,6 +145,21 @@ def percentile(values, pct):
     hi = min(lo + 1, len(values) - 1)
     frac = pos - lo
     return float(values[lo] * (1.0 - frac) + values[hi] * frac)
+
+
+def classify_failure(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "out of memory" in text or "cuda error: out of memory" in text:
+        return "oom"
+    if "tensor_parallel_size" in text or "tensor parallel" in text:
+        return "tensor_parallel_invalid"
+    if "no such file" in text or "404" in text or "repositorynotfounderror" in text:
+        return "model_unavailable"
+    if "trust_remote_code" in text:
+        return "remote_code_requirement"
+    if "cuda" in text:
+        return "cuda_runtime_error"
+    return "unknown"
 
 
 def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
@@ -179,7 +198,11 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
 
     gpu_name = detect_gpu_name()
     mean_w = ps.mean_watts()
+    batch_latency_mean = round(statistics.fmean(batch_latencies_ms), 3) if batch_latencies_ms else 0.0
+    batch_latency_p50 = round(percentile(batch_latencies_ms, 0.50), 3)
+    batch_latency_p95 = round(percentile(batch_latencies_ms, 0.95), 3)
     row = {
+        "benchmark_schema_version": 2,
         "suite": "llm_infer",
         "status": "ok",
         "model": model,
@@ -195,13 +218,14 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         "reqs_per_s": reqs / elapsed if elapsed > 0 else 0.0,
         "generated_tokens": gen_tokens,
         "gen_tokens_per_s": gen_tokens / elapsed if elapsed > 0 else 0.0,
-        "batch_latency_ms_mean": round(statistics.fmean(batch_latencies_ms), 3) if batch_latencies_ms else 0.0,
-        "batch_latency_ms_p50": round(percentile(batch_latencies_ms, 0.50), 3),
-        "batch_latency_ms_p95": round(percentile(batch_latencies_ms, 0.95), 3),
-        "item_latency_ms_mean": round(statistics.fmean(batch_latencies_ms) / bs, 3) if batch_latencies_ms else 0.0,
-        "item_latency_ms_p50": round(percentile(batch_latencies_ms, 0.50) / bs, 3) if batch_latencies_ms else 0.0,
-        "item_latency_ms_p95": round(percentile(batch_latencies_ms, 0.95) / bs, 3) if batch_latencies_ms else 0.0,
+        "batch_latency_ms_mean": batch_latency_mean,
+        "batch_latency_ms_p50": batch_latency_p50,
+        "batch_latency_ms_p95": batch_latency_p95,
+        "batch_latency_per_item_proxy_ms_mean": round(batch_latency_mean / bs, 3) if bs > 0 else 0.0,
+        "batch_latency_per_item_proxy_ms_p50": round(batch_latency_p50 / bs, 3) if bs > 0 else 0.0,
+        "batch_latency_per_item_proxy_ms_p95": round(batch_latency_p95 / bs, 3) if bs > 0 else 0.0,
         "latency_samples": len(batch_latencies_ms),
+        "power_sampler_available": ps.available(),
         "mean_power_w": round(mean_w, 2),
         "gen_tokens_per_watt": (gen_tokens / elapsed / mean_w) if mean_w > 1e-6 else 0.0,
         "gpu_name": gpu_name,
@@ -240,8 +264,10 @@ def main():
                 print(json.dumps(row, indent=2))
             except Exception as e:
                 row = {
+                    "benchmark_schema_version": 2,
                     "suite": "llm_infer",
                     "status": "failed",
+                    "failure_kind": classify_failure(e),
                     "model": model,
                     "dtype": dtype,
                     "tensor_parallel": tp,
@@ -252,7 +278,9 @@ def main():
                     "warmup_s": args.warmup,
                     "duration_s": args.duration,
                     "gpu_name": detect_gpu_name(),
+                    "error_type": type(e).__name__,
                     "error": str(e),
+                    "error_traceback_tail": traceback.format_exc(limit=3).strip().splitlines()[-1],
                 }
                 write_metric(row)
                 print(f"[ERROR] TP={tp} BS={bs}: {e}")

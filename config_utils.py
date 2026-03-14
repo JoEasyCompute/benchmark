@@ -32,6 +32,7 @@ def write_effective_config(src_path, dst_path, smoke_mode):
         cfg["repeat"] = 1
 
         llm_train = cfg.get("llm_train") or {}
+        llm_train["world_sizes"] = [1]
         llm_train["steps"] = min(int(llm_train.get("steps", 1) or 1), 2)
         llm_train["batch_size"] = min(int(llm_train.get("batch_size", 1) or 1), 1)
         llm_train["seq_len"] = min(int(llm_train.get("seq_len", 128) or 128), 128)

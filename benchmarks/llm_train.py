@@ -57,6 +57,7 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0")) if world_size > 1 else 0
     rank = int(os.environ.get("RANK", "0")) if world_size > 1 else 0
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 
     # ★ FIX 1: Correct dtype mapping
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg["dtype"]]
@@ -117,6 +118,7 @@ def main():
     elapsed = time.time() - start
 
     metric = {
+        "benchmark_schema_version": 2,
         "suite": "llm_train",
         "status": "ok",
         "dtype": cfg["dtype"],
@@ -124,6 +126,9 @@ def main():
         "batch_size": cfg["batch_size"],
         "steps": steps,
         "world_size": world_size,
+        "gpu_count": world_size,
+        "cuda_visible_devices": cuda_visible_devices,
+        "distributed_backend": "nccl" if world_size > 1 else None,
         "tokens_per_step": tokens_per_step,
         "steps_per_sec": n / elapsed if elapsed > 0 else 0.0,
         "tokens_per_sec": tokens_per_sec(tokens_per_step, elapsed / n) if n else 0.0,
