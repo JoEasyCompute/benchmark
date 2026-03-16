@@ -118,7 +118,10 @@ pip install --upgrade --no-deps \
   "accelerate==1.10.1"
 pip install --upgrade \
   "huggingface-hub>=0.34.0,<1.0" \
-  "importlib-metadata>=6.0"
+  "importlib-metadata>=6.0" \
+  "tokenizers>=0.22.0,<=0.23.0" \
+  "regex!=2019.12.17" \
+  "psutil>=5.9.8"
 
 # Bench deps
 if [[ "$GPU_BACKEND" == "nvidia" ]]; then
