@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 import time
 
 import torch
@@ -48,7 +49,17 @@ def init_dist():
 
 
 def detect_backend() -> str:
-    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+    if os.environ.get("HIP_VISIBLE_DEVICES"):
+        return "amd"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "nvidia"
+    if shutil.which("rocm-smi") and not shutil.which("nvidia-smi"):
+        return "amd"
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("rocm-smi"):
+        return "amd"
+    return "nvidia"
 
 
 def visible_device_env_var() -> str:

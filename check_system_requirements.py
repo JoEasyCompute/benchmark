@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import json
 import platform
 import shutil
@@ -46,6 +47,18 @@ def main():
         payload["checks"].append({"binary": name, "path": path})
         if not path:
             payload["warnings"].append(f"optional binary not found on PATH: {name}")
+
+    llm_infer_backend = ((cfg.get("llm_infer", {}) or {}).get("backend", "transformers") or "transformers").lower()
+    if backend == "amd" and llm_infer_backend == "vllm":
+        try:
+            importlib.import_module("vllm")
+            importlib.import_module("vllm._C")
+            payload["checks"].append({"amd_vllm_runtime": "available"})
+        except Exception as exc:
+            payload["checks"].append({"amd_vllm_runtime": "unavailable"})
+            payload["warnings"].append(
+                f"AMD llm_infer_vllm is not validated in this environment; benchmark will likely be skipped ({type(exc).__name__}: {exc})"
+            )
 
     blender_enabled = (cfg.get("blender", {}) or {}).get("enabled", True)
     if blender_enabled:

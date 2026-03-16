@@ -17,6 +17,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import sys
 import time
@@ -36,7 +37,17 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 
 
 def detect_backend() -> str:
-    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+    if os.environ.get("HIP_VISIBLE_DEVICES"):
+        return "amd"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "nvidia"
+    if shutil.which("rocm-smi") and not shutil.which("nvidia-smi"):
+        return "amd"
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("rocm-smi"):
+        return "amd"
+    return "nvidia"
 
 
 def gpu_runtime_available() -> bool:

@@ -2,7 +2,7 @@
 
 This repo is a script-driven GPU benchmarking harness for comparing datacenter and consumer GPUs across:
 - **LLM training** with a synthetic PyTorch transformer
-- **LLM inference** with vLLM
+- **LLM inference** with a canonical Transformers/PyTorch benchmark
 - **Image generation** with Stable Diffusion / Diffusers
 - **Rendering** with Blender Cycles
 
@@ -64,6 +64,8 @@ What "supported" means in the current codebase:
 Important caveat:
 - practical support still depends on your installed ROCm/CUDA stack, PyTorch build, vLLM build, Diffusers stack, and Blender build on the target machine
 - AMD support should be treated as implementation-level support that still requires runtime validation on a real ROCm host
+- the default `llm_infer` path is backend-agnostic `transformers`; `vllm` remains optional and opt-in
+- the default `env_setup.sh` path no longer installs `vllm` or `xformers` on AMD automatically; `llm_infer_vllm` is skipped unless you provide a separately validated ROCm-compatible `vllm` install
 
 ## Runtime Flow
 
@@ -127,20 +129,23 @@ Notes:
 
 ### 2. LLM Inference
 
-File: [benchmarks/llm_infer_vllm.py](./benchmarks/llm_infer_vllm.py)
+File: [benchmarks/llm_infer_hf.py](./benchmarks/llm_infer_hf.py)
 
 What it does:
-- Loads a model through vLLM
-- Sweeps configured batch sizes and tensor-parallel sizes
+- Loads a model through Hugging Face Transformers on PyTorch
+- Sweeps configured batch sizes with a canonical Transformers path used across GPU vendors
 - Warms up, then runs repeated synchronous `generate()` calls for a fixed duration
 - Records requests/sec, generated tokens/sec, batch latency stats, average power, and tokens/watt
 
 Notes:
 - This is an offline throughput-style benchmark, not an interactive latency benchmark
 - Prompt length is now tokenizer-verified; results include both requested and actual prompt token counts
-- Failures for oversized TP or batch settings are recorded as structured failed rows in `metrics.jsonl`
+- The canonical `transformers` backend only supports `tensor_parallel=1`; larger configured TP values are emitted as structured skipped rows
+- `multi_gpu_mode: replicated` launches one worker per visible GPU and aggregates total requests/sec and tokens/sec into a single `llm_infer` row
 - Latency fields are measured per `generate()` batch call; `batch_latency_per_item_proxy_*` is a simple batch-latency-per-item proxy, not a true online per-request latency measurement
 - Power sampling is currently NVIDIA-only through NVML; on AMD the benchmark still runs, but power-related fields may be zero or unavailable
+- Optional vLLM benchmark: [benchmarks/llm_infer_vllm.py](./benchmarks/llm_infer_vllm.py)
+- Set `llm_infer.backend: vllm` if you want to run the vLLM-specific benchmark instead of the canonical Transformers path
 
 ### 3. Stable Diffusion
 
@@ -189,6 +194,9 @@ Main sections:
 
 Important caveat:
 - `llm_train_real` is optional and disabled by default because it adds significant runtime and depends on model availability.
+- `llm_infer.backend` defaults to `transformers` so inference results are comparable across mixed GPU vendors. The default model is currently `Qwen/Qwen3-8B`.
+- `llm_infer.multi_gpu_mode` supports `single` and `replicated`. `replicated` is the default and runs one worker per visible GPU for comparable multi-GPU aggregate throughput.
+- Set the backend to `vllm` only when you intentionally want the vLLM-specific benchmark.
 
 ## Outputs
 
@@ -228,6 +236,7 @@ It also builds repeat-level summaries grouped by benchmark configuration and sta
 - pandas / PyYAML / tqdm / safetensors
 
 The script assumes system-level GPU driver setup is already handled outside the repo. It chooses CUDA or ROCm wheels based on `gpu_backend`.
+On AMD, the default setup intentionally skips `vllm` and `xformers` because the common wheels are often CUDA-oriented or otherwise not validated for the target ROCm runtime.
 
 ## Metadata
 

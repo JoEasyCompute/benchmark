@@ -46,12 +46,14 @@ class ValidateConfigTest(unittest.TestCase):
               batch_size: 1
               steps: 1
             llm_infer:
+              backend: transformers
               model: "Qwen/Qwen2.5-0.5B"
               dtype: float16
               prompt_len: 64
               output_len: 32
               batch_sizes: [1]
               tensor_parallel_sizes: [1]
+              multi_gpu_mode: replicated
             sd_infer:
               model: "stabilityai/stable-diffusion-2-1"
               steps: 4
@@ -84,12 +86,14 @@ class ValidateConfigTest(unittest.TestCase):
               batch_size: 4
               steps: 2
             llm_infer:
+              backend: invalid
               model: "Qwen/Qwen2.5-0.5B"
               dtype: float16
               prompt_len: 64
               output_len: 32
               batch_sizes: [1]
               tensor_parallel_sizes: [1]
+              multi_gpu_mode: invalid
             sd_infer:
               model: "stabilityai/stable-diffusion-2-1"
               steps: 4
@@ -103,6 +107,8 @@ class ValidateConfigTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("gpu_backend must be one of auto, nvidia, amd", result.stderr)
+        self.assertIn("llm_infer.backend must be one of transformers, vllm", result.stderr)
+        self.assertIn("llm_infer.multi_gpu_mode must be 'single' or 'replicated'", result.stderr)
         self.assertIn("unsupported key 'bogus'", result.stderr)
 
 

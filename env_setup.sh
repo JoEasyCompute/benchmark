@@ -104,16 +104,21 @@ if [[ "$GPU_BACKEND" == "nvidia" ]]; then
     "vllm==0.11.0" \
     "xformers==0.0.32.post1"
 else
-  pip install "vllm==0.11.0" || echo "[ENV][WARN] vLLM install failed; llm_infer_vllm may be unavailable on this AMD host"
-  pip install "xformers==0.0.32.post1" || echo "[ENV][WARN] xformers install failed; SD will continue without it"
+  pip uninstall -y vllm xformers >/dev/null 2>&1 || true
+  echo "[ENV][WARN] Skipping default vLLM install on AMD; llm_infer_vllm requires a separately validated ROCm-compatible vLLM build."
+  echo "[ENV][WARN] Skipping xformers install on AMD; Stable Diffusion will run without it unless you install a compatible build manually."
 fi
 
 # Stable Diffusion trio (pins that avoid CLIP offload kw issues)
-# --no-deps prevents pulling mismatched transitive deps
+# --no-deps prevents pulling mismatched transitive deps, so install
+# the shared requirements explicitly afterward.
 pip install --upgrade --no-deps \
   "diffusers==0.29.2" \
   "transformers==4.57.0" \
   "accelerate==1.10.1"
+pip install --upgrade \
+  "huggingface-hub>=0.34.0,<1.0" \
+  "importlib-metadata>=6.0"
 
 # Bench deps
 if [[ "$GPU_BACKEND" == "nvidia" ]]; then

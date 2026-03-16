@@ -70,10 +70,17 @@ def main():
         add_range(totals, real_total["min_s"], real_total["likely_s"], real_total["max_s"])
 
     llm_infer = cfg.get("llm_infer", {})
-    combos = len(llm_infer.get("batch_sizes", [])) * len(llm_infer.get("tensor_parallel_sizes", []))
+    infer_backend = (llm_infer.get("backend", "transformers") or "transformers").lower()
+    infer_multi_gpu_mode = (llm_infer.get("multi_gpu_mode", "single") or "single").lower()
+    batch_sizes = list(llm_infer.get("batch_sizes", []))
+    tp_sizes = list(llm_infer.get("tensor_parallel_sizes", []))
+    if infer_backend == "vllm":
+        combos = len(batch_sizes) * len(tp_sizes)
+    else:
+        combos = len(batch_sizes) * sum(1 for tp in tp_sizes if int(tp) == 1)
     infer_per_combo = {"min_s": 35.0, "likely_s": 55.0, "max_s": 95.0}
     infer_total = {k: combos * repeat * v for k, v in infer_per_combo.items()}
-    sections.append({"suite": "llm_infer", "combos": combos, **infer_total})
+    sections.append({"suite": "llm_infer", "backend": infer_backend, "multi_gpu_mode": infer_multi_gpu_mode, "combos": combos, **infer_total})
     add_range(totals, infer_total["min_s"], infer_total["likely_s"], infer_total["max_s"])
 
     sd_infer = cfg.get("sd_infer", {})

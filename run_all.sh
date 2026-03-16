@@ -234,6 +234,32 @@ run_and_log () {
   ( set -o pipefail; (cd "$RUN_DIR" && stdbuf -oL -eL "$@") 2>&1 | tee "$logfile" )
 }
 
+RUN_FAILURE_COUNT=0
+
+run_and_log_allow_fail () {
+  local name="$1"; shift
+  local had_errexit=0
+  case $- in
+    *e*) had_errexit=1 ;;
+  esac
+
+  set +e
+  run_and_log "$name" "$@"
+  local rc=$?
+  if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  RUN_FAILURE_COUNT=$((RUN_FAILURE_COUNT + 1))
+  echo "[WARN] $name exited with status $rc; continuing"
+  printf '[WARN] suite command exited with status %s\n' "$rc" >> "$RUN_DIR/logs/${name}.log"
+  return 0
+}
+
 jsonl_line_count () {
   local fp="$1"
   if [[ -f "$fp" ]]; then
@@ -311,11 +337,11 @@ PY
     train_gpu_csv="$(IFS=,; echo "${train_gpu_ids[*]}")"
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     if [[ "$world_size" -gt 1 ]]; then
-      run_and_log "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
+      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
         python3 -m torch.distributed.run --standalone --nproc_per_node "$world_size" \
         "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     else
-      run_and_log "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
+      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
         python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     fi
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
@@ -326,15 +352,22 @@ LLM_TRAIN_REAL_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH
 if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-    run_and_log "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$RUN_CONFIG_PATH"
+    run_and_log_allow_fail "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$RUN_CONFIG_PATH"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train_real" "$rep" "$REPEAT_COUNT"
   done
 fi
 
-# --- 2) LLM Inference (vLLM) ---
+# --- 2) LLM Inference ---
+LLM_INFER_BACKEND="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.backend --default '"transformers"' --format text)"
+LLM_INFER_SCRIPT="$BENCH_DIR/llm_infer_hf.py"
+LLM_INFER_LOG_NAME="llm_infer_transformers"
+if [[ "$LLM_INFER_BACKEND" == "vllm" ]]; then
+  LLM_INFER_SCRIPT="$BENCH_DIR/llm_infer_vllm.py"
+  LLM_INFER_LOG_NAME="llm_infer_vllm"
+fi
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-  run_and_log "llm_infer_vllm_r${rep}" python3 "$BENCH_DIR/llm_infer_vllm.py" --config "$RUN_CONFIG_PATH" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
+  run_and_log_allow_fail "${LLM_INFER_LOG_NAME}_r${rep}" python3 "$LLM_INFER_SCRIPT" --config "$RUN_CONFIG_PATH" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_infer" "$rep" "$REPEAT_COUNT"
 done
 
@@ -349,7 +382,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
   for sz in "${SD_SIZES[@]}"; do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     if [[ "$SD_EMIT_WORKER_ROWS" == "1" ]]; then
-      run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
+      run_and_log_allow_fail "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
         --model "$SD_MODEL" --width "$sz" --height "$sz" \
         --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
@@ -357,7 +390,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
         --multi-gpu-mode "$SD_MULTI_GPU_MODE" \
         --emit-worker-rows
     else
-      run_and_log "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
+      run_and_log_allow_fail "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
         --model "$SD_MODEL" --width "$sz" --height "$sz" \
         --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
@@ -381,7 +414,7 @@ if command -v blender >/dev/null 2>&1; then
     export RESULTS_JSON="$RUN_DIR/results/blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}.json"
     export REPEAT_INDEX="$rep"
     export REPEAT_COUNT
-    run_and_log "blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}" bash "$BENCH_DIR/blender_bench_cuda.sh"
+    run_and_log_allow_fail "blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}" bash "$BENCH_DIR/blender_bench_cuda.sh"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "blender" "$rep" "$REPEAT_COUNT"
   done
 else
@@ -410,3 +443,8 @@ echo "        - System Reqs:   $RUN_DIR/system_requirements.json"
 echo "        - Machine State: $RUN_DIR/machine_state.json"
 echo "        - Blender JSON:  $RUN_DIR/results/blender_bench_*.json (if ran)"
 echo "        - Logs:          $RUN_DIR/logs/*.log"
+
+if [[ "$RUN_FAILURE_COUNT" -gt 0 ]]; then
+  echo "[WARN] $RUN_FAILURE_COUNT benchmark command(s) exited non-zero during the run" >&2
+  exit 1
+fi

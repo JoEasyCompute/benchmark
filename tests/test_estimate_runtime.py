@@ -33,12 +33,14 @@ class EstimateRuntimeTest(unittest.TestCase):
               batch_size: 1
               steps: 3
             llm_infer:
+              backend: transformers
               model: "Qwen/Qwen2.5-0.5B"
               dtype: float16
               prompt_len: 64
               output_len: 32
               batch_sizes: [1, 2]
               tensor_parallel_sizes: [1, 2]
+              multi_gpu_mode: replicated
             sd_infer:
               model: "stabilityai/stable-diffusion-2-1"
               steps: 20
@@ -73,7 +75,9 @@ class EstimateRuntimeTest(unittest.TestCase):
             self.assertEqual(payload["visible_gpus"], 3)
             self.assertEqual(payload["total_minutes"]["min"], round(payload["total"]["min_s"] / 60.0, 1))
             suites = {section["suite"]: section for section in payload["sections"]}
-            self.assertEqual(suites["llm_infer"]["combos"], 4)
+            self.assertEqual(suites["llm_infer"]["backend"], "transformers")
+            self.assertEqual(suites["llm_infer"]["multi_gpu_mode"], "replicated")
+            self.assertEqual(suites["llm_infer"]["combos"], 2)
             self.assertEqual(suites["sd_infer"]["multi_gpu_mode"], "replicated")
             self.assertIn("[ESTIMATE] total runtime:", result.stdout)
 

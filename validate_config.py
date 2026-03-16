@@ -113,9 +113,13 @@ def main():
         expect_keys(
             "llm_infer",
             llm_infer,
-            {"model", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes"},
+            {"backend", "model", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes", "multi_gpu_mode"},
             errors,
         )
+        if llm_infer.get("backend", "transformers") not in {"transformers", "vllm"}:
+            errors.append("llm_infer.backend must be one of transformers, vllm")
+        if llm_infer.get("multi_gpu_mode", "single") not in {"single", "replicated"}:
+            errors.append("llm_infer.multi_gpu_mode must be 'single' or 'replicated'")
         if not isinstance(llm_infer.get("model"), str) or not llm_infer["model"].strip():
             errors.append("llm_infer.model must be a non-empty string")
         if llm_infer.get("dtype") not in {"float16", "half", "bfloat16", "float32", "float", "auto"}:

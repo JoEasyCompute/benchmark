@@ -36,12 +36,14 @@ llm_train_real:
 #  n_heads: 24
 
 llm_infer:
-  model: "mistralai/Mistral-7B-Instruct-v0.3"
+  backend: transformers
+  model: "Qwen/Qwen3-8B"
   dtype: float16
   prompt_len: 512
   output_len: 128
   batch_sizes: [1, 4, 16, 64]
-  tensor_parallel_sizes: [1, 2, 4]
+  tensor_parallel_sizes: [1]
+  multi_gpu_mode: "replicated"  # replicated = one worker per visible GPU
 
 sd_infer:
   model: "stabilityai/stable-diffusion-2-1"

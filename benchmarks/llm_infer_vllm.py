@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import importlib
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import threading
@@ -10,17 +12,35 @@ import traceback
 from typing import List
 
 import yaml
-from transformers import AutoTokenizer
+
+try:
+    from transformers import AutoTokenizer
+    TRANSFORMERS_IMPORT_ERROR = None
+except Exception as exc:
+    AutoTokenizer = None
+    TRANSFORMERS_IMPORT_ERROR = exc
 
 try:
     from vllm import LLM, SamplingParams
+    VLLM_IMPORT_ERROR = None
 except Exception:
     LLM = None
     SamplingParams = None
+    VLLM_IMPORT_ERROR = traceback.format_exc(limit=3)
 
 
 def detect_backend() -> str:
-    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+    if os.environ.get("HIP_VISIBLE_DEVICES"):
+        return "amd"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "nvidia"
+    if shutil.which("rocm-smi") and not shutil.which("nvidia-smi"):
+        return "amd"
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("rocm-smi"):
+        return "amd"
+    return "nvidia"
 
 
 def make_prompt(tokenizer, target_tokens: int) -> tuple[str, int]:
@@ -191,6 +211,44 @@ def classify_failure(exc: Exception) -> str:
     return "unknown"
 
 
+def dependency_error_message() -> str | None:
+    if TRANSFORMERS_IMPORT_ERROR is not None:
+        exc = TRANSFORMERS_IMPORT_ERROR
+        return f"transformers import failed: {type(exc).__name__}: {exc}"
+    if LLM is None or SamplingParams is None:
+        return f"vllm import failed: {VLLM_IMPORT_ERROR or 'unknown import error'}"
+    return None
+
+
+def probe_vllm_runtime(backend: str) -> str | None:
+    if backend != "amd":
+        return None
+    try:
+        importlib.import_module("vllm._C")
+        return None
+    except Exception as exc:
+        return (
+            "AMD vLLM runtime is unavailable in the current environment: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def write_skip_row(cfg, reason: str, detail: str):
+    row = {
+        "benchmark_schema_version": 2,
+        "suite": "llm_infer",
+        "status": "skipped",
+        "skip_reason": reason,
+        "gpu_backend": detect_backend(),
+        "model": cfg.get("model"),
+        "dtype": cfg.get("dtype", "float16"),
+        "gpu_name": detect_gpu_name(),
+        "detail": detail,
+    }
+    write_metric(row)
+    print(f"[SKIP] {detail}")
+
+
 def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
               out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float):
     llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=8192, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
@@ -275,22 +333,15 @@ def main():
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)["llm_infer"]
-    if LLM is None or SamplingParams is None:
-        row = {
-            "benchmark_schema_version": 2,
-            "suite": "llm_infer",
-            "status": "failed",
-            "failure_kind": "dependency_unavailable",
-            "gpu_backend": detect_backend(),
-            "model": cfg.get("model"),
-            "dtype": cfg.get("dtype", "float16"),
-            "error_type": "ImportError",
-            "error": "vllm is not importable in the current environment",
-            "gpu_name": detect_gpu_name(),
-        }
-        write_metric(row)
-        print("[ERROR] vllm is not importable in the current environment")
-        raise SystemExit(1)
+    backend = detect_backend()
+    dep_error = dependency_error_message()
+    if dep_error is not None:
+        write_skip_row(cfg, "dependency_unavailable", dep_error)
+        return
+    runtime_error = probe_vllm_runtime(backend)
+    if runtime_error is not None:
+        write_skip_row(cfg, "unsupported_runtime", runtime_error)
+        return
 
     model = cfg["model"]
     dtype = cfg.get("dtype", "float16")

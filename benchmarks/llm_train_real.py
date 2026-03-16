@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -14,7 +15,17 @@ DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float3
 
 
 def detect_backend() -> str:
-    return "amd" if os.environ.get("HIP_VISIBLE_DEVICES") else "nvidia"
+    if os.environ.get("HIP_VISIBLE_DEVICES"):
+        return "amd"
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return "nvidia"
+    if shutil.which("rocm-smi") and not shutil.which("nvidia-smi"):
+        return "amd"
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("rocm-smi"):
+        return "amd"
+    return "nvidia"
 
 
 def resolve_model_revision(model) -> str | None:
