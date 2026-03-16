@@ -6,6 +6,7 @@ results_dir: results
 
 preflight:
   machine_state_strict: false
+  blender_strict: false
 
 llm_train:
   dtype: bf16          # or fp16; both fine on 4090
@@ -55,6 +56,7 @@ sd_infer:
 
 blender:
   enabled: true
+  require_installed: false
   backend: auto
   scenes:
     # Provide local .blend scene paths if available

@@ -60,18 +60,29 @@ def main():
                 f"AMD llm_infer_vllm is not validated in this environment; benchmark will likely be skipped ({type(exc).__name__}: {exc})"
             )
 
-    blender_enabled = (cfg.get("blender", {}) or {}).get("enabled", True)
+    blender_cfg = cfg.get("blender", {}) or {}
+    blender_enabled = blender_cfg.get("enabled", True)
+    blender_require_installed = bool(blender_cfg.get("require_installed", False))
+    blender_strict = bool((cfg.get("preflight", {}) or {}).get("blender_strict", False))
     if blender_enabled:
         blender_path = shutil.which("blender")
         payload["checks"].append({"binary": "blender", "path": blender_path})
         if not blender_path:
-            payload["warnings"].append("blender not found on PATH; Blender benchmark will be skipped")
+            message = "blender not found on PATH"
+            if blender_require_installed or blender_strict:
+                payload["errors"].append(f"{message}; Blender benchmark is enabled and required")
+            else:
+                payload["warnings"].append(f"{message}; Blender benchmark will be skipped")
         payload["checks"].append({"blender_backend": blender_backend(backend)})
 
         time_path = Path("/usr/bin/time")
         payload["checks"].append({"binary": "/usr/bin/time", "path": str(time_path) if time_path.exists() else None})
         if not time_path.exists():
-            payload["warnings"].append("/usr/bin/time not found; Blender timing script will fail if Blender is enabled")
+            message = "/usr/bin/time not found; Blender timing script will fail if Blender is enabled"
+            if blender_require_installed or blender_strict:
+                payload["errors"].append(message)
+            else:
+                payload["warnings"].append(message)
 
     if payload["errors"]:
         payload["status"] = "error"

@@ -30,6 +30,7 @@ bash run_all.sh
 On the first run, `run_all.sh` bootstraps `.venv` automatically by invoking `env_setup.sh` if the repo environment is missing or incomplete.
 That auto-bootstrap path is intended for supported Linux GPU hosts and now supports both NVIDIA/CUDA and AMD/ROCm setups through `gpu_backend`.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
+Blender is intentionally not installed by `env_setup.sh`; use [install_blender.sh](./install_blender.sh) if you want full-suite host setup.
 
 For a quick validation run, use:
 
@@ -43,7 +44,7 @@ Assumptions:
 - Linux benchmark host
 - NVIDIA drivers with `nvidia-smi` or AMD ROCm with `rocm-smi` are already installed
 - Python 3.10, 3.11, or 3.12 is available
-- Blender is optional; the Blender benchmark is skipped if `blender` is not on `PATH`
+- Blender is a host-level prerequisite for full-suite runs; if it is missing and not required, the Blender benchmark is skipped
 
 ## Backend Support
 
@@ -66,6 +67,7 @@ Important caveat:
 - AMD support should be treated as implementation-level support that still requires runtime validation on a real ROCm host
 - the default `llm_infer` path is backend-agnostic `transformers`; `vllm` remains optional and opt-in
 - the default `env_setup.sh` path no longer installs `vllm` or `xformers` on AMD automatically; `llm_infer_vllm` is skipped unless you provide a separately validated ROCm-compatible `vllm` install
+- Blender should be pinned to the same version across benchmark hosts; this repo provides [install_blender.sh](./install_blender.sh) for that purpose
 
 ## Runtime Flow
 
@@ -177,7 +179,7 @@ What it does:
 Notes:
 - Scene selection now comes from `config.yaml` when `blender.scenes` is provided; otherwise it falls back to bundled scenes
 - It writes structured rows directly to `metrics.jsonl` and also keeps a standalone JSON file in the run results directory
-- It is skipped if `blender` is unavailable
+- It is skipped if `blender` is unavailable unless Blender is marked required in config/preflight
 
 ## Configuration
 
@@ -197,6 +199,7 @@ Important caveat:
 - `llm_infer.backend` defaults to `transformers` so inference results are comparable across mixed GPU vendors. The default model is currently `Qwen/Qwen3-8B`.
 - `llm_infer.multi_gpu_mode` supports `single` and `replicated`. `replicated` is the default and runs one worker per visible GPU for comparable multi-GPU aggregate throughput.
 - Set the backend to `vllm` only when you intentionally want the vLLM-specific benchmark.
+- `blender.require_installed: true` and/or `preflight.blender_strict: true` turns missing Blender from a warning into a hard preflight error
 
 ## Outputs
 
@@ -260,6 +263,33 @@ Machine-state inspection:
 System requirements:
 - `check_system_requirements.py` verifies the Linux GPU host assumptions and required binaries such as `nvidia-smi` or `rocm-smi` and `stdbuf`.
 - Missing required host tools are a hard stop before benchmark execution begins.
+- If Blender is enabled and required, missing `blender` or `/usr/bin/time` is also a hard stop before benchmark execution begins.
+
+## Blender Install
+
+For hosts that should run the full suite, install a pinned Blender build separately from the Python environment:
+
+```bash
+bash install_blender.sh
+```
+
+Defaults:
+- Blender version: `4.2.18`
+- install root: `~/.local/opt/blender-4.2.18`
+- symlink: `~/.local/bin/blender`
+
+Example with explicit version:
+
+```bash
+BLENDER_VERSION=4.2.18 bash install_blender.sh
+```
+
+The installer downloads Blender from the official archive:
+- `https://download.blender.org/release/Blender4.2/blender-4.2.18-linux-x64.tar.xz`
+
+Recommended practice:
+- use the same Blender version on every benchmark host
+- set `blender.require_installed: true` once Blender is part of your required comparison suite
 
 Post-run validation:
 - `validate_run_artifacts.py` checks a completed run folder for missing artifacts, backend mismatches, missing suite rows, failed/skipped rows, and AMD power-metric caveats before you compare runs across vendors.

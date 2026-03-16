@@ -58,9 +58,11 @@ def main():
         if not isinstance(preflight, dict):
             errors.append("preflight must be a mapping if provided")
         else:
-            expect_keys("preflight", preflight, {"machine_state_strict"}, errors)
+            expect_keys("preflight", preflight, {"machine_state_strict", "blender_strict"}, errors)
             if "machine_state_strict" in preflight and not isinstance(preflight["machine_state_strict"], bool):
                 errors.append("preflight.machine_state_strict must be true or false")
+            if "blender_strict" in preflight and not isinstance(preflight["blender_strict"], bool):
+                errors.append("preflight.blender_strict must be true or false")
 
     llm_train = cfg.get("llm_train")
     if not isinstance(llm_train, dict):
@@ -160,9 +162,11 @@ def main():
     if not isinstance(blender, dict):
         errors.append("blender must be a mapping if provided")
     else:
-        expect_keys("blender", blender, {"enabled", "backend", "scenes"}, errors)
+        expect_keys("blender", blender, {"enabled", "backend", "scenes", "require_installed"}, errors)
         if "enabled" in blender and not isinstance(blender["enabled"], bool):
             errors.append("blender.enabled must be true or false")
+        if "require_installed" in blender and not isinstance(blender["require_installed"], bool):
+            errors.append("blender.require_installed must be true or false")
         if blender.get("backend", "auto") not in {"auto", "cuda", "hip"}:
             errors.append("blender.backend must be one of auto, cuda, hip")
         scenes = blender.get("scenes", [])

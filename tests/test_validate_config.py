@@ -30,6 +30,7 @@ class ValidateConfigTest(unittest.TestCase):
             results_dir: results
             preflight:
               machine_state_strict: false
+              blender_strict: true
             llm_train:
               dtype: bf16
               hidden_size: 1024
@@ -63,6 +64,7 @@ class ValidateConfigTest(unittest.TestCase):
               emit_worker_rows: false
             blender:
               enabled: true
+              require_installed: true
               backend: hip
               scenes: []
             """
@@ -102,6 +104,7 @@ class ValidateConfigTest(unittest.TestCase):
               multi_gpu_mode: "single"
             blender:
               enabled: true
+              require_installed: invalid
               scenes: []
             """
         )
@@ -109,6 +112,7 @@ class ValidateConfigTest(unittest.TestCase):
         self.assertIn("gpu_backend must be one of auto, nvidia, amd", result.stderr)
         self.assertIn("llm_infer.backend must be one of transformers, vllm", result.stderr)
         self.assertIn("llm_infer.multi_gpu_mode must be 'single' or 'replicated'", result.stderr)
+        self.assertIn("blender.require_installed must be true or false", result.stderr)
         self.assertIn("unsupported key 'bogus'", result.stderr)
 
 
