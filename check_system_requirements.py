@@ -16,6 +16,21 @@ REQUIRED_BINS = ("stdbuf", "tee", "hostname")
 OPTIONAL_BINS = ("lscpu", "free")
 
 
+def find_binary(name: str) -> str | None:
+    path = shutil.which(name)
+    if path:
+        return path
+
+    candidates = (
+        Path.home() / ".local" / "bin" / name,
+        Path.home() / "bin" / name,
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
@@ -37,13 +52,13 @@ def main():
     required_bins = (gpu_tool, *REQUIRED_BINS)
 
     for name in required_bins:
-        path = shutil.which(name)
+        path = find_binary(name)
         payload["checks"].append({"binary": name, "path": path})
         if not path:
             payload["errors"].append(f"required binary not found on PATH: {name}")
 
     for name in OPTIONAL_BINS:
-        path = shutil.which(name)
+        path = find_binary(name)
         payload["checks"].append({"binary": name, "path": path})
         if not path:
             payload["warnings"].append(f"optional binary not found on PATH: {name}")
@@ -65,7 +80,7 @@ def main():
     blender_require_installed = bool(blender_cfg.get("require_installed", False))
     blender_strict = bool((cfg.get("preflight", {}) or {}).get("blender_strict", False))
     if blender_enabled:
-        blender_path = shutil.which("blender")
+        blender_path = find_binary("blender")
         payload["checks"].append({"binary": "blender", "path": blender_path})
         if not blender_path:
             message = "blender not found on PATH"

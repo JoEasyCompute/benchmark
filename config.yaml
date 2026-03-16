@@ -47,7 +47,7 @@ llm_infer:
   multi_gpu_mode: "replicated"  # replicated = one worker per visible GPU
 
 sd_infer:
-  model: "stabilityai/stable-diffusion-2-1"
+  model: "stable-diffusion-v1-5/stable-diffusion-v1-5"
   steps: 20
   sizes: [512, 1024]
   per_gpu_batch: 4

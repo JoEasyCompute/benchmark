@@ -11,6 +11,10 @@ CONFIG_UTILS="$BASE_DIR/config_utils.py"
 GPU_PLATFORM="$BASE_DIR/gpu_platform.py"
 SMOKE_MODE=0
 
+# Include common user-local bin directories so host-level tools installed by
+# helper scripts are discoverable even in non-login shells.
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --smoke)

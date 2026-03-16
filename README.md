@@ -159,6 +159,7 @@ What it does:
 - Reports images/sec and per-iteration timing
 
 Notes:
+- Default model is now `stable-diffusion-v1-5/stable-diffusion-v1-5` because previously configured SD model identifiers are no longer reliably accessible on Hugging Face.
 - `run_all.sh` runs it once per configured image size
 - `multi_gpu_mode: replicated` now launches one worker per visible GPU and reports aggregate throughput
 - If only one GPU is visible, replicated mode falls back to single-GPU execution
@@ -277,6 +278,8 @@ Defaults:
 - Blender version: `4.2.18`
 - install root: `~/.local/opt/blender-4.2.18`
 - symlink: `~/.local/bin/blender`
+
+`run_all.sh` prepends `~/.local/bin` and `~/bin` to `PATH`, and `check_system_requirements.py` also checks those locations directly, so the installed Blender binary is discoverable even in non-login shell sessions.
 
 Example with explicit version:
 
