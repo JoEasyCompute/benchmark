@@ -98,7 +98,7 @@ def infer_max_gpu_count(summary_rows: list[dict]) -> int | None:
     return max(counts) if counts else None
 
 
-def load_run(run_dir: Path) -> dict:
+def load_run(run_dir: Path, label: str | None = None) -> dict:
     missing = [rel for rel in REQUIRED_FILES if not (run_dir / rel).exists()]
     if missing:
         raise SystemExit(f"[COMPARE][ERROR] Missing required files in {run_dir}: {', '.join(missing)}")
@@ -109,7 +109,7 @@ def load_run(run_dir: Path) -> dict:
     if not isinstance(summary_rows, list):
         raise SystemExit(f"[COMPARE][ERROR] metrics_summary.json is not a list: {run_dir}")
 
-    label = default_label(run_dir, meta)
+    label = label or default_label(run_dir, meta)
     return {
         "run_dir": str(run_dir),
         "run_name": run_dir.name,
@@ -227,10 +227,77 @@ def best_row(metric: str, rows: list[dict]):
     return sorted(candidates, key=lambda row: row["value"], reverse=reverse)[0]
 
 
-def build_payload(runs: list[dict]) -> dict:
+def baseline_key(run: dict) -> tuple[str, str, str]:
+    return run["label"], run["run_name"], run["run_dir"]
+
+
+def resolve_baseline_label(runs: list[dict], baseline: str | None) -> str:
+    if baseline is None:
+        return runs[0]["label"]
+    for run in runs:
+        if baseline in baseline_key(run):
+            return run["label"]
+    raise SystemExit(f"[COMPARE][ERROR] Unknown baseline run: {baseline}")
+
+
+def compute_executive_summary(payload: dict) -> dict:
+    counts = {"strict": 0, "directional": 0, "partial": 0}
+    winners = {}
+    suite_highlights = []
+    baseline_label = payload["baseline_label"]
+
+    for suite, suite_payload in payload["suites"].items():
+        best_highlight = None
+        for group in suite_payload["groups"]:
+            counts[group["quality"]] = counts.get(group["quality"], 0) + 1
+            for metric, metric_payload in group["metrics"].items():
+                winner = metric_payload.get("winner")
+                if winner:
+                    winners[winner] = winners.get(winner, 0) + 1
+                if group["quality"] != "strict":
+                    continue
+                if baseline_label not in group["runs_present"]:
+                    continue
+                baseline_row = next((row for row in metric_payload["rows"] if row["label"] == baseline_label), None)
+                if not baseline_row:
+                    continue
+                competitor_rows = [
+                    row for row in metric_payload["rows"]
+                    if row["label"] != baseline_label and row.get("delta_vs_first_run_pct") is not None
+                ]
+                if not competitor_rows:
+                    continue
+                competitor = max(competitor_rows, key=lambda row: abs(row["delta_vs_first_run_pct"]))
+                delta = competitor["delta_vs_first_run_pct"]
+                score = abs(delta) if delta is not None else None
+                if score is None:
+                    continue
+                candidate = {
+                    "suite": suite,
+                    "metric": metric,
+                    "winner": competitor["label"],
+                    "delta_vs_baseline_pct": round(delta, 3),
+                    "group_key_text": group["key_text"],
+                }
+                if best_highlight is None or score > abs(best_highlight["delta_vs_baseline_pct"]):
+                    best_highlight = candidate
+        if best_highlight:
+            suite_highlights.append(best_highlight)
+
+    winner_counts = [{"label": label, "metric_wins": count} for label, count in sorted(winners.items(), key=lambda item: (-item[1], item[0]))]
+    return {
+        "group_counts": counts,
+        "winner_counts": winner_counts,
+        "suite_highlights": suite_highlights,
+    }
+
+
+def build_payload(runs: list[dict], baseline: str | None = None) -> dict:
     groups = build_groups(runs)
+    baseline_label = resolve_baseline_label(runs, baseline)
     payload = {
         "run_count": len(runs),
+        "baseline_label": baseline_label,
         "runs": [],
         "suites": {},
     }
@@ -249,7 +316,6 @@ def build_payload(runs: list[dict]) -> dict:
             }
         )
 
-    baseline_label = runs[0]["label"]
     for suite, suite_groups in sorted(groups.items()):
         suite_payload = {"groups": []}
         for key, entries in sorted(suite_groups.items(), key=lambda item: format_key_summary(item[0])):
@@ -301,6 +367,7 @@ def build_payload(runs: list[dict]) -> dict:
             suite_payload["groups"].append(group_payload)
         payload["suites"][suite] = suite_payload
 
+    payload["executive_summary"] = compute_executive_summary(payload)
     return payload
 
 
@@ -309,6 +376,31 @@ def render_markdown(payload: dict) -> str:
     lines.append("# Run Comparison Report")
     lines.append("")
     lines.append(f"Compared runs: {payload['run_count']}")
+    lines.append(f"Baseline run: `{payload['baseline_label']}`")
+    lines.append("")
+    lines.append("## Executive Summary")
+    lines.append("")
+    summary = payload["executive_summary"]
+    group_counts = summary["group_counts"]
+    lines.append(
+        f"- Groups: strict={group_counts.get('strict', 0)}, "
+        f"directional={group_counts.get('directional', 0)}, partial={group_counts.get('partial', 0)}"
+    )
+    if summary["winner_counts"]:
+        top_winner = summary["winner_counts"][0]
+        lines.append(f"- Most metric wins: `{top_winner['label']}` ({top_winner['metric_wins']} metrics)")
+    else:
+        lines.append("- Most metric wins: n/a")
+    if summary["suite_highlights"]:
+        for item in summary["suite_highlights"]:
+            delta = item["delta_vs_baseline_pct"]
+            delta_text = f"{delta:+.3f}%"
+            lines.append(
+                f"- {item['suite']}: `{item['winner']}` is strongest on `{item['metric']}` "
+                f"vs baseline ({delta_text})"
+            )
+    else:
+        lines.append("- No strict-comparison highlights available yet.")
     lines.append("")
     lines.append("## Run Overview")
     lines.append("")
@@ -369,30 +461,56 @@ def render_markdown(payload: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def parse_labeled_run(spec: str) -> tuple[str, Path]:
+    if "=" not in spec:
+        raise SystemExit("[COMPARE][ERROR] --label must be in NAME=PATH format")
+    name, raw_path = spec.split("=", 1)
+    name = name.strip()
+    raw_path = raw_path.strip()
+    if not name or not raw_path:
+        raise SystemExit("[COMPARE][ERROR] --label must be in NAME=PATH format")
+    return name, Path(raw_path).resolve()
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("run_dirs", nargs="+", help="Path to completed results/<run_id> directories")
+    ap.add_argument("run_dirs", nargs="*", help="Path to completed results/<run_id> directories")
+    ap.add_argument("--label", action="append", default=[], help="Label a run as NAME=PATH")
+    ap.add_argument("--baseline", default="", help="Baseline run label, run name, or run path")
+    ap.add_argument("--out-dir", default="", help="Directory to write comparison.json and comparison.md")
     ap.add_argument("--json-out", default="")
     ap.add_argument("--md-out", default="")
     args = ap.parse_args()
 
-    run_dirs = [Path(item).resolve() for item in args.run_dirs]
-    if len(run_dirs) < 2:
+    labeled_runs = [parse_labeled_run(spec) for spec in args.label]
+    unlabeled_runs = [Path(item).resolve() for item in args.run_dirs]
+    all_paths = [path for _, path in labeled_runs] + unlabeled_runs
+    if len(all_paths) < 2:
         raise SystemExit("[COMPARE][ERROR] Provide at least two run directories")
+    if len({str(path) for path in all_paths}) != len(all_paths):
+        raise SystemExit("[COMPARE][ERROR] Duplicate run directories are not allowed")
 
-    runs = [load_run(run_dir) for run_dir in run_dirs]
-    payload = build_payload(runs)
+    runs = [load_run(run_dir, label=name) for name, run_dir in labeled_runs]
+    runs.extend(load_run(run_dir) for run_dir in unlabeled_runs)
+    payload = build_payload(runs, baseline=args.baseline or None)
     markdown = render_markdown(payload)
 
     print(markdown, end="")
 
-    if args.json_out:
-        json_path = Path(args.json_out)
+    json_target = Path(args.json_out) if args.json_out else None
+    md_target = Path(args.md_out) if args.md_out else None
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+        json_target = out_dir / "comparison.json"
+        md_target = out_dir / "comparison.md"
+
+    if json_target:
+        json_path = json_target
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.write_text(json.dumps(payload, indent=2) + "\n")
 
-    if args.md_out:
-        md_path = Path(args.md_out)
+    if md_target:
+        md_path = md_target
         md_path.parent.mkdir(parents=True, exist_ok=True)
         md_path.write_text(markdown)
 

@@ -135,23 +135,38 @@ class CompareRunsTest(unittest.TestCase):
                 ],
             )
 
-            json_out = tmpdir_path / "comparison.json"
-            md_out = tmpdir_path / "comparison.md"
+            out_dir = tmpdir_path / "report"
             result = subprocess.run(
-                [str(PYTHON), str(SCRIPT), str(run_a), str(run_b), "--json-out", str(json_out), "--md-out", str(md_out)],
+                [
+                    str(PYTHON),
+                    str(SCRIPT),
+                    "--label",
+                    f"AMD={run_a}",
+                    "--label",
+                    f"NVIDIA={run_b}",
+                    "--baseline",
+                    "NVIDIA",
+                    "--out-dir",
+                    str(out_dir),
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            json_out = out_dir / "comparison.json"
+            md_out = out_dir / "comparison.md"
             self.assertTrue(json_out.exists())
             self.assertTrue(md_out.exists())
 
             payload = json.loads(json_out.read_text())
             self.assertEqual(payload["run_count"], 2)
+            self.assertEqual(payload["baseline_label"], "NVIDIA")
             self.assertIn("llm_train", payload["suites"])
             self.assertIn("llm_infer", payload["suites"])
+            self.assertIn("executive_summary", payload)
+            self.assertEqual(payload["executive_summary"]["group_counts"]["strict"], 1)
 
             llm_train_groups = payload["suites"]["llm_train"]["groups"]
             self.assertEqual(len(llm_train_groups), 1)
@@ -161,11 +176,12 @@ class CompareRunsTest(unittest.TestCase):
             llm_train_metrics = llm_train_groups[0]["metrics"]["tokens_per_sec_mean"]["rows"]
             self.assertEqual(llm_train_metrics[0]["value"], 20000.0)
             self.assertEqual(llm_train_metrics[1]["value"], 38000.0)
-            self.assertEqual(llm_train_metrics[1]["delta_vs_first_run_pct"], 90.0)
             self.assertEqual(
                 llm_train_groups[0]["metrics"]["tokens_per_sec_mean"]["winner"],
-                "run_b [nvidia]",
+                "NVIDIA",
             )
+            self.assertEqual(llm_train_metrics[0]["delta_vs_first_run_pct"], -47.368)
+            self.assertEqual(llm_train_metrics[1]["delta_vs_first_run_pct"], 0.0)
 
             llm_infer_groups = payload["suites"]["llm_infer"]["groups"]
             self.assertEqual(len(llm_infer_groups), 1)
@@ -173,7 +189,7 @@ class CompareRunsTest(unittest.TestCase):
             self.assertIn("Per-GPU values are shown", llm_infer_groups[0]["notes"][0])
             infer_metric = llm_infer_groups[0]["metrics"]["gen_tokens_per_s_mean"]
             self.assertTrue(infer_metric["show_per_gpu"])
-            self.assertEqual(infer_metric["winner"], "run_b [nvidia]")
+            self.assertEqual(infer_metric["winner"], "NVIDIA")
             self.assertEqual(infer_metric["rows"][0]["per_gpu_value"], 20.0)
             self.assertEqual(infer_metric["rows"][1]["per_gpu_value"], 18.75)
 
@@ -183,18 +199,22 @@ class CompareRunsTest(unittest.TestCase):
             self.assertEqual(blender_groups[0]["quality"], "directional")
             self.assertEqual(blender_groups[0]["key"], {"scene": "BMW27.blend", "mode": "single"})
             self.assertIn("different render backends", blender_groups[0]["notes"][0])
-            self.assertEqual(blender_groups[0]["metrics"]["time_s_mean"]["winner"], "run_b [nvidia]")
+            self.assertEqual(blender_groups[0]["metrics"]["time_s_mean"]["winner"], "NVIDIA")
 
             markdown = md_out.read_text()
             self.assertIn("# Run Comparison Report", markdown)
+            self.assertIn("Baseline run: `NVIDIA`", markdown)
+            self.assertIn("## Executive Summary", markdown)
+            self.assertIn("Most metric wins: `NVIDIA`", markdown)
+            self.assertIn("llm_train: `AMD` is strongest on `tokens_per_sec_mean` vs baseline (-47.368%)", markdown)
             self.assertIn("## Suite: llm_train", markdown)
             self.assertIn("## Suite: llm_infer", markdown)
             self.assertIn("## Suite: blender", markdown)
-            self.assertIn("run_a [amd]", markdown)
-            self.assertIn("run_b [nvidia]", markdown)
+            self.assertIn("AMD", markdown)
+            self.assertIn("NVIDIA", markdown)
             self.assertIn("Per-GPU Value", markdown)
             self.assertIn("backend differences may affect fairness", markdown)
-            self.assertIn("Best run: `run_b [nvidia]`", markdown)
+            self.assertIn("Best run: `NVIDIA`", markdown)
             self.assertIn("### Group 1 (strict)", markdown)
 
 
