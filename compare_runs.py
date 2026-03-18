@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    raise SystemExit("[COMPARE][ERROR] Missing dependency: PyYAML. Run env_setup.sh or activate the project venv.")
+
+
+SUITE_KEY_FIELDS = {
+    "llm_train": (
+        "dtype",
+        "seq_len",
+        "batch_size",
+        "hidden_size",
+        "n_layers",
+        "n_heads",
+        "world_size",
+    ),
+    "llm_infer": (
+        "backend",
+        "model",
+        "dtype",
+        "multi_gpu_mode",
+        "per_gpu_batch_size",
+        "tensor_parallel",
+        "requested_prompt_len",
+        "output_len",
+    ),
+    "sd_infer": (
+        "model",
+        "steps",
+        "width",
+        "height",
+        "per_gpu_batch",
+        "multi_gpu_mode",
+        "dtype",
+    ),
+    "blender": (
+        "scene",
+        "mode",
+    ),
+}
+
+SUITE_METRICS = {
+    "llm_train": ("tokens_per_sec_mean", "steps_per_sec_mean"),
+    "llm_infer": ("gen_tokens_per_s_mean", "reqs_per_s_mean"),
+    "sd_infer": ("images_per_sec_mean",),
+    "blender": ("time_s_mean",),
+}
+
+LOWER_IS_BETTER_METRICS = {"time_s_mean"}
+THROUGHPUT_METRICS = {
+    "tokens_per_sec_mean",
+    "steps_per_sec_mean",
+    "gen_tokens_per_s_mean",
+    "reqs_per_s_mean",
+    "images_per_sec_mean",
+}
+REQUIRED_FILES = ("meta.json", "effective_config.yaml", "metrics_summary.json")
+
+
+def load_json(path: Path):
+    return json.loads(path.read_text())
+
+
+def load_yaml(path: Path):
+    return yaml.safe_load(path.read_text()) or {}
+
+
+def is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def default_label(run_dir: Path, meta: dict) -> str:
+    gpu_backend = meta.get("gpu_backend") or "unknown"
+    gpu_name = (((meta.get("gpu_smi") or "").splitlines() or ["unknown"])[0]).strip()
+    if not gpu_name:
+        gpu_name = "unknown"
+    return f"{run_dir.name} [{gpu_backend}]"
+
+
+def infer_gpu_name(meta: dict, summary_rows: list[dict]) -> str:
+    for row in summary_rows:
+        name = row.get("gpu_name")
+        if name:
+            return str(name)
+    gpu_smi = meta.get("gpu_smi")
+    if isinstance(gpu_smi, str) and gpu_smi:
+        return gpu_smi.splitlines()[0][:80]
+    return "unknown"
+
+
+def infer_max_gpu_count(summary_rows: list[dict]) -> int | None:
+    counts = [int(row["gpu_count"]) for row in summary_rows if str(row.get("gpu_count", "")).isdigit()]
+    return max(counts) if counts else None
+
+
+def load_run(run_dir: Path) -> dict:
+    missing = [rel for rel in REQUIRED_FILES if not (run_dir / rel).exists()]
+    if missing:
+        raise SystemExit(f"[COMPARE][ERROR] Missing required files in {run_dir}: {', '.join(missing)}")
+
+    meta = load_json(run_dir / "meta.json")
+    effective_config = load_yaml(run_dir / "effective_config.yaml")
+    summary_rows = load_json(run_dir / "metrics_summary.json")
+    if not isinstance(summary_rows, list):
+        raise SystemExit(f"[COMPARE][ERROR] metrics_summary.json is not a list: {run_dir}")
+
+    label = default_label(run_dir, meta)
+    return {
+        "run_dir": str(run_dir),
+        "run_name": run_dir.name,
+        "label": label,
+        "meta": meta,
+        "effective_config": effective_config,
+        "summary_rows": summary_rows,
+        "gpu_backend": meta.get("gpu_backend", "unknown"),
+        "gpu_name": infer_gpu_name(meta, summary_rows),
+        "max_gpu_count": infer_max_gpu_count(summary_rows),
+        "python": meta.get("python"),
+        "platform": meta.get("platform"),
+        "software_versions": meta.get("software_versions", {}) or {},
+    }
+
+
+def suite_key_fields(suite: str) -> tuple[str, ...]:
+    return SUITE_KEY_FIELDS.get(suite, ("status",))
+
+
+def row_key(row: dict) -> tuple[tuple[str, object], ...]:
+    suite = row.get("suite", "unknown")
+    fields = suite_key_fields(suite)
+    return tuple((field, row.get(field)) for field in fields if field in row)
+
+
+def key_to_dict(key: tuple[tuple[str, object], ...]) -> dict:
+    return {k: v for k, v in key}
+
+
+def format_value(value):
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.6g}"
+    return str(value)
+
+
+def format_key_summary(key: tuple[tuple[str, object], ...]) -> str:
+    payload = key_to_dict(key)
+    if not payload:
+        return "default"
+    return ", ".join(f"{field}={format_value(value)}" for field, value in payload.items())
+
+
+def build_groups(runs: list[dict]) -> dict[str, dict[tuple[tuple[str, object], ...], dict[str, dict]]]:
+    groups = {}
+    for run in runs:
+        for row in run["summary_rows"]:
+            suite = row.get("suite", "unknown")
+            if row.get("status") != "ok":
+                continue
+            key = row_key(row)
+            groups.setdefault(suite, {}).setdefault(key, {})[run["label"]] = row
+    return groups
+
+
+def metric_delta(metric: str, baseline, current):
+    if not is_number(baseline) or not is_number(current) or baseline == 0:
+        return None
+    return ((current - baseline) / baseline) * 100.0
+
+
+def metric_per_gpu(metric: str, value, gpu_count):
+    if metric not in THROUGHPUT_METRICS:
+        return None
+    if not is_number(value) or not is_number(gpu_count) or gpu_count <= 0:
+        return None
+    return value / gpu_count
+
+
+def compare_quality(suite: str, rows_present: list[dict], run_count: int) -> tuple[str, list[str]]:
+    notes = []
+    if len(rows_present) != run_count:
+        notes.append("Not all runs contain this comparable row.")
+
+    gpu_counts_present = sorted(
+        {int(row["gpu_count"]) for row in rows_present if str(row.get("gpu_count", "")).isdigit()}
+    )
+    backends_present = sorted({str(row.get("gpu_backend")) for row in rows_present if row.get("gpu_backend")})
+    blender_backends_present = sorted({str(row.get("backend")) for row in rows_present if row.get("backend")})
+
+    if len(gpu_counts_present) > 1 and any(metric in THROUGHPUT_METRICS for metric in SUITE_METRICS.get(suite, ())):
+        notes.append(
+            "Runs in this group use different gpu_count values; total throughput is not normalized. "
+            "Per-GPU values are shown for throughput metrics."
+        )
+    if suite == "blender" and len(blender_backends_present) > 1:
+        notes.append(
+            "Blender rows use different render backends across runs; timings are shown together, "
+            "but backend differences may affect fairness."
+        )
+    elif len(backends_present) > 1:
+        notes.append("Runs in this group span different gpu_backend values.")
+
+    if len(rows_present) != run_count:
+        quality = "partial"
+    elif suite == "blender" and len(blender_backends_present) > 1:
+        quality = "directional"
+    elif len(backends_present) > 1 and len(gpu_counts_present) > 1:
+        quality = "directional"
+    else:
+        quality = "strict"
+
+    return quality, notes
+
+
+def best_row(metric: str, rows: list[dict]):
+    candidates = [row for row in rows if is_number(row.get("value"))]
+    if not candidates:
+        return None
+    reverse = metric not in LOWER_IS_BETTER_METRICS
+    return sorted(candidates, key=lambda row: row["value"], reverse=reverse)[0]
+
+
+def build_payload(runs: list[dict]) -> dict:
+    groups = build_groups(runs)
+    payload = {
+        "run_count": len(runs),
+        "runs": [],
+        "suites": {},
+    }
+
+    for run in runs:
+        payload["runs"].append(
+            {
+                "label": run["label"],
+                "run_dir": run["run_dir"],
+                "gpu_backend": run["gpu_backend"],
+                "gpu_name": run["gpu_name"],
+                "max_gpu_count": run["max_gpu_count"],
+                "python": run["python"],
+                "transformers": run["software_versions"].get("transformers"),
+                "torch": run["software_versions"].get("torch"),
+            }
+        )
+
+    baseline_label = runs[0]["label"]
+    for suite, suite_groups in sorted(groups.items()):
+        suite_payload = {"groups": []}
+        for key, entries in sorted(suite_groups.items(), key=lambda item: format_key_summary(item[0])):
+            rows_present = list(entries.values())
+            gpu_counts_present = sorted(
+                {int(row["gpu_count"]) for row in rows_present if str(row.get("gpu_count", "")).isdigit()}
+            )
+            quality, notes = compare_quality(suite, rows_present, len(runs))
+            group_payload = {
+                "key": key_to_dict(key),
+                "key_text": format_key_summary(key),
+                "run_count": len(entries),
+                "fully_comparable": len(entries) == len(runs),
+                "quality": quality,
+                "runs_present": sorted(entries.keys()),
+                "notes": notes,
+                "metrics": {},
+            }
+            for metric in SUITE_METRICS.get(suite, ()):
+                metric_rows = []
+                baseline_value = None
+                show_per_gpu = len(gpu_counts_present) > 1 and metric in THROUGHPUT_METRICS
+                if baseline_label in entries:
+                    baseline_value = entries[baseline_label].get(metric)
+                for run in runs:
+                    row = entries.get(run["label"])
+                    value = row.get(metric) if row else None
+                    gpu_count = row.get("gpu_count") if row else None
+                    per_gpu_value = metric_per_gpu(metric, value, gpu_count)
+                    delta_pct = metric_delta(metric, baseline_value, value) if baseline_value is not None else None
+                    metric_rows.append(
+                        {
+                            "label": run["label"],
+                            "value": value,
+                            "per_gpu_value": None if per_gpu_value is None else round(per_gpu_value, 6),
+                            "delta_vs_first_run_pct": None if delta_pct is None else round(delta_pct, 3),
+                            "gpu_backend": run["gpu_backend"],
+                            "gpu_name": run["gpu_name"],
+                            "max_gpu_count": run["max_gpu_count"],
+                        }
+                    )
+                winner = best_row(metric, metric_rows)
+                group_payload["metrics"][metric] = {
+                    "lower_is_better": metric in LOWER_IS_BETTER_METRICS,
+                    "show_per_gpu": show_per_gpu,
+                    "winner": None if winner is None else winner["label"],
+                    "rows": metric_rows,
+                }
+            suite_payload["groups"].append(group_payload)
+        payload["suites"][suite] = suite_payload
+
+    return payload
+
+
+def render_markdown(payload: dict) -> str:
+    lines = []
+    lines.append("# Run Comparison Report")
+    lines.append("")
+    lines.append(f"Compared runs: {payload['run_count']}")
+    lines.append("")
+    lines.append("## Run Overview")
+    lines.append("")
+    lines.append("| Label | Backend | GPU | Max GPU Count | Torch | Transformers |")
+    lines.append("| --- | --- | --- | ---: | --- | --- |")
+    for run in payload["runs"]:
+        lines.append(
+            f"| {run['label']} | {run['gpu_backend']} | {run['gpu_name']} | "
+            f"{format_value(run['max_gpu_count'])} | {format_value(run['torch'])} | {format_value(run['transformers'])} |"
+        )
+    lines.append("")
+
+    for suite, suite_payload in sorted(payload["suites"].items()):
+        lines.append(f"## Suite: {suite}")
+        lines.append("")
+        if not suite_payload["groups"]:
+            lines.append("No successful comparable rows found.")
+            lines.append("")
+            continue
+
+        for index, group in enumerate(suite_payload["groups"], start=1):
+            lines.append(f"### Group {index} ({group['quality']})")
+            lines.append("")
+            lines.append(f"Key: `{group['key_text']}`")
+            lines.append("")
+            lines.append(f"Runs present: {', '.join(group['runs_present'])}")
+            lines.append("")
+            for note in group.get("notes", []):
+                lines.append(f"Note: {note}")
+                lines.append("")
+            for metric, metric_payload in group["metrics"].items():
+                direction = "lower is better" if metric_payload["lower_is_better"] else "higher is better"
+                lines.append(f"#### Metric: {metric} ({direction})")
+                lines.append("")
+                if metric_payload.get("winner"):
+                    lines.append(f"Best run: `{metric_payload['winner']}`")
+                    lines.append("")
+                if metric_payload.get("show_per_gpu"):
+                    lines.append("| Run | Value | Per-GPU Value | Delta vs First Run | GPU Count |")
+                    lines.append("| --- | ---: | ---: | ---: | ---: |")
+                else:
+                    lines.append("| Run | Value | Delta vs First Run | GPU Count |")
+                    lines.append("| --- | ---: | ---: | ---: |")
+                for row in metric_payload["rows"]:
+                    delta = row["delta_vs_first_run_pct"]
+                    delta_text = "n/a" if delta is None else f"{delta:+.3f}%"
+                    value_text = "n/a" if row["value"] is None else format_value(row["value"])
+                    if metric_payload.get("show_per_gpu"):
+                        per_gpu_text = "n/a" if row["per_gpu_value"] is None else format_value(row["per_gpu_value"])
+                        lines.append(
+                            f"| {row['label']} | {value_text} | {per_gpu_text} | {delta_text} | {format_value(row['max_gpu_count'])} |"
+                        )
+                    else:
+                        lines.append(
+                            f"| {row['label']} | {value_text} | {delta_text} | {format_value(row['max_gpu_count'])} |"
+                        )
+                lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run_dirs", nargs="+", help="Path to completed results/<run_id> directories")
+    ap.add_argument("--json-out", default="")
+    ap.add_argument("--md-out", default="")
+    args = ap.parse_args()
+
+    run_dirs = [Path(item).resolve() for item in args.run_dirs]
+    if len(run_dirs) < 2:
+        raise SystemExit("[COMPARE][ERROR] Provide at least two run directories")
+
+    runs = [load_run(run_dir) for run_dir in run_dirs]
+    payload = build_payload(runs)
+    markdown = render_markdown(payload)
+
+    print(markdown, end="")
+
+    if args.json_out:
+        json_path = Path(args.json_out)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    if args.md_out:
+        md_path = Path(args.md_out)
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(markdown)
+
+
+if __name__ == "__main__":
+    main()
