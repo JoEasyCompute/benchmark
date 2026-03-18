@@ -256,11 +256,14 @@ This writes:
 - `results/comparison_report/comparison.json`
 
 What the report includes:
-- executive summary with baseline-aware highlights
+- executive summary split into:
+  - decision view for top-line workload picks
+  - benchmark view for baseline-aware metric diagnostics
 - run overview table
 - grouped per-suite metric comparisons
 - best-run annotations per metric
 - per-GPU throughput normalization when total GPU counts differ
+- explicit "no decision-grade pick yet" messaging when a suite only has partial coverage
 
 Baseline behavior:
 - if `--baseline` is omitted, the first provided run is used
