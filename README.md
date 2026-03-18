@@ -228,6 +228,48 @@ Typical contents:
 
 It also builds repeat-level summaries grouped by benchmark configuration and status, with mean/stdev/min/max for tracked numeric metrics such as throughput and timing.
 
+## Comparing Runs
+
+Use [compare_runs.py](./compare_runs.py) to compare two or more completed run folders and generate:
+- a Markdown report
+- a machine-readable JSON payload
+
+The comparison tool reads:
+- `meta.json`
+- `effective_config.yaml`
+- `metrics_summary.json`
+
+It groups rows by suite-specific comparison keys, labels groups as `strict`, `directional`, or `partial`, and adds caveats when runs differ in GPU count, backend, or benchmark coverage.
+
+Example:
+
+```bash
+.venv/bin/python compare_runs.py \
+  --label AMD=results/20260317_081332_ezc-test-20260316_2xGPU \
+  --label RTX4090=results/20260318_143637_ezc-benchmark-17c_8x4090 \
+  --baseline RTX4090 \
+  --out-dir results/comparison_report
+```
+
+This writes:
+- `results/comparison_report/comparison.md`
+- `results/comparison_report/comparison.json`
+
+What the report includes:
+- executive summary with baseline-aware highlights
+- run overview table
+- grouped per-suite metric comparisons
+- best-run annotations per metric
+- per-GPU throughput normalization when total GPU counts differ
+
+Baseline behavior:
+- if `--baseline` is omitted, the first provided run is used
+- `--baseline` may match a label, run folder name, or full run path
+
+Label behavior:
+- use `--label NAME=PATH` when you want readable report labels
+- unlabeled run paths are still supported and fall back to `<run_id> [backend]`
+
 ## Environment Setup
 
 [env_setup.sh](./env_setup.sh) creates a local `.venv` and installs a pinned stack intended to work together:

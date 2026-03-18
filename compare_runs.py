@@ -245,6 +245,8 @@ def compute_executive_summary(payload: dict) -> dict:
     winners = {}
     suite_highlights = []
     baseline_label = payload["baseline_label"]
+    strongest_gain = None
+    strongest_loss = None
 
     for suite, suite_payload in payload["suites"].items():
         best_highlight = None
@@ -281,6 +283,10 @@ def compute_executive_summary(payload: dict) -> dict:
                 }
                 if best_highlight is None or score > abs(best_highlight["delta_vs_baseline_pct"]):
                     best_highlight = candidate
+                if delta > 0 and (strongest_gain is None or delta > strongest_gain["delta_vs_baseline_pct"]):
+                    strongest_gain = candidate
+                if delta < 0 and (strongest_loss is None or delta < strongest_loss["delta_vs_baseline_pct"]):
+                    strongest_loss = candidate
         if best_highlight:
             suite_highlights.append(best_highlight)
 
@@ -289,6 +295,8 @@ def compute_executive_summary(payload: dict) -> dict:
         "group_counts": counts,
         "winner_counts": winner_counts,
         "suite_highlights": suite_highlights,
+        "strongest_gain": strongest_gain,
+        "strongest_loss": strongest_loss,
     }
 
 
@@ -391,16 +399,34 @@ def render_markdown(payload: dict) -> str:
         lines.append(f"- Most metric wins: `{top_winner['label']}` ({top_winner['metric_wins']} metrics)")
     else:
         lines.append("- Most metric wins: n/a")
+    strongest_gain = summary.get("strongest_gain")
+    strongest_loss = summary.get("strongest_loss")
+    if strongest_gain:
+        lines.append(
+            f"- Strongest gain vs baseline: `{strongest_gain['winner']}` on "
+            f"`{strongest_gain['suite']}` / `{strongest_gain['metric']}` "
+            f"({strongest_gain['delta_vs_baseline_pct']:+.3f}%)"
+        )
+    else:
+        lines.append("- Strongest gain vs baseline: n/a")
+    if strongest_loss:
+        lines.append(
+            f"- Largest baseline lead: baseline stays ahead on "
+            f"`{strongest_loss['suite']}` / `{strongest_loss['metric']}` "
+            f"({strongest_loss['delta_vs_baseline_pct']:+.3f}%)"
+        )
+    else:
+        lines.append("- Largest baseline lead: n/a")
     if summary["suite_highlights"]:
+        lines.append("- Per-suite highlights:")
         for item in summary["suite_highlights"]:
             delta = item["delta_vs_baseline_pct"]
             delta_text = f"{delta:+.3f}%"
             lines.append(
-                f"- {item['suite']}: `{item['winner']}` is strongest on `{item['metric']}` "
-                f"vs baseline ({delta_text})"
+                f"  - {item['suite']}: `{item['winner']}` on `{item['metric']}` ({delta_text})"
             )
     else:
-        lines.append("- No strict-comparison highlights available yet.")
+        lines.append("- Per-suite highlights: n/a")
     lines.append("")
     lines.append("## Run Overview")
     lines.append("")
