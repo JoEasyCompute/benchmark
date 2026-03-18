@@ -244,18 +244,42 @@ def compute_executive_summary(payload: dict) -> dict:
     counts = {"strict": 0, "directional": 0, "partial": 0}
     winners = {}
     suite_highlights = []
+    suite_decisions = []
     baseline_label = payload["baseline_label"]
     strongest_gain = None
     strongest_loss = None
 
     for suite, suite_payload in payload["suites"].items():
         best_highlight = None
+        decision_candidate = None
+        saw_partial_only = False
         for group in suite_payload["groups"]:
             counts[group["quality"]] = counts.get(group["quality"], 0) + 1
             for metric, metric_payload in group["metrics"].items():
                 winner = metric_payload.get("winner")
                 if winner:
                     winners[winner] = winners.get(winner, 0) + 1
+                winner_row = next((row for row in metric_payload["rows"] if row["label"] == winner), None) if winner else None
+                if winner and winner_row and winner_row.get("value") is not None:
+                    decision_score = abs(winner_row["value"])
+                    candidate = {
+                        "suite": suite,
+                        "quality": group["quality"],
+                        "winner": winner,
+                        "metric": metric,
+                        "group_key_text": group["key_text"],
+                    }
+                    if group["quality"] == "partial":
+                        saw_partial_only = True
+                    else:
+                        if decision_candidate is None:
+                            decision_candidate = (candidate, metric_payload["lower_is_better"], decision_score)
+                        else:
+                            current_candidate, current_lower_is_better, current_score = decision_candidate
+                            if group["quality"] == "strict" and current_candidate["quality"] != "strict":
+                                decision_candidate = (candidate, metric_payload["lower_is_better"], decision_score)
+                            elif group["quality"] == current_candidate["quality"] and metric_payload["lower_is_better"] == current_lower_is_better and decision_score > current_score:
+                                decision_candidate = (candidate, metric_payload["lower_is_better"], decision_score)
                 if group["quality"] != "strict":
                     continue
                 if baseline_label not in group["runs_present"]:
@@ -289,11 +313,24 @@ def compute_executive_summary(payload: dict) -> dict:
                     strongest_loss = candidate
         if best_highlight:
             suite_highlights.append(best_highlight)
+        if decision_candidate:
+            suite_decisions.append(decision_candidate[0])
+        elif saw_partial_only:
+            suite_decisions.append(
+                {
+                    "suite": suite,
+                    "quality": "partial",
+                    "winner": None,
+                    "metric": None,
+                    "group_key_text": None,
+                }
+            )
 
     winner_counts = [{"label": label, "metric_wins": count} for label, count in sorted(winners.items(), key=lambda item: (-item[1], item[0]))]
     return {
         "group_counts": counts,
         "winner_counts": winner_counts,
+        "suite_decisions": suite_decisions,
         "suite_highlights": suite_highlights,
         "strongest_gain": strongest_gain,
         "strongest_loss": strongest_loss,
@@ -390,6 +427,22 @@ def render_markdown(payload: dict) -> str:
     lines.append("")
     summary = payload["executive_summary"]
     group_counts = summary["group_counts"]
+    lines.append("### Decision View")
+    lines.append("")
+    if summary["suite_decisions"]:
+        for item in summary["suite_decisions"]:
+            if item["winner"] is None:
+                lines.append(f"- No decision-grade pick for `{item['suite']}` yet (partial coverage only)")
+            else:
+                lines.append(
+                    f"- Best current pick for `{item['suite']}`: `{item['winner']}` "
+                    f"based on `{item['metric']}` ({item['quality']})"
+                )
+    else:
+        lines.append("- No decision-oriented suite picks available yet.")
+    lines.append("")
+    lines.append("### Benchmark View")
+    lines.append("")
     lines.append(
         f"- Groups: strict={group_counts.get('strict', 0)}, "
         f"directional={group_counts.get('directional', 0)}, partial={group_counts.get('partial', 0)}"
