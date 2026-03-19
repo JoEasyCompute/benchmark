@@ -1,8 +1,55 @@
 # Run Comparison And Reporting Plan
 
-Status: exploratory
+Status: in progress
 Owner: unassigned
-Last updated: 2026-03-18
+Last updated: 2026-03-19
+
+## Current Status
+
+Implemented in repo today:
+
+- `compare_runs.py` exists and is the active multi-run comparison tool
+- compares completed run folders using:
+  - `meta.json`
+  - `effective_config.yaml`
+  - `metrics_summary.json`
+- emits:
+  - `comparison.json`
+  - `comparison.md`
+- supports:
+  - positional run paths
+  - `--label NAME=PATH`
+  - `--baseline <label|run_name|path>`
+  - `--out-dir <dir>`
+  - `--json-out`
+  - `--md-out`
+  - `--suites <comma-separated>`
+- groups rows by suite-specific keys
+- labels groups as `strict`, `directional`, or `partial`
+- adds comparability notes for:
+  - differing `gpu_count`
+  - differing `gpu_backend`
+  - differing Blender render backends
+  - differing `torch` versions
+  - differing `transformers` versions
+  - differing repeat counts
+  - partial suite/group coverage
+- reports:
+  - executive summary
+  - run overview
+  - comparability summary
+  - per-suite metric tables
+  - baseline-relative deltas
+  - repeat variability from summary rows
+  - tie-aware best-run annotations
+
+Still not implemented:
+
+- raw-row comparison mode using `metrics.jsonl`
+- `--strict-comparability`
+- optional `comparison.csv`
+- charts / HTML / dashboard output
+- broader real-run validation beyond the current synthetic regression coverage
 
 ## Goal
 
@@ -119,12 +166,12 @@ Preferred comparison source should likely be:
 
 ### Machine-readable
 
-- [ ] `comparison.json`
+- [x] `comparison.json`
 - [ ] optional `comparison.csv`
 
 ### Human-readable
 
-- [ ] `comparison_report.md`
+- [x] `comparison.md`
 
 Potential later outputs:
 
@@ -148,8 +195,8 @@ Possible flags to investigate:
 - [ ] `--format markdown|json|both`
 - [ ] `--use-summary`
 - [ ] `--strict-comparability`
-- [ ] `--label NAME=PATH`
-- [ ] `--suites llm_train,llm_infer`
+- [x] `--label NAME=PATH`
+- [x] `--suites llm_train,llm_infer`
 
 ## Report Structure Idea
 
@@ -290,63 +337,63 @@ Special note:
 
 ### 2. Define run identity and labels
 
-- [ ] Decide how runs should be named in reports
-- [ ] Prefer human-friendly labels without losing the original run path
-- [ ] Decide whether labels come from CLI, metadata, or both
+- [x] Decide how runs should be named in reports
+- [x] Prefer human-friendly labels without losing the original run path
+- [x] Decide whether labels come from CLI, metadata, or both
 
 ### 3. Define comparability rules
 
-- [ ] Create per-suite comparison keys
+- [x] Create per-suite comparison keys
 - [ ] Define which mismatches are hard blockers
-- [ ] Define which mismatches become warnings only
-- [ ] Define how missing suites should be reported
+- [x] Define which mismatches become warnings only
+- [x] Define how missing suites should be reported
 
 ### 4. Define metric ranking behavior
 
-- [ ] Mark each metric as higher-is-better or lower-is-better
-- [ ] Decide how percent delta is computed
-- [ ] Decide how to report ties and near-ties
+- [x] Mark each metric as higher-is-better or lower-is-better
+- [x] Decide how percent delta is computed
+- [x] Decide how to report ties and near-ties
 - [ ] Decide how to represent skipped or failed rows
 
 ### 5. Implement reporting output
 
-- [ ] Produce Markdown first
-- [ ] Keep report easy to read in GitHub and terminal
-- [ ] Include compact tables where they help
-- [ ] Avoid hiding caveats behind raw numbers
+- [x] Produce Markdown first
+- [x] Keep report easy to read in GitHub and terminal
+- [x] Include compact tables where they help
+- [x] Avoid hiding caveats behind raw numbers
 
 ### 6. Validate with real repo data
 
 - [ ] Compare at least two real run folders from different GPUs
 - [ ] Compare repeated runs from the same GPU
-- [ ] Compare runs with intentionally mismatched configs to verify warning behavior
-- [ ] Ensure the report stays useful when optional suites are missing
+- [x] Compare runs with intentionally mismatched configs to verify warning behavior
+- [x] Ensure the report stays useful when optional suites are missing
 
 ## Suggested Delivery Phases
 
 ### Phase 1: Core comparison engine
 
-- compare two runs only
-- use existing summary artifacts
-- emit JSON plus Markdown
-- support strict like-for-like comparison
+- [x] compare two runs only
+- [x] use existing summary artifacts
+- [x] emit JSON plus Markdown
+- [x] support strict like-for-like comparison
 
 ### Phase 2: Multi-run ranking
 
-- compare 3 or more runs
-- produce ranked suite summaries
-- include percent deltas against a chosen baseline
+- [x] compare 3 or more runs
+- [x] produce ranked suite summaries
+- [x] include percent deltas against a chosen baseline
 
 ### Phase 3: Richer analysis
 
-- better repeat variability analysis
-- stronger mismatch diagnostics
+- [x] better repeat variability analysis
+- [x] stronger mismatch diagnostics
 - optional chart generation
 
 ### Phase 4: UX polish
 
 - helper scripts
-- README documentation
+- [x] README documentation
 - examples using real run folders
 
 ## Open Questions

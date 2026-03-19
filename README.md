@@ -240,6 +240,7 @@ The comparison tool reads:
 - `metrics_summary.json`
 
 It groups rows by suite-specific comparison keys, labels groups as `strict`, `directional`, or `partial`, and adds caveats when runs differ in GPU count, backend, or benchmark coverage.
+It also surfaces repeat variability from summary artifacts and now calls out caveats such as differing software versions and repeat counts.
 
 Example:
 
@@ -260,9 +261,12 @@ What the report includes:
   - decision view for top-line workload picks
   - benchmark view for baseline-aware metric diagnostics
 - run overview table
+- comparability summary table
 - grouped per-suite metric comparisons
 - best-run annotations per metric
+- tie-aware best-run reporting for near-equal results
 - per-GPU throughput normalization when total GPU counts differ
+- repeat variability using summary min/max/stdev/CV when available
 - explicit "no decision-grade pick yet" messaging when a suite only has partial coverage
 
 Baseline behavior:
@@ -272,6 +276,15 @@ Baseline behavior:
 Label behavior:
 - use `--label NAME=PATH` when you want readable report labels
 - unlabeled run paths are still supported and fall back to `<run_id> [backend]`
+
+Suite filtering:
+- use `--suites llm_train,llm_infer` to restrict the report to selected suites
+
+Current caveats the report can surface:
+- differing `gpu_count` values
+- backend or Blender render-backend differences
+- differing `torch` / `transformers` versions
+- differing repeat counts from summary rows
 
 ## Environment Setup
 

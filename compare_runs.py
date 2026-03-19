@@ -60,6 +60,7 @@ THROUGHPUT_METRICS = {
     "images_per_sec_mean",
 }
 REQUIRED_FILES = ("meta.json", "effective_config.yaml", "metrics_summary.json")
+TIE_EPSILON_PCT = 1.0
 
 
 def load_json(path: Path):
@@ -157,13 +158,29 @@ def format_key_summary(key: tuple[tuple[str, object], ...]) -> str:
     return ", ".join(f"{field}={format_value(value)}" for field, value in payload.items())
 
 
-def build_groups(runs: list[dict]) -> dict[str, dict[tuple[tuple[str, object], ...], dict[str, dict]]]:
+def parse_suite_filter(raw: str) -> set[str] | None:
+    if not raw.strip():
+        return None
+    suites = {item.strip() for item in raw.split(",") if item.strip()}
+    unknown = sorted(suites - set(SUITE_METRICS))
+    if unknown:
+        raise SystemExit(f"[COMPARE][ERROR] Unknown suites in --suites: {', '.join(unknown)}")
+    return suites
+
+
+def build_groups(runs: list[dict], allowed_suites: set[str] | None = None) -> dict[str, dict[tuple[tuple[str, object], ...], dict[str, dict]]]:
     groups = {}
     for run in runs:
         for row in run["summary_rows"]:
             suite = row.get("suite", "unknown")
             if row.get("status") != "ok":
                 continue
+            if allowed_suites is not None and suite not in allowed_suites:
+                continue
+            row = dict(row)
+            row["_run_label"] = run["label"]
+            row["_torch_version"] = run["software_versions"].get("torch")
+            row["_transformers_version"] = run["software_versions"].get("transformers")
             key = row_key(row)
             groups.setdefault(suite, {}).setdefault(key, {})[run["label"]] = row
     return groups
@@ -175,6 +192,18 @@ def metric_delta(metric: str, baseline, current):
     return ((current - baseline) / baseline) * 100.0
 
 
+def competitive_delta_pct(metric: str, winner_value, runner_up_value):
+    if not is_number(winner_value) or not is_number(runner_up_value):
+        return None
+    if metric in LOWER_IS_BETTER_METRICS:
+        if runner_up_value == 0:
+            return None
+        return ((runner_up_value - winner_value) / runner_up_value) * 100.0
+    if runner_up_value == 0:
+        return None
+    return ((winner_value - runner_up_value) / runner_up_value) * 100.0
+
+
 def metric_per_gpu(metric: str, value, gpu_count):
     if metric not in THROUGHPUT_METRICS:
         return None
@@ -183,35 +212,102 @@ def metric_per_gpu(metric: str, value, gpu_count):
     return value / gpu_count
 
 
+def metric_base_name(metric: str) -> str:
+    return metric[:-5] if metric.endswith("_mean") else metric
+
+
+def metric_variability(row: dict | None, metric: str) -> dict | None:
+    if not row:
+        return None
+    base = metric_base_name(metric)
+    minimum = row.get(f"{base}_min")
+    maximum = row.get(f"{base}_max")
+    stdev = row.get(f"{base}_stdev")
+    mean = row.get(metric)
+    summary_count = row.get("summary_count")
+    cv_pct = None
+    if is_number(mean) and mean != 0 and is_number(stdev):
+        cv_pct = abs(float(stdev) / float(mean)) * 100.0
+    if not any(is_number(value) for value in (minimum, maximum, stdev, cv_pct)):
+        return None
+    return {
+        "min": minimum,
+        "max": maximum,
+        "stdev": stdev,
+        "cv_pct": cv_pct,
+        "summary_count": summary_count,
+    }
+
+
+def format_variability(variability: dict | None) -> str:
+    if not variability:
+        return "n/a"
+    parts = []
+    minimum = variability.get("min")
+    maximum = variability.get("max")
+    stdev = variability.get("stdev")
+    cv_pct = variability.get("cv_pct")
+    summary_count = variability.get("summary_count")
+    if is_number(minimum) and is_number(maximum):
+        parts.append(f"range {format_value(minimum)}-{format_value(maximum)}")
+    if is_number(stdev):
+        parts.append(f"sd {format_value(stdev)}")
+    if is_number(cv_pct):
+        parts.append(f"cv {cv_pct:.2f}%")
+    if is_number(summary_count):
+        parts.append(f"n={int(summary_count)}")
+    return ", ".join(parts) if parts else "n/a"
+
+
 def compare_quality(suite: str, rows_present: list[dict], run_count: int) -> tuple[str, list[str]]:
     notes = []
     if len(rows_present) != run_count:
-        notes.append("Not all runs contain this comparable row.")
+        present_labels = [str(row.get("_run_label", "unknown")) for row in rows_present]
+        notes.append(f"Not all runs contain this comparable row. Present in: {', '.join(sorted(present_labels))}.")
 
     gpu_counts_present = sorted(
         {int(row["gpu_count"]) for row in rows_present if str(row.get("gpu_count", "")).isdigit()}
     )
     backends_present = sorted({str(row.get("gpu_backend")) for row in rows_present if row.get("gpu_backend")})
     blender_backends_present = sorted({str(row.get("backend")) for row in rows_present if row.get("backend")})
+    torch_versions = sorted({str(row.get("_torch_version")) for row in rows_present if row.get("_torch_version")})
+    transformers_versions = sorted(
+        {str(row.get("_transformers_version")) for row in rows_present if row.get("_transformers_version")}
+    )
+    repeat_counts = sorted(
+        {int(row["summary_count"]) for row in rows_present if str(row.get("summary_count", "")).isdigit()}
+    )
 
     if len(gpu_counts_present) > 1 and any(metric in THROUGHPUT_METRICS for metric in SUITE_METRICS.get(suite, ())):
         notes.append(
-            "Runs in this group use different gpu_count values; total throughput is not normalized. "
+            f"Runs in this group use different gpu_count values ({', '.join(map(str, gpu_counts_present))}); total throughput is not normalized. "
             "Per-GPU values are shown for throughput metrics."
         )
     if suite == "blender" and len(blender_backends_present) > 1:
         notes.append(
-            "Blender rows use different render backends across runs; timings are shown together, "
+            f"Blender rows use different render backends across runs ({', '.join(blender_backends_present)}); timings are shown together, "
             "but backend differences may affect fairness."
         )
-    elif len(backends_present) > 1:
-        notes.append("Runs in this group span different gpu_backend values.")
+    if len(backends_present) > 1:
+        notes.append(f"Runs in this group span different gpu_backend values ({', '.join(backends_present)}).")
+    if len(torch_versions) > 1:
+        notes.append(f"Runs in this group use different torch versions ({', '.join(torch_versions)}).")
+    if len(transformers_versions) > 1:
+        notes.append(f"Runs in this group use different transformers versions ({', '.join(transformers_versions)}).")
+    if len(repeat_counts) > 1:
+        notes.append(f"Runs in this group use different repeat counts ({', '.join(map(str, repeat_counts))}).")
 
     if len(rows_present) != run_count:
         quality = "partial"
     elif suite == "blender" and len(blender_backends_present) > 1:
         quality = "directional"
-    elif len(backends_present) > 1 and len(gpu_counts_present) > 1:
+    elif (
+        len(backends_present) > 1
+        or len(gpu_counts_present) > 1
+        or len(torch_versions) > 1
+        or len(transformers_versions) > 1
+        or len(repeat_counts) > 1
+    ):
         quality = "directional"
     else:
         quality = "strict"
@@ -219,12 +315,63 @@ def compare_quality(suite: str, rows_present: list[dict], run_count: int) -> tup
     return quality, notes
 
 
-def best_row(metric: str, rows: list[dict]):
+def best_rows(metric: str, rows: list[dict]):
     candidates = [row for row in rows if is_number(row.get("value"))]
     if not candidates:
+        return []
+    reverse = metric not in LOWER_IS_BETTER_METRICS
+    ranked = sorted(candidates, key=lambda row: row["value"], reverse=reverse)
+    winner = ranked[0]
+    ties = [winner]
+    for candidate in ranked[1:]:
+        gap = competitive_delta_pct(metric, winner["value"], candidate["value"])
+        if gap is None or abs(gap) <= TIE_EPSILON_PCT:
+            ties.append(candidate)
+        else:
+            break
+    return ties
+
+
+def best_row(metric: str, rows: list[dict]):
+    winners = best_rows(metric, rows)
+    return winners[0] if winners else None
+
+
+def comparability_summary(payload: dict) -> list[dict]:
+    summary = []
+    for suite, suite_payload in sorted(payload["suites"].items()):
+        groups = suite_payload["groups"]
+        qualities = [group["quality"] for group in groups]
+        if not groups:
+            summary.append({"suite": suite, "group_count": 0, "best_quality": "none", "issues": []})
+            continue
+        best_quality = "strict" if "strict" in qualities else "directional" if "directional" in qualities else "partial"
+        issues = []
+        for group in groups:
+            for note in group.get("notes", []):
+                if note not in issues:
+                    issues.append(note)
+        summary.append(
+            {
+                "suite": suite,
+                "group_count": len(groups),
+                "best_quality": best_quality,
+                "issues": issues,
+            }
+        )
+    return summary
+
+
+def metric_competitive_score(metric: str, rows: list[dict]) -> float | None:
+    candidates = [row for row in rows if is_number(row.get("value"))]
+    if len(candidates) < 2:
         return None
     reverse = metric not in LOWER_IS_BETTER_METRICS
-    return sorted(candidates, key=lambda row: row["value"], reverse=reverse)[0]
+    ranked = sorted(candidates, key=lambda row: row["value"], reverse=reverse)
+    score = competitive_delta_pct(metric, ranked[0]["value"], ranked[1]["value"])
+    if score is None:
+        return None
+    return abs(score)
 
 
 def baseline_key(run: dict) -> tuple[str, str, str]:
@@ -257,11 +404,12 @@ def compute_executive_summary(payload: dict) -> dict:
             counts[group["quality"]] = counts.get(group["quality"], 0) + 1
             for metric, metric_payload in group["metrics"].items():
                 winner = metric_payload.get("winner")
-                if winner:
+                tied_winners = metric_payload.get("tied_winners", [])
+                if len(tied_winners) == 1 and winner:
                     winners[winner] = winners.get(winner, 0) + 1
                 winner_row = next((row for row in metric_payload["rows"] if row["label"] == winner), None) if winner else None
                 if winner and winner_row and winner_row.get("value") is not None:
-                    decision_score = abs(winner_row["value"])
+                    decision_score = metric_competitive_score(metric, metric_payload["rows"])
                     candidate = {
                         "suite": suite,
                         "quality": group["quality"],
@@ -278,7 +426,12 @@ def compute_executive_summary(payload: dict) -> dict:
                             current_candidate, current_lower_is_better, current_score = decision_candidate
                             if group["quality"] == "strict" and current_candidate["quality"] != "strict":
                                 decision_candidate = (candidate, metric_payload["lower_is_better"], decision_score)
-                            elif group["quality"] == current_candidate["quality"] and metric_payload["lower_is_better"] == current_lower_is_better and decision_score > current_score:
+                            elif (
+                                group["quality"] == current_candidate["quality"]
+                                and metric_payload["lower_is_better"] == current_lower_is_better
+                                and decision_score is not None
+                                and (current_score is None or decision_score > current_score)
+                            ):
                                 decision_candidate = (candidate, metric_payload["lower_is_better"], decision_score)
                 if group["quality"] != "strict":
                     continue
@@ -289,12 +442,12 @@ def compute_executive_summary(payload: dict) -> dict:
                     continue
                 competitor_rows = [
                     row for row in metric_payload["rows"]
-                    if row["label"] != baseline_label and row.get("delta_vs_first_run_pct") is not None
+                    if row["label"] != baseline_label and row.get("delta_vs_baseline_pct") is not None
                 ]
                 if not competitor_rows:
                     continue
-                competitor = max(competitor_rows, key=lambda row: abs(row["delta_vs_first_run_pct"]))
-                delta = competitor["delta_vs_first_run_pct"]
+                competitor = max(competitor_rows, key=lambda row: abs(row["delta_vs_baseline_pct"]))
+                delta = competitor["delta_vs_baseline_pct"]
                 score = abs(delta) if delta is not None else None
                 if score is None:
                     continue
@@ -337,8 +490,8 @@ def compute_executive_summary(payload: dict) -> dict:
     }
 
 
-def build_payload(runs: list[dict], baseline: str | None = None) -> dict:
-    groups = build_groups(runs)
+def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites: set[str] | None = None) -> dict:
+    groups = build_groups(runs, allowed_suites=allowed_suites)
     baseline_label = resolve_baseline_label(runs, baseline)
     payload = {
         "run_count": len(runs),
@@ -396,23 +549,28 @@ def build_payload(runs: list[dict], baseline: str | None = None) -> dict:
                             "label": run["label"],
                             "value": value,
                             "per_gpu_value": None if per_gpu_value is None else round(per_gpu_value, 6),
-                            "delta_vs_first_run_pct": None if delta_pct is None else round(delta_pct, 3),
+                            "delta_vs_baseline_pct": None if delta_pct is None else round(delta_pct, 3),
+                            "gpu_count": gpu_count,
                             "gpu_backend": run["gpu_backend"],
                             "gpu_name": run["gpu_name"],
                             "max_gpu_count": run["max_gpu_count"],
+                            "variability": metric_variability(row, metric),
                         }
                     )
-                winner = best_row(metric, metric_rows)
+                winners = best_rows(metric, metric_rows)
+                winner = winners[0] if winners else None
                 group_payload["metrics"][metric] = {
                     "lower_is_better": metric in LOWER_IS_BETTER_METRICS,
                     "show_per_gpu": show_per_gpu,
                     "winner": None if winner is None else winner["label"],
+                    "tied_winners": [row["label"] for row in winners],
                     "rows": metric_rows,
                 }
             suite_payload["groups"].append(group_payload)
         payload["suites"][suite] = suite_payload
 
     payload["executive_summary"] = compute_executive_summary(payload)
+    payload["comparability_summary"] = comparability_summary(payload)
     return payload
 
 
@@ -491,6 +649,14 @@ def render_markdown(payload: dict) -> str:
             f"{format_value(run['max_gpu_count'])} | {format_value(run['torch'])} | {format_value(run['transformers'])} |"
         )
     lines.append("")
+    lines.append("## Comparability Summary")
+    lines.append("")
+    lines.append("| Suite | Best Quality | Groups | Issues |")
+    lines.append("| --- | --- | ---: | --- |")
+    for item in payload.get("comparability_summary", []):
+        issues_text = "; ".join(item["issues"]) if item["issues"] else "n/a"
+        lines.append(f"| {item['suite']} | {item['best_quality']} | {item['group_count']} | {issues_text} |")
+    lines.append("")
 
     for suite, suite_payload in sorted(payload["suites"].items()):
         lines.append(f"## Suite: {suite}")
@@ -514,27 +680,32 @@ def render_markdown(payload: dict) -> str:
                 direction = "lower is better" if metric_payload["lower_is_better"] else "higher is better"
                 lines.append(f"#### Metric: {metric} ({direction})")
                 lines.append("")
-                if metric_payload.get("winner"):
+                tied_winners = metric_payload.get("tied_winners", [])
+                if len(tied_winners) > 1:
+                    lines.append(f"Best run: tie between `{', '.join(tied_winners)}`")
+                    lines.append("")
+                elif metric_payload.get("winner"):
                     lines.append(f"Best run: `{metric_payload['winner']}`")
                     lines.append("")
                 if metric_payload.get("show_per_gpu"):
-                    lines.append("| Run | Value | Per-GPU Value | Delta vs First Run | GPU Count |")
-                    lines.append("| --- | ---: | ---: | ---: | ---: |")
+                    lines.append("| Run | Value | Per-GPU Value | Delta vs Baseline | GPU Count | Repeat Variability |")
+                    lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
                 else:
-                    lines.append("| Run | Value | Delta vs First Run | GPU Count |")
-                    lines.append("| --- | ---: | ---: | ---: |")
+                    lines.append("| Run | Value | Delta vs Baseline | GPU Count | Repeat Variability |")
+                    lines.append("| --- | ---: | ---: | ---: | --- |")
                 for row in metric_payload["rows"]:
-                    delta = row["delta_vs_first_run_pct"]
+                    delta = row["delta_vs_baseline_pct"]
                     delta_text = "n/a" if delta is None else f"{delta:+.3f}%"
                     value_text = "n/a" if row["value"] is None else format_value(row["value"])
+                    variability_text = format_variability(row.get("variability"))
                     if metric_payload.get("show_per_gpu"):
                         per_gpu_text = "n/a" if row["per_gpu_value"] is None else format_value(row["per_gpu_value"])
                         lines.append(
-                            f"| {row['label']} | {value_text} | {per_gpu_text} | {delta_text} | {format_value(row['max_gpu_count'])} |"
+                            f"| {row['label']} | {value_text} | {per_gpu_text} | {delta_text} | {format_value(row['gpu_count'])} | {variability_text} |"
                         )
                     else:
                         lines.append(
-                            f"| {row['label']} | {value_text} | {delta_text} | {format_value(row['max_gpu_count'])} |"
+                            f"| {row['label']} | {value_text} | {delta_text} | {format_value(row['gpu_count'])} | {variability_text} |"
                         )
                 lines.append("")
     return "\n".join(lines).rstrip() + "\n"
@@ -556,6 +727,7 @@ def main():
     ap.add_argument("run_dirs", nargs="*", help="Path to completed results/<run_id> directories")
     ap.add_argument("--label", action="append", default=[], help="Label a run as NAME=PATH")
     ap.add_argument("--baseline", default="", help="Baseline run label, run name, or run path")
+    ap.add_argument("--suites", default="", help="Comma-separated suites to include")
     ap.add_argument("--out-dir", default="", help="Directory to write comparison.json and comparison.md")
     ap.add_argument("--json-out", default="")
     ap.add_argument("--md-out", default="")
@@ -571,7 +743,8 @@ def main():
 
     runs = [load_run(run_dir, label=name) for name, run_dir in labeled_runs]
     runs.extend(load_run(run_dir) for run_dir in unlabeled_runs)
-    payload = build_payload(runs, baseline=args.baseline or None)
+    allowed_suites = parse_suite_filter(args.suites)
+    payload = build_payload(runs, baseline=args.baseline or None, allowed_suites=allowed_suites)
     markdown = render_markdown(payload)
 
     print(markdown, end="")
