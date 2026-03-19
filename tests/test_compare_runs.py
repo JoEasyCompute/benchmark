@@ -552,6 +552,132 @@ class CompareRunsTest(unittest.TestCase):
             self.assertIn("## Suite: llm_train", markdown)
             self.assertNotIn("## Suite: sd_infer", markdown)
 
+    def test_surfaces_failed_rows_and_handles_lower_is_better_gains(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            run_a = write_run(
+                tmpdir_path,
+                "run_a",
+                {
+                    "gpu_backend": "nvidia",
+                    "python": "3.10.12",
+                    "platform": "Linux",
+                    "software_versions": {"torch": "2.8.0+cu128", "transformers": "4.57.0"},
+                },
+                """
+                gpu_backend: nvidia
+                """,
+                [
+                    {
+                        "suite": "blender",
+                        "status": "ok",
+                        "scene": "classroom.blend",
+                        "mode": "single",
+                        "backend": "CUDA",
+                        "time_s_mean": 10.0,
+                        "time_s_min": 9.9,
+                        "time_s_max": 10.1,
+                        "time_s_stdev": 0.1,
+                        "summary_count": 3,
+                    },
+                    {
+                        "suite": "llm_infer",
+                        "status": "ok",
+                        "backend": "transformers",
+                        "model": "Qwen/Qwen3-8B",
+                        "dtype": "float16",
+                        "multi_gpu_mode": "replicated",
+                        "per_gpu_batch_size": 1,
+                        "tensor_parallel": 1,
+                        "requested_prompt_len": 512,
+                        "output_len": 128,
+                        "gpu_count": 8,
+                        "gen_tokens_per_s_mean": 100.0,
+                        "reqs_per_s_mean": 1.0,
+                        "summary_count": 1,
+                    },
+                ],
+            )
+            run_b = write_run(
+                tmpdir_path,
+                "run_b",
+                {
+                    "gpu_backend": "nvidia",
+                    "python": "3.10.12",
+                    "platform": "Linux",
+                    "software_versions": {"torch": "2.8.0+cu128", "transformers": "4.57.0"},
+                },
+                """
+                gpu_backend: nvidia
+                """,
+                [
+                    {
+                        "suite": "blender",
+                        "status": "ok",
+                        "scene": "classroom.blend",
+                        "mode": "single",
+                        "backend": "CUDA",
+                        "time_s_mean": 20.0,
+                        "time_s_min": 19.8,
+                        "time_s_max": 20.2,
+                        "time_s_stdev": 0.2,
+                        "summary_count": 3,
+                    },
+                    {
+                        "suite": "llm_infer",
+                        "status": "failed",
+                        "backend": "transformers",
+                        "model": "Qwen/Qwen3-8B",
+                        "dtype": "float16",
+                        "multi_gpu_mode": "replicated",
+                        "per_gpu_batch_size": 1,
+                        "tensor_parallel": 1,
+                        "requested_prompt_len": 512,
+                        "output_len": 128,
+                        "gpu_count": 8,
+                        "gen_tokens_per_s_mean": 0.0,
+                        "reqs_per_s_mean": 0.0,
+                        "summary_count": 1,
+                    },
+                ],
+            )
+
+            out_dir = tmpdir_path / "report"
+            result = subprocess.run(
+                [
+                    str(PYTHON),
+                    str(SCRIPT),
+                    "--label",
+                    f"A={run_a}",
+                    "--label",
+                    f"B={run_b}",
+                    "--baseline",
+                    "A",
+                    "--out-dir",
+                    str(out_dir),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads((out_dir / "comparison.json").read_text())
+            self.assertEqual(payload["executive_summary"]["strongest_gain"], None)
+            self.assertEqual(payload["executive_summary"]["strongest_loss"]["suite"], "blender")
+            self.assertEqual(
+                payload["executive_summary"]["strongest_loss"]["preferred_delta_vs_baseline_pct"],
+                -100.0,
+            )
+
+            infer_notes = payload["suites"]["llm_infer"]["groups"][0]["notes"]
+            self.assertIn("Run `B` has status `failed` for this comparable row.", infer_notes)
+
+            markdown = (out_dir / "comparison.md").read_text()
+            self.assertIn("Largest baseline lead: baseline stays ahead on `blender` / `time_s_mean` (+100.000%)", markdown)
+            self.assertIn("Strongest gain vs baseline: n/a", markdown)
+            self.assertIn("Run `B` has status `failed` for this comparable row.", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

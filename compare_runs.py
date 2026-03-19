@@ -168,6 +168,20 @@ def parse_suite_filter(raw: str) -> set[str] | None:
     return suites
 
 
+def build_status_index(runs: list[dict], allowed_suites: set[str] | None = None) -> dict[str, dict[tuple[tuple[str, object], ...], dict[str, dict]]]:
+    statuses = {}
+    for run in runs:
+        for row in run["summary_rows"]:
+            suite = row.get("suite", "unknown")
+            if allowed_suites is not None and suite not in allowed_suites:
+                continue
+            row = dict(row)
+            row["_run_label"] = run["label"]
+            key = row_key(row)
+            statuses.setdefault(suite, {}).setdefault(key, {})[run["label"]] = row
+    return statuses
+
+
 def build_groups(runs: list[dict], allowed_suites: set[str] | None = None) -> dict[str, dict[tuple[tuple[str, object], ...], dict[str, dict]]]:
     groups = {}
     for run in runs:
@@ -259,11 +273,19 @@ def format_variability(variability: dict | None) -> str:
     return ", ".join(parts) if parts else "n/a"
 
 
-def compare_quality(suite: str, rows_present: list[dict], run_count: int) -> tuple[str, list[str]]:
+def compare_quality(
+    suite: str,
+    rows_present: list[dict],
+    run_count: int,
+    missing_statuses: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
     notes = []
     if len(rows_present) != run_count:
         present_labels = [str(row.get("_run_label", "unknown")) for row in rows_present]
         notes.append(f"Not all runs contain this comparable row. Present in: {', '.join(sorted(present_labels))}.")
+    if missing_statuses:
+        for label, status in sorted(missing_statuses.items()):
+            notes.append(f"Run `{label}` has status `{status}` for this comparable row.")
 
     gpu_counts_present = sorted(
         {int(row["gpu_count"]) for row in rows_present if str(row.get("gpu_count", "")).isdigit()}
@@ -374,6 +396,12 @@ def metric_competitive_score(metric: str, rows: list[dict]) -> float | None:
     return abs(score)
 
 
+def delta_sign_for_preference(metric: str, delta_pct: float | None) -> float | None:
+    if delta_pct is None:
+        return None
+    return -delta_pct if metric in LOWER_IS_BETTER_METRICS else delta_pct
+
+
 def baseline_key(run: dict) -> tuple[str, str, str]:
     return run["label"], run["run_name"], run["run_dir"]
 
@@ -449,6 +477,7 @@ def compute_executive_summary(payload: dict) -> dict:
                 competitor = max(competitor_rows, key=lambda row: abs(row["delta_vs_baseline_pct"]))
                 delta = competitor["delta_vs_baseline_pct"]
                 score = abs(delta) if delta is not None else None
+                signed_delta = delta_sign_for_preference(metric, delta)
                 if score is None:
                     continue
                 candidate = {
@@ -456,13 +485,18 @@ def compute_executive_summary(payload: dict) -> dict:
                     "metric": metric,
                     "winner": competitor["label"],
                     "delta_vs_baseline_pct": round(delta, 3),
+                    "preferred_delta_vs_baseline_pct": None if signed_delta is None else round(signed_delta, 3),
                     "group_key_text": group["key_text"],
                 }
                 if best_highlight is None or score > abs(best_highlight["delta_vs_baseline_pct"]):
                     best_highlight = candidate
-                if delta > 0 and (strongest_gain is None or delta > strongest_gain["delta_vs_baseline_pct"]):
+                if signed_delta is not None and signed_delta > 0 and (
+                    strongest_gain is None or signed_delta > strongest_gain["preferred_delta_vs_baseline_pct"]
+                ):
                     strongest_gain = candidate
-                if delta < 0 and (strongest_loss is None or delta < strongest_loss["delta_vs_baseline_pct"]):
+                if signed_delta is not None and signed_delta < 0 and (
+                    strongest_loss is None or signed_delta < strongest_loss["preferred_delta_vs_baseline_pct"]
+                ):
                     strongest_loss = candidate
         if best_highlight:
             suite_highlights.append(best_highlight)
@@ -492,6 +526,7 @@ def compute_executive_summary(payload: dict) -> dict:
 
 def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites: set[str] | None = None) -> dict:
     groups = build_groups(runs, allowed_suites=allowed_suites)
+    statuses = build_status_index(runs, allowed_suites=allowed_suites)
     baseline_label = resolve_baseline_label(runs, baseline)
     payload = {
         "run_count": len(runs),
@@ -521,7 +556,13 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
             gpu_counts_present = sorted(
                 {int(row["gpu_count"]) for row in rows_present if str(row.get("gpu_count", "")).isdigit()}
             )
-            quality, notes = compare_quality(suite, rows_present, len(runs))
+            status_entries = ((statuses.get(suite) or {}).get(key) or {})
+            missing_statuses = {
+                run["label"]: status_entries[run["label"]].get("status", "unknown")
+                for run in runs
+                if run["label"] not in entries and run["label"] in status_entries
+            }
+            quality, notes = compare_quality(suite, rows_present, len(runs), missing_statuses=missing_statuses)
             group_payload = {
                 "key": key_to_dict(key),
                 "key_text": format_key_summary(key),
