@@ -402,6 +402,89 @@ def delta_sign_for_preference(metric: str, delta_pct: float | None) -> float | N
     return -delta_pct if metric in LOWER_IS_BETTER_METRICS else delta_pct
 
 
+def describe_relative_to_baseline(metric: str, delta_pct: float | None) -> str:
+    if delta_pct is None:
+        return "n/a"
+    preferred_delta = delta_sign_for_preference(metric, delta_pct)
+    magnitude = abs(delta_pct)
+    if preferred_delta is None:
+        return "n/a"
+    if preferred_delta > 0:
+        return f"better than baseline by {magnitude:.3f}%"
+    if preferred_delta < 0:
+        return f"worse than baseline by {magnitude:.3f}%"
+    return "matched baseline"
+
+
+def summarize_suite_takeaway(suite: str, suite_payload: dict, decision_item: dict | None) -> str:
+    groups = suite_payload.get("groups", [])
+    if not groups:
+        return "No successful comparable rows."
+    strict_groups = [group for group in groups if group["quality"] == "strict"]
+    directional_groups = [group for group in groups if group["quality"] == "directional"]
+    partial_groups = [group for group in groups if group["quality"] == "partial"]
+    if decision_item is None or decision_item.get("winner") is None:
+        if partial_groups and not strict_groups and not directional_groups:
+            return "No decision-grade result because coverage is only partial."
+        return "No decision-grade result yet."
+    winner = decision_item["winner"]
+    metric = decision_item["metric"]
+    quality = decision_item["quality"]
+    tied_group_count = 0
+    winner_group_count = 0
+    for group in groups:
+        metric_payload = group["metrics"].get(metric)
+        if not metric_payload:
+            continue
+        tied_winners = metric_payload.get("tied_winners", [])
+        if winner in tied_winners:
+            if len(tied_winners) > 1:
+                tied_group_count += 1
+            else:
+                winner_group_count += 1
+    confidence = f"{quality} evidence"
+    if strict_groups:
+        confidence += f", {len(strict_groups)} strict group(s)"
+    elif directional_groups:
+        confidence += f", {len(directional_groups)} directional group(s)"
+    if partial_groups:
+        confidence += f", {len(partial_groups)} partial group(s)"
+    if winner_group_count and tied_group_count:
+        return f"`{winner}` leads on `{metric}` with {confidence}; some other comparable groups are ties."
+    if tied_group_count:
+        return f"`{winner}` is still the current pick on `{metric}` with {confidence}, but comparable groups include ties."
+    return f"`{winner}` leads on `{metric}` with {confidence}."
+
+
+def collect_risk_flags(payload: dict) -> list[str]:
+    flags = []
+    for suite_item in payload.get("comparability_summary", []):
+        suite = suite_item["suite"]
+        issues = suite_item.get("issues", [])
+        if suite_item.get("best_quality") == "partial":
+            flags.append(f"{suite}: comparison coverage is only partial.")
+        for issue in issues:
+            if "status `failed`" in issue:
+                flags.append(f"{suite}: at least one run failed a comparable row.")
+            elif "different torch versions" in issue:
+                flags.append(f"{suite}: torch versions differ across runs.")
+            elif "different transformers versions" in issue:
+                flags.append(f"{suite}: transformers versions differ across runs.")
+            elif "different repeat counts" in issue:
+                flags.append(f"{suite}: repeat counts differ across runs.")
+            elif "different gpu_count values" in issue:
+                flags.append(f"{suite}: gpu_count differs across runs.")
+            elif "render backends" in issue:
+                flags.append(f"{suite}: Blender backend differs across runs.")
+            elif "different gpu_backend values" in issue:
+                flags.append(f"{suite}: gpu backend differs across runs.")
+    deduped = []
+    for flag in flags:
+        if flag not in deduped:
+            deduped.append(flag)
+    return deduped[:8]
+
+
 def baseline_key(run: dict) -> tuple[str, str, str]:
     return run["label"], run["run_name"], run["run_dir"]
 
@@ -486,6 +569,7 @@ def compute_executive_summary(payload: dict) -> dict:
                     "winner": competitor["label"],
                     "delta_vs_baseline_pct": round(delta, 3),
                     "preferred_delta_vs_baseline_pct": None if signed_delta is None else round(signed_delta, 3),
+                    "relative_to_baseline_text": describe_relative_to_baseline(metric, delta),
                     "group_key_text": group["key_text"],
                 }
                 if best_highlight is None or score > abs(best_highlight["delta_vs_baseline_pct"]):
@@ -514,11 +598,41 @@ def compute_executive_summary(payload: dict) -> dict:
             )
 
     winner_counts = [{"label": label, "metric_wins": count} for label, count in sorted(winners.items(), key=lambda item: (-item[1], item[0]))]
+    suite_confidence = []
+    suite_takeaways = []
+    decision_map = {item["suite"]: item for item in suite_decisions}
+    for suite, suite_payload in payload["suites"].items():
+        groups = suite_payload["groups"]
+        quality_counts = {"strict": 0, "directional": 0, "partial": 0}
+        for group in groups:
+            quality_counts[group["quality"]] += 1
+        best_quality = "strict" if quality_counts["strict"] else "directional" if quality_counts["directional"] else "partial"
+        has_failures = any("status `failed`" in note for group in groups for note in group.get("notes", []))
+        suite_confidence.append(
+            {
+                "suite": suite,
+                "best_quality": best_quality,
+                "group_count": len(groups),
+                "strict_groups": quality_counts["strict"],
+                "directional_groups": quality_counts["directional"],
+                "partial_groups": quality_counts["partial"],
+                "has_failures": has_failures,
+            }
+        )
+        suite_takeaways.append(
+            {
+                "suite": suite,
+                "text": summarize_suite_takeaway(suite, suite_payload, decision_map.get(suite)),
+            }
+        )
     return {
         "group_counts": counts,
         "winner_counts": winner_counts,
         "suite_decisions": suite_decisions,
+        "suite_confidence": suite_confidence,
+        "suite_takeaways": suite_takeaways,
         "suite_highlights": suite_highlights,
+        "risk_flags": collect_risk_flags(payload),
         "strongest_gain": strongest_gain,
         "strongest_loss": strongest_loss,
     }
@@ -610,8 +724,8 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
             suite_payload["groups"].append(group_payload)
         payload["suites"][suite] = suite_payload
 
-    payload["executive_summary"] = compute_executive_summary(payload)
     payload["comparability_summary"] = comparability_summary(payload)
+    payload["executive_summary"] = compute_executive_summary(payload)
     return payload
 
 
@@ -657,7 +771,7 @@ def render_markdown(payload: dict) -> str:
         lines.append(
             f"- Strongest gain vs baseline: `{strongest_gain['winner']}` on "
             f"`{strongest_gain['suite']}` / `{strongest_gain['metric']}` "
-            f"({strongest_gain['delta_vs_baseline_pct']:+.3f}%)"
+            f"({strongest_gain['relative_to_baseline_text']})"
         )
     else:
         lines.append("- Strongest gain vs baseline: n/a")
@@ -665,20 +779,48 @@ def render_markdown(payload: dict) -> str:
         lines.append(
             f"- Largest baseline lead: baseline stays ahead on "
             f"`{strongest_loss['suite']}` / `{strongest_loss['metric']}` "
-            f"({strongest_loss['delta_vs_baseline_pct']:+.3f}%)"
+            f"({strongest_loss['relative_to_baseline_text']})"
         )
     else:
         lines.append("- Largest baseline lead: n/a")
     if summary["suite_highlights"]:
         lines.append("- Per-suite highlights:")
         for item in summary["suite_highlights"]:
-            delta = item["delta_vs_baseline_pct"]
-            delta_text = f"{delta:+.3f}%"
             lines.append(
-                f"  - {item['suite']}: `{item['winner']}` on `{item['metric']}` ({delta_text})"
+                f"  - {item['suite']}: `{item['winner']}` on `{item['metric']}` "
+                f"({item['relative_to_baseline_text']})"
             )
     else:
         lines.append("- Per-suite highlights: n/a")
+    lines.append("")
+    lines.append("### Decision Confidence")
+    lines.append("")
+    for item in summary.get("suite_confidence", []):
+        flags = []
+        if item["strict_groups"]:
+            flags.append(f"strict={item['strict_groups']}")
+        if item["directional_groups"]:
+            flags.append(f"directional={item['directional_groups']}")
+        if item["partial_groups"]:
+            flags.append(f"partial={item['partial_groups']}")
+        if item["has_failures"]:
+            flags.append("failed rows present")
+        flags_text = ", ".join(flags) if flags else "no comparable groups"
+        lines.append(f"- `{item['suite']}`: best quality `{item['best_quality']}`, groups={item['group_count']}, {flags_text}")
+    lines.append("")
+    lines.append("### Suite Takeaways")
+    lines.append("")
+    for item in summary.get("suite_takeaways", []):
+        lines.append(f"- `{item['suite']}`: {item['text']}")
+    lines.append("")
+    lines.append("### Risk Flags")
+    lines.append("")
+    risk_flags = summary.get("risk_flags", [])
+    if risk_flags:
+        for flag in risk_flags:
+            lines.append(f"- {flag}")
+    else:
+        lines.append("- No major report-level risk flags.")
     lines.append("")
     lines.append("## Run Overview")
     lines.append("")

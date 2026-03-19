@@ -248,6 +248,12 @@ class CompareRunsTest(unittest.TestCase):
             self.assertIn("Strongest gain vs baseline: n/a", markdown)
             self.assertIn("Largest baseline lead: n/a", markdown)
             self.assertIn("Per-suite highlights: n/a", markdown)
+            self.assertIn("### Decision Confidence", markdown)
+            self.assertIn("### Suite Takeaways", markdown)
+            self.assertIn("### Risk Flags", markdown)
+            self.assertIn("`llm_train`: best quality `directional`, groups=1, directional=1", markdown)
+            self.assertIn("`llm_train`: `NVIDIA` leads on `tokens_per_sec_mean` with directional evidence, 1 directional group(s).", markdown)
+            self.assertIn("llm_train: torch versions differ across runs.", markdown)
             self.assertIn("## Suite: llm_train", markdown)
             self.assertIn("## Suite: llm_infer", markdown)
             self.assertIn("## Suite: blender", markdown)
@@ -669,13 +675,19 @@ class CompareRunsTest(unittest.TestCase):
                 payload["executive_summary"]["strongest_loss"]["preferred_delta_vs_baseline_pct"],
                 -100.0,
             )
+            self.assertTrue(any(item["suite"] == "llm_infer" and item["has_failures"] for item in payload["executive_summary"]["suite_confidence"]))
+            self.assertTrue(any(item["suite"] == "llm_infer" and "partial" in item["text"] for item in payload["executive_summary"]["suite_takeaways"]))
+            self.assertIn("llm_infer: at least one run failed a comparable row.", payload["executive_summary"]["risk_flags"])
 
             infer_notes = payload["suites"]["llm_infer"]["groups"][0]["notes"]
             self.assertIn("Run `B` has status `failed` for this comparable row.", infer_notes)
 
             markdown = (out_dir / "comparison.md").read_text()
-            self.assertIn("Largest baseline lead: baseline stays ahead on `blender` / `time_s_mean` (+100.000%)", markdown)
+            self.assertIn("Largest baseline lead: baseline stays ahead on `blender` / `time_s_mean` (worse than baseline by 100.000%)", markdown)
             self.assertIn("Strongest gain vs baseline: n/a", markdown)
+            self.assertIn("`llm_infer`: best quality `partial`, groups=1, partial=1, failed rows present", markdown)
+            self.assertIn("`llm_infer`: No decision-grade result because coverage is only partial.", markdown)
+            self.assertIn("llm_infer: at least one run failed a comparable row.", markdown)
             self.assertIn("Run `B` has status `failed` for this comparable row.", markdown)
 
 

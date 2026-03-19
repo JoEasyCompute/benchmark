@@ -36,12 +36,16 @@ Implemented in repo today:
   - partial suite/group coverage
 - reports:
   - executive summary
+  - executive-summary decision confidence
+  - executive-summary suite takeaways
+  - executive-summary risk flags
   - run overview
   - comparability summary
   - per-suite metric tables
-  - baseline-relative deltas
+  - baseline-relative deltas with explicit better/worse wording in summary sections
   - repeat variability from summary rows
   - tie-aware best-run annotations
+  - failed comparable-row visibility in notes/summary when a run has non-`ok` status
 
 Still not implemented:
 
@@ -50,6 +54,11 @@ Still not implemented:
 - optional `comparison.csv`
 - charts / HTML / dashboard output
 - broader real-run validation beyond the current synthetic regression coverage
+
+Recent refinement:
+
+- benchmark-view summary text now says `better than baseline by X%` / `worse than baseline by X%`
+  instead of relying on signed percentages alone
 
 ## Goal
 

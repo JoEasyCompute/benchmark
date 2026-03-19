@@ -259,7 +259,10 @@ This writes:
 What the report includes:
 - executive summary split into:
   - decision view for top-line workload picks
-  - benchmark view for baseline-aware metric diagnostics
+  - benchmark view for baseline-aware metric diagnostics with explicit "better/worse than baseline" wording
+  - decision confidence by suite
+  - suite takeaways
+  - risk flags
 - run overview table
 - comparability summary table
 - grouped per-suite metric comparisons
@@ -285,6 +288,7 @@ Current caveats the report can surface:
 - backend or Blender render-backend differences
 - differing `torch` / `transformers` versions
 - differing repeat counts from summary rows
+- explicit failed comparable rows when a run produced non-`ok` summary rows
 
 ## Environment Setup
 
