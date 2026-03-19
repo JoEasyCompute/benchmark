@@ -39,6 +39,7 @@ Implemented in repo today:
   - executive-summary decision confidence
   - executive-summary suite takeaways
   - executive-summary risk flags
+  - single-GPU summary view
   - run overview
   - comparability summary
   - per-suite metric tables
@@ -59,6 +60,8 @@ Recent refinement:
 
 - benchmark-view summary text now says `better than baseline by X%` / `worse than baseline by X%`
   instead of relying on signed percentages alone
+- report now includes a dedicated single-GPU view built from genuinely single-device comparable rows
+  (`gpu_count == 1` for benchmark suites, `mode=single` for Blender)
 
 ## Goal
 

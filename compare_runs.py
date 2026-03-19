@@ -384,6 +384,49 @@ def comparability_summary(payload: dict) -> list[dict]:
     return summary
 
 
+def is_single_gpu_group(suite: str, group: dict) -> bool:
+    if suite == "blender":
+        return group.get("key", {}).get("mode") == "single"
+    gpu_counts = {
+        int(row["gpu_count"])
+        for metric_payload in group.get("metrics", {}).values()
+        for row in metric_payload.get("rows", [])
+        if str(row.get("gpu_count", "")).isdigit() and row.get("value") is not None
+    }
+    return bool(gpu_counts) and gpu_counts == {1}
+
+
+def single_gpu_summary(payload: dict) -> list[dict]:
+    summary = []
+    for suite, suite_payload in sorted(payload["suites"].items()):
+        groups = [group for group in suite_payload.get("groups", []) if is_single_gpu_group(suite, group)]
+        if not groups:
+            continue
+        qualities = [group["quality"] for group in groups]
+        best_quality = "strict" if "strict" in qualities else "directional" if "directional" in qualities else "partial"
+        top_pick = None
+        for decision in payload.get("executive_summary", {}).get("suite_decisions", []):
+            if decision.get("suite") == suite:
+                top_pick = decision
+                break
+        issues = []
+        for group in groups:
+            for note in group.get("notes", []):
+                if note not in issues:
+                    issues.append(note)
+        summary.append(
+            {
+                "suite": suite,
+                "group_count": len(groups),
+                "best_quality": best_quality,
+                "top_pick": None if not top_pick or not top_pick.get("winner") else top_pick["winner"],
+                "metric": None if not top_pick or not top_pick.get("metric") else top_pick["metric"],
+                "issues": issues,
+            }
+        )
+    return summary
+
+
 def metric_competitive_score(metric: str, rows: list[dict]) -> float | None:
     candidates = [row for row in rows if is_number(row.get("value"))]
     if len(candidates) < 2:
@@ -726,6 +769,7 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
 
     payload["comparability_summary"] = comparability_summary(payload)
     payload["executive_summary"] = compute_executive_summary(payload)
+    payload["single_gpu_summary"] = single_gpu_summary(payload)
     return payload
 
 
@@ -831,6 +875,21 @@ def render_markdown(payload: dict) -> str:
             f"| {run['label']} | {run['gpu_backend']} | {run['gpu_name']} | "
             f"{format_value(run['max_gpu_count'])} | {format_value(run['torch'])} | {format_value(run['transformers'])} |"
         )
+    lines.append("")
+    lines.append("## Single-GPU View")
+    lines.append("")
+    single_gpu_items = payload.get("single_gpu_summary", [])
+    if single_gpu_items:
+        lines.append("| Suite | Best Quality | Groups | Top Pick | Metric | Issues |")
+        lines.append("| --- | --- | ---: | --- | --- | --- |")
+        for item in single_gpu_items:
+            issues_text = "; ".join(item["issues"]) if item["issues"] else "n/a"
+            lines.append(
+                f"| {item['suite']} | {item['best_quality']} | {item['group_count']} | "
+                f"{format_value(item['top_pick'])} | {format_value(item['metric'])} | {issues_text} |"
+            )
+    else:
+        lines.append("No single-GPU comparable groups found.")
     lines.append("")
     lines.append("## Comparability Summary")
     lines.append("")

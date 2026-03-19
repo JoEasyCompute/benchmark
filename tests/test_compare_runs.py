@@ -257,12 +257,16 @@ class CompareRunsTest(unittest.TestCase):
             self.assertIn("## Suite: llm_train", markdown)
             self.assertIn("## Suite: llm_infer", markdown)
             self.assertIn("## Suite: blender", markdown)
+            self.assertIn("## Single-GPU View", markdown)
+            self.assertIn("| llm_train | directional | 1 | NVIDIA | tokens_per_sec_mean |", markdown)
+            self.assertIn("| blender | directional | 1 | NVIDIA | time_s_mean |", markdown)
             self.assertIn("## Comparability Summary", markdown)
             self.assertIn("Delta vs Baseline", markdown)
             self.assertIn("Repeat Variability", markdown)
             self.assertNotIn("Delta vs First Run", markdown)
             self.assertIn("different torch versions", markdown)
             self.assertIn("range 19000-21000, sd 1000, cv 5.00%, n=3", markdown)
+            self.assertEqual({item["suite"] for item in payload["single_gpu_summary"]}, {"blender", "llm_train"})
 
     def test_uses_row_level_gpu_count_in_group_tables(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -263,6 +263,7 @@ What the report includes:
   - decision confidence by suite
   - suite takeaways
   - risk flags
+- single-GPU comparison view where the run data supports it
 - run overview table
 - comparability summary table
 - grouped per-suite metric comparisons
@@ -289,6 +290,11 @@ Current caveats the report can surface:
 - differing `torch` / `transformers` versions
 - differing repeat counts from summary rows
 - explicit failed comparable rows when a run produced non-`ok` summary rows
+
+Single-GPU behavior:
+- `llm_train` single-GPU rows are summarized when grouped rows use `gpu_count == 1`
+- `llm_infer` and `sd_infer` appear in the single-GPU view only when their comparable rows actually use one GPU
+- `blender` uses `mode=single` for the single-GPU view
 
 ## Environment Setup
 
