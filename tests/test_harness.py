@@ -11,6 +11,29 @@ SCRIPT = ROOT / "harness.py"
 
 
 class HarnessTest(unittest.TestCase):
+    def test_inference_repeats_combine_varying_measurements(self):
+        rows = [dict(suite="llm_infer", status="ok", batch_size=1,
+                     repeat_index=i, repeat_count=3, requests=10*i,
+                     latency_samples=i, batch_latency_ms_mean=100/i,
+                     batch_latency_ms_p50=90/i, batch_latency_ms_p95=120/i,
+                     batch_latency_per_item_proxy_ms_mean=100/i,
+                     batch_latency_per_item_proxy_ms_p50=90/i,
+                     batch_latency_per_item_proxy_ms_p95=120/i,
+                     gen_tokens_per_s=20*i) for i in (1, 2, 3)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            results = Path(tmpdir) / "results"
+            results.mkdir()
+            (results / "metrics.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows))
+            subprocess.run([str(PYTHON), str(SCRIPT)], cwd=tmpdir, check=True,
+                           capture_output=True)
+            summaries = json.loads((results / "metrics_summary.json").read_text())
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["summary_count"], 3)
+            self.assertEqual(summaries[0]["gen_tokens_per_s_mean"], 40)
+            self.assertEqual(summaries[0]["gen_tokens_per_s_stdev"], 20)
+            self.assertEqual(summaries[0]["requests_mean"], 20)
+
     def test_consolidates_metrics_and_writes_repeat_summary(self):
         rows = [
             {

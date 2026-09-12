@@ -10,6 +10,7 @@ except ModuleNotFoundError:
     raise SystemExit("[ESTIMATE][ERROR] Missing dependency: PyYAML. Run env_setup.sh or activate the project venv.")
 
 from gpu_platform import detect_backend, query_gpu_ids
+from suite_config import optional_jobs
 
 
 def visible_gpu_count():
@@ -17,7 +18,10 @@ def visible_gpu_count():
     visible = [x.strip() for x in visible_env.split(",") if x.strip()]
     if visible:
         return len(visible)
-    return len(query_gpu_ids(detect_backend("auto")))
+    try:
+        return len(query_gpu_ids(detect_backend("auto")))
+    except ValueError:
+        return 0
 
 
 def add_range(acc, low_s, likely_s, high_s):
@@ -56,6 +60,31 @@ def main():
     train_total = {k: v * repeat * len(train_world_sizes) for k, v in train_per_repeat.items()}
     sections.append({"suite": "llm_train", "world_sizes": train_world_sizes, **train_total})
     add_range(totals, train_total["min_s"], train_total["likely_s"], train_total["max_s"])
+
+    pair_selection = llm_train.get("pair_selection") or {}
+    if pair_selection.get("enabled", False) and 2 in train_world_sizes and gpu_count >= 2:
+        candidate_count = gpu_count * (gpu_count - 1) // 2
+        candidate_limit = int(pair_selection.get("candidate_limit", 0) or 0)
+        if candidate_limit > 0:
+            candidate_count = min(candidate_count, candidate_limit)
+        strategy = (pair_selection.get("strategy", "benchmark") or "benchmark").lower()
+        probe_steps = int(pair_selection.get("probe_steps", 10) or 10)
+        if strategy == "benchmark":
+            pair_total = {
+                "min_s": candidate_count * max(10.0, probe_steps * 0.8),
+                "likely_s": candidate_count * max(20.0, probe_steps * 1.5),
+                "max_s": candidate_count * max(45.0, probe_steps * 3.0),
+            }
+        else:
+            pair_total = {"min_s": 1.0, "likely_s": 3.0, "max_s": 10.0}
+        sections.append({
+            "suite": "llm_train_pair_selection",
+            "strategy": strategy,
+            "candidate_pairs": candidate_count,
+            "probe_steps": probe_steps if strategy == "benchmark" else 0,
+            **pair_total,
+        })
+        add_range(totals, pair_total["min_s"], pair_total["likely_s"], pair_total["max_s"])
 
     llm_train_real = cfg.get("llm_train_real", {})
     if llm_train_real.get("enabled", False):
@@ -121,13 +150,27 @@ def main():
                 low, likely, high = 70.0, 150.0, 300.0
             else:
                 low, likely, high = 25.0, 60.0, 150.0
-            blend_min += low * 2 * repeat
-            blend_likely += likely * 2 * repeat
-            blend_max += high * 2 * repeat
+            modes = 1 if cfg.get('benchmark_profile') == 'single_gpu_baseline' else 2
+            blend_min += low * modes * repeat
+            blend_likely += likely * modes * repeat
+            blend_max += high * modes * repeat
         sections.append({"suite": "blender", "scenes": len(scenes), "min_s": blend_min, "likely_s": blend_likely, "max_s": blend_max})
         add_range(totals, blend_min, blend_likely, blend_max)
 
+    for job in optional_jobs(cfg):
+        suite = job['suite']
+        if suite == 'llm_serve':
+            duration = float(job['args'][job['args'].index('--duration') + 1])
+            likely = duration + 30
+        else:
+            likely = 30 if suite == 'kernel_bench' else 60
+        sections.append(dict(suite=suite, min_s=likely*.5*repeat, likely_s=likely*repeat, max_s=likely*4*repeat))
+    sections = [s for s in sections if (cfg.get('llm_train') or {}).get('enabled', True)
+                or s['suite'] not in ('llm_train', 'llm_train_pair_selection')]
+    sections = [s for s in sections if (cfg.get(s['suite']) or {}).get('enabled', True)]
+    totals = {key: sum(section[key] for section in sections) for key in ('min_s', 'likely_s', 'max_s')}
     payload = {
+        'estimate_scope': 'heuristic; model downloads and serving request drains can exceed these ranges',
         "repeat": repeat,
         "visible_gpus": gpu_count,
         "sections": sections,

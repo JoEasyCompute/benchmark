@@ -9,6 +9,7 @@ preflight:
   blender_strict: false
 
 llm_train:
+  enabled: true
   dtype: bf16          # or fp16; both fine on 4090
   world_sizes: [1, 2, 4]
   hidden_size: 1024
@@ -17,14 +18,21 @@ llm_train:
   seq_len: 512
   batch_size: 4
   steps: 100
+  pair_selection:
+    enabled: true
+    strategy: benchmark   # benchmark, topology, first
+    probe_steps: 10        # short ws=2 probe per candidate pair
+    candidate_limit: 0     # 0 = try every visible two-GPU pair
 
 llm_train_real:
   enabled: false
   model: "Qwen/Qwen2.5-0.5B"
+  revision: "main"
   dtype: fp16
   seq_len: 512
   batch_size: 2
   steps: 20
+  warmup_steps: 2
 
 #llm_train:
 #  seq_len: 2048
@@ -37,6 +45,7 @@ llm_train_real:
 #  n_heads: 24
 
 llm_infer:
+  enabled: true
   backend: transformers
   model: "Qwen/Qwen3-8B"
   dtype: float16
@@ -47,12 +56,45 @@ llm_infer:
   multi_gpu_mode: "replicated"  # replicated = one worker per visible GPU
 
 sd_infer:
+  enabled: true
   model: "stable-diffusion-v1-5/stable-diffusion-v1-5"
   steps: 20
   sizes: [512, 1024]
   per_gpu_batch: 4
   multi_gpu_mode: "replicated"  # replicated = one worker per GPU
   emit_worker_rows: false
+
+vision_infer:
+  enabled: false
+  model: resnet18
+  weights: ResNet18_Weights.IMAGENET1K_V1
+  dtype: float32
+  modes: [throughput, latency]
+  iterations: 50
+  warmup: 5
+  batch_sizes: [1, 32]
+  sizes: [224]
+
+kernel_bench:
+  enabled: false
+  cases: [gemm, attention, memory]
+  size: 2048
+  iterations: 20
+  dtype: float32
+  warmup: 3
+  heads: 8
+  head_dim: 64
+
+llm_serve:
+  enabled: false
+  provider: transformers
+  endpoint: ""
+  concurrency: [1, 4]
+  dtype: float16
+  duration: 30
+  warmup: 1
+  timeout: 120
+  output_len: 32
 
 blender:
   enabled: true

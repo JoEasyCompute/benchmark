@@ -12,6 +12,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
+from benchmark_protocol import SEED, TIMING_METHOD
+from energy import EnergySampler
+
 # Enable TensorFloat32 on Ampere/Lovelace for better speed without extra memory
 if hasattr(torch.backends, "cuda"):
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,6 +82,7 @@ def main():
         cfg = yaml.safe_load(f)
     cfg = cfg["llm_train"]
 
+    torch.manual_seed(SEED)
     init_dist()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0")) if world_size > 1 else 0
@@ -130,24 +134,46 @@ def main():
         tokens_per_step *= world_size
 
     # Timed run
-    start = time.time()
-    n = 0
-    for i, (x, y) in enumerate(dl):
-        if i >= steps: break
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        optim.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = loss_fn(logits.float().view(-1, logits.size(-1)), y.view(-1))
-        loss.backward()
-        optim.step()
-        n += 1
+    if world_size > 1:
+        dist.barrier()
     torch.cuda.synchronize(device)
-    elapsed = time.time() - start
+    energy_sampler = EnergySampler(backend, device_indices=list(range(world_size))) if rank == 0 else None
+    if energy_sampler is not None:
+        energy_sampler.start()
+    if world_size > 1:
+        dist.barrier()
+    start = time.perf_counter()
+    n = 0
+    try:
+        for i, (x, y) in enumerate(dl):
+            if i >= steps: break
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            optim.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = loss_fn(logits.float().view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            optim.step()
+            n += 1
+        torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - start
+        if world_size > 1:
+            dist.barrier()
+    finally:
+        energy = energy_sampler.stop() if energy_sampler is not None else {}
+    if world_size > 1:
+        elapsed_tensor = torch.tensor(elapsed, device=device, dtype=torch.float64)
+        dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+        elapsed = elapsed_tensor.item()
 
     metric = {
         "benchmark_schema_version": 2,
         "suite": "llm_train",
+        "timing_method": TIMING_METHOD,
+        "seed": SEED,
+        "hidden_size": cfg["hidden_size"],
+        "n_layers": cfg["n_layers"],
+        "n_heads": cfg["n_heads"],
         "status": "ok",
         "dtype": cfg["dtype"],
         "seq_len": cfg["seq_len"],
@@ -165,7 +191,10 @@ def main():
         "tokens_per_sec": tokens_per_sec(tokens_per_step, elapsed / n) if n else 0.0,
         "gpu_name": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
         "time_s": elapsed,
+        **energy,
     }
+    if metric.get('energy_j'):
+        metric['tokens_per_joule'] = n * tokens_per_step / metric['energy_j']
 
     if rank == 0:
         os.makedirs("results", exist_ok=True)

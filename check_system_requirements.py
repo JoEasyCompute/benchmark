@@ -4,6 +4,7 @@ import importlib
 import json
 import platform
 import shutil
+import subprocess
 from pathlib import Path
 
 try:
@@ -14,6 +15,42 @@ except ModuleNotFoundError:
 from gpu_platform import blender_backend, detect_backend, system_tool
 REQUIRED_BINS = ("stdbuf", "tee", "hostname")
 OPTIONAL_BINS = ("lscpu", "free")
+
+
+def optional_capabilities(cfg, backend, importer=importlib.import_module):
+    checks, warnings = [], []
+    modules = set()
+    if (cfg.get('vision_infer') or {}).get('enabled'):
+        modules.update(('torch', 'torchvision'))
+    kernel = cfg.get('kernel_bench') or {}
+    if kernel.get('enabled'):
+        modules.add('torch')
+    serving = cfg.get('llm_serve') or {}
+    if serving.get('enabled'):
+        if serving.get('endpoint'):
+            checks.append({'serving': 'external streaming endpoint; server hardware/revision must be verified separately'})
+        else:
+            modules.update(('torch', 'transformers'))
+    if backend == 'nvidia':
+        modules.add('pynvml')
+    else:
+        checks.append({'power_tool': 'rocm-smi --showpower --json',
+                       'available': bool(find_binary('rocm-smi'))})
+    loaded = {}
+    for name in sorted(modules):
+        try:
+            loaded[name] = importer(name)
+            checks.append({'module': name, 'available': True})
+        except Exception as exc:
+            checks.append({'module': name, 'available': False})
+            warnings.append(f'optional capability {name} unavailable; suite/telemetry may skip ({type(exc).__name__})')
+    if kernel.get('enabled') and 'attention' in kernel.get('cases', ['gemm', 'attention', 'memory']):
+        functional = getattr(getattr(loaded.get('torch'), 'nn', None), 'functional', None)
+        available = hasattr(functional, 'scaled_dot_product_attention')
+        checks.append({'kernel_api': 'scaled_dot_product_attention', 'available': available})
+        if not available:
+            warnings.append('scaled_dot_product_attention is unavailable for the requested attention benchmark')
+    return checks, warnings
 
 
 def find_binary(name: str) -> str | None:
@@ -42,6 +79,9 @@ def main():
     backend = detect_backend(cfg.get("gpu_backend", "auto"))
 
     payload = {"status": "ok", "checks": [], "warnings": [], "errors": []}
+    checks, warnings = optional_capabilities(cfg, backend)
+    payload['checks'].extend(checks)
+    payload['warnings'].extend(warnings)
     payload["checks"].append({"platform": platform.platform()})
     payload["checks"].append({"gpu_backend": backend})
 
@@ -90,14 +130,17 @@ def main():
                 payload["warnings"].append(f"{message}; Blender benchmark will be skipped")
         payload["checks"].append({"blender_backend": blender_backend(backend)})
 
-        time_path = Path("/usr/bin/time")
-        payload["checks"].append({"binary": "/usr/bin/time", "path": str(time_path) if time_path.exists() else None})
-        if not time_path.exists():
-            message = "/usr/bin/time not found; Blender timing script will fail if Blender is enabled"
-            if blender_require_installed or blender_strict:
-                payload["errors"].append(message)
-            else:
-                payload["warnings"].append(message)
+        if blender_path:
+            try:
+                probe = subprocess.run([blender_path, '--background', '--factory-startup', '--python-expr',
+                    "import bpy; print('BENCH_CYCLES_AVAILABLE=' + str('cycles' in bpy.context.preferences.addons))"],
+                    capture_output=True, text=True, timeout=30, check=False)
+                cycles = probe.returncode == 0 and 'BENCH_CYCLES_AVAILABLE=True' in probe.stdout
+                payload['checks'].append({'blender_cycles_available': cycles})
+                if not cycles:
+                    payload['warnings'].append('Blender Cycles capability probe failed; render suite may fail')
+            except (OSError, subprocess.SubprocessError) as exc:
+                payload['warnings'].append(f'Blender capability probe unavailable: {type(exc).__name__}')
 
     if payload["errors"]:
         payload["status"] = "error"

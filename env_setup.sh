@@ -6,9 +6,17 @@
 
 set -euo pipefail
 
-VENV_DIR="${VENV_DIR:-.venv}"
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${VENV_DIR:-$BASE_DIR/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 GPU_BACKEND="${GPU_BACKEND:-auto}"
+CONFIG_ONLY=0
+if [[ "${1:-}" == "--config-only" && $# -eq 1 ]]; then
+  CONFIG_ONLY=1
+elif [[ $# -gt 0 ]]; then
+  echo "Usage: bash env_setup.sh [--config-only] (optional GPU_BACKEND=auto|nvidia|amd)" >&2
+  exit 2
+fi
 
 pick_python_bin() {
   local candidate
@@ -63,15 +71,14 @@ PY
 ensure_supported_host
 PYTHON_BIN="$(pick_python_bin)"
 ensure_supported_venv
-if [[ "$GPU_BACKEND" == "auto" ]]; then
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    GPU_BACKEND="nvidia"
-  elif command -v rocm-smi >/dev/null 2>&1; then
-    GPU_BACKEND="amd"
-  else
-    echo "[ENV][ERROR] Could not detect a supported GPU backend. Expected nvidia-smi or rocm-smi." >&2
+if [[ "$CONFIG_ONLY" != "1" ]]; then
+  GPU_BACKEND="$("$PYTHON_BIN" "$BASE_DIR/gpu_platform.py" detect-backend --backend "$GPU_BACKEND")"
+  GPU_IDS="$("$PYTHON_BIN" "$BASE_DIR/gpu_platform.py" gpu-ids --backend "$GPU_BACKEND")"
+  if [[ -z "$GPU_IDS" ]]; then
+    echo "[ENV][ERROR] No responding $GPU_BACKEND GPU found; GPU stack installation cancelled" >&2
     exit 1
   fi
+  echo "[ENV] Selected backend: $GPU_BACKEND"
 fi
 
 # Create venv if missing
@@ -80,6 +87,11 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
+
+if [[ "$CONFIG_ONLY" == "1" ]]; then
+  python -m pip install 'PyYAML>=6.0'
+  exit 0
+fi
 
 python -c 'import sys; print("Python:", sys.version)'
 
@@ -90,13 +102,26 @@ pip install --upgrade pip wheel
 pip install "setuptools<80,>=77.0.3"
 
 # Torch stack
+INSTALLED_GPU_BACKEND="$(python - <<'PY'
+try:
+    import torch
+    print('amd' if torch.version.hip else 'nvidia' if torch.version.cuda else 'cpu')
+except Exception:
+    print('missing')
+PY
+)"
 if [[ "$GPU_BACKEND" == "amd" ]]; then
-  pip install --extra-index-url https://download.pytorch.org/whl/rocm6.3 \
-    "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
+  TORCH_INDEX="https://download.pytorch.org/whl/rocm6.4"
 else
-  pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
-    "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
+  TORCH_INDEX="https://download.pytorch.org/whl/cu128"
 fi
+TORCH_INSTALL_ARGS=(--index-url "$TORCH_INDEX")
+if [[ "$INSTALLED_GPU_BACKEND" != "missing" && "$INSTALLED_GPU_BACKEND" != "$GPU_BACKEND" ]]; then
+  # An installed CUDA/CPU build can satisfy the same version pin on an AMD host.
+  TORCH_INSTALL_ARGS+=(--force-reinstall)
+fi
+pip install "${TORCH_INSTALL_ARGS[@]}" \
+  "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
 
 # Optional acceleration stack
 if [[ "$GPU_BACKEND" == "nvidia" ]]; then

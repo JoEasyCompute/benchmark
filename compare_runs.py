@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 from pathlib import Path
 
 try:
@@ -18,6 +19,8 @@ SUITE_KEY_FIELDS = {
         "n_layers",
         "n_heads",
         "world_size",
+        "seed",
+        "timing_method",
     ),
     "llm_infer": (
         "backend",
@@ -27,10 +30,25 @@ SUITE_KEY_FIELDS = {
         "per_gpu_batch_size",
         "tensor_parallel",
         "requested_prompt_len",
+        "prompt_len",
         "output_len",
+        "model_revision",
+        "tokenizer_revision",
+        "prompt_sha256",
+        "generation_mode",
+        "seed",
+        "timing_method",
     ),
     "sd_infer": (
         "model",
+        "model_revision",
+        "prompt_sha256",
+        "negative_prompt_sha256",
+        "scheduler_name",
+        "guidance_scale",
+        "xformers_enabled",
+        "seed",
+        "timing_method",
         "steps",
         "width",
         "height",
@@ -40,24 +58,43 @@ SUITE_KEY_FIELDS = {
     ),
     "blender": (
         "scene",
+        "scene_sha256",
+        "timing_method",
         "mode",
     ),
+    "vision_infer": ("model", "weights", "weights_sha256", "model_revision", "torchvision_version",
+                     "preprocessing_sha256", "input_sha256", "input_size", "dtype", "mode",
+                     "batch_size", "seed", "timing_method"),
+    "kernel_bench": ("case", "size", "dtype", "heads", "head_dim", "work_convention", "seed", "timing_method"),
+    "llm_serve": ("provider", "model", "model_revision", "tokenizer_revision", "dtype", "concurrency",
+                  "prompt_sha256", "prompt_len", "output_len", "generation_protocol",
+                  "scheduling_protocol", "seed", "timing_method"),
+    "llm_train_real": ("model", "model_revision", "dtype", "seq_len", "batch_size", "world_size",
+                       "objective", "data_protocol", "optimizer", "learning_rate", "weight_decay",
+                       "adam_epsilon", "adam_betas", "allow_tf32", "seed", "timing_method"),
 }
+SUITE_KEY_FIELDS['blender'] += ('blender_version', 'render_settings_sha256')
 
 SUITE_METRICS = {
     "llm_train": ("tokens_per_sec_mean", "steps_per_sec_mean"),
     "llm_infer": ("gen_tokens_per_s_mean", "reqs_per_s_mean"),
     "sd_infer": ("images_per_sec_mean",),
     "blender": ("time_s_mean",),
+    "vision_infer": ("images_per_sec_mean",),
+    "kernel_bench": ("throughput_mean",),
+    "llm_serve": ("generated_tokens_per_s_mean", "reqs_per_s_mean", "ttft_ms_mean_mean", "latency_ms_p95_mean"),
+    "llm_train_real": ("tokens_per_sec_mean", "steps_per_sec_mean"),
 }
+SUITE_CATEGORIES = {'kernel_bench': 'Kernel diagnostics', 'llm_serve': 'Serving and latency'}
 
-LOWER_IS_BETTER_METRICS = {"time_s_mean"}
+LOWER_IS_BETTER_METRICS = {"time_s_mean", "ttft_ms_mean_mean", "latency_ms_p95_mean"}
 THROUGHPUT_METRICS = {
     "tokens_per_sec_mean",
     "steps_per_sec_mean",
     "gen_tokens_per_s_mean",
     "reqs_per_s_mean",
     "images_per_sec_mean",
+    "generated_tokens_per_s_mean", "throughput_mean",
 }
 REQUIRED_FILES = ("meta.json", "effective_config.yaml", "metrics_summary.json")
 TIE_EPSILON_PCT = 1.0
@@ -72,7 +109,7 @@ def load_yaml(path: Path):
 
 
 def is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def default_label(run_dir: Path, meta: dict) -> str:
@@ -132,9 +169,18 @@ def suite_key_fields(suite: str) -> tuple[str, ...]:
 
 
 def row_key(row: dict) -> tuple[tuple[str, object], ...]:
+    row = dict(row)
     suite = row.get("suite", "unknown")
+    if suite == "sd_infer":
+        if "hw" in row:
+            width, height = str(row["hw"]).split("x")
+            row.setdefault("width", int(width))
+            row.setdefault("height", int(height))
+        if "per_gpu_batch_size" in row:
+            row.setdefault("per_gpu_batch", row["per_gpu_batch_size"])
     fields = suite_key_fields(suite)
-    return tuple((field, row.get(field)) for field in fields if field in row)
+    return tuple((field, json.dumps(row[field], sort_keys=True) if isinstance(row[field], (list, dict))
+                  else row[field]) for field in fields if field in row)
 
 
 def key_to_dict(key: tuple[tuple[str, object], ...]) -> dict:
@@ -196,7 +242,14 @@ def build_groups(runs: list[dict], allowed_suites: set[str] | None = None) -> di
             row["_torch_version"] = run["software_versions"].get("torch")
             row["_transformers_version"] = run["software_versions"].get("transformers")
             key = row_key(row)
-            groups.setdefault(suite, {}).setdefault(key, {})[run["label"]] = row
+            entries = groups.setdefault(suite, {}).setdefault(key, {})
+            if run["label"] in entries:
+                raise SystemExit(
+                    f"[COMPARE][ERROR] Duplicate {suite} workload rows in {run['label']}: "
+                    f"{format_key_summary(key)}. Regenerate summaries from raw metrics "
+                    "with the current harness; check workload identity if duplicates remain."
+                )
+            entries[run["label"]] = row
     return groups
 
 
@@ -319,12 +372,27 @@ def compare_quality(
     if len(repeat_counts) > 1:
         notes.append(f"Runs in this group use different repeat counts ({', '.join(map(str, repeat_counts))}).")
 
+    missing_identity = sorted({
+        field for row in rows_present
+        for field in suite_key_fields(suite)
+        if dict(row_key(row)).get(field) in (None, "")
+    })
+    if any(not isinstance(row.get('gpu_count'), int) or row.get('gpu_count', 0) <= 0
+           for row in rows_present) and not (suite == 'blender' and all(row.get('mode') == 'single' for row in rows_present)):
+        missing_identity.append('gpu_count')
+    if missing_identity:
+        notes.append(
+            "Missing workload identity: " + ", ".join(missing_identity)
+            + ". Legacy or unresolved settings support directional comparisons only."
+        )
+
     if len(rows_present) != run_count:
         quality = "partial"
     elif suite == "blender" and len(blender_backends_present) > 1:
         quality = "directional"
     elif (
-        len(backends_present) > 1
+        missing_identity
+        or len(backends_present) > 1
         or len(gpu_counts_present) > 1
         or len(torch_versions) > 1
         or len(transformers_versions) > 1
@@ -405,7 +473,8 @@ def single_gpu_summary(payload: dict) -> list[dict]:
         qualities = [group["quality"] for group in groups]
         best_quality = "strict" if "strict" in qualities else "directional" if "directional" in qualities else "partial"
         top_pick = None
-        for decision in payload.get("executive_summary", {}).get("suite_decisions", []):
+        scoped = {**payload, 'suites': {suite: {**suite_payload, 'groups': groups}}}
+        for decision in compute_executive_summary(scoped).get('suite_decisions', []):
             if decision.get("suite") == suite:
                 top_pick = decision
                 break
@@ -501,6 +570,12 @@ def summarize_suite_takeaway(suite: str, suite_payload: dict, decision_item: dic
 
 def collect_risk_flags(payload: dict) -> list[str]:
     flags = []
+    for suite, data in payload['suites'].items():
+        statuses = {status for values in data.get('statuses', {}).values() for status in values}
+        if 'failed' in statuses:
+            flags.append(f'{suite}: failed rows are present in the run artifacts.')
+        if 'skipped' in statuses:
+            flags.append(f'{suite}: skipped rows are present; coverage is incomplete.')
     for suite_item in payload.get("comparability_summary", []):
         suite = suite_item["suite"]
         issues = suite_item.get("issues", [])
@@ -556,6 +631,8 @@ def compute_executive_summary(payload: dict) -> dict:
         saw_partial_only = False
         for group in suite_payload["groups"]:
             counts[group["quality"]] = counts.get(group["quality"], 0) + 1
+            if suite == 'kernel_bench':
+                continue
             for metric, metric_payload in group["metrics"].items():
                 winner = metric_payload.get("winner")
                 tied_winners = metric_payload.get("tied_winners", [])
@@ -650,7 +727,8 @@ def compute_executive_summary(payload: dict) -> dict:
         for group in groups:
             quality_counts[group["quality"]] += 1
         best_quality = "strict" if quality_counts["strict"] else "directional" if quality_counts["directional"] else "partial"
-        has_failures = any("status `failed`" in note for group in groups for note in group.get("notes", []))
+        has_failures = (any('failed' in values for values in suite_payload.get('statuses', {}).values())
+                        or any("status `failed`" in note for group in groups for note in group.get("notes", [])))
         suite_confidence.append(
             {
                 "suite": suite,
@@ -684,6 +762,8 @@ def compute_executive_summary(payload: dict) -> dict:
 def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites: set[str] | None = None) -> dict:
     groups = build_groups(runs, allowed_suites=allowed_suites)
     statuses = build_status_index(runs, allowed_suites=allowed_suites)
+    for suite in statuses:
+        groups.setdefault(suite, {})
     baseline_label = resolve_baseline_label(runs, baseline)
     payload = {
         "run_count": len(runs),
@@ -707,7 +787,9 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
         )
 
     for suite, suite_groups in sorted(groups.items()):
-        suite_payload = {"groups": []}
+        suite_payload = {"groups": [], 'category': SUITE_CATEGORIES.get(suite, 'Application benchmarks'),
+                         'statuses': {run['label']: sorted({r.get('status', 'unknown') for r in run['summary_rows']
+                                                          if r.get('suite') == suite}) for run in runs}}
         for key, entries in sorted(suite_groups.items(), key=lambda item: format_key_summary(item[0])):
             rows_present = list(entries.values())
             gpu_counts_present = sorted(
@@ -739,6 +821,8 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
                 for run in runs:
                     row = entries.get(run["label"])
                     value = row.get(metric) if row else None
+                    if not is_number(value):
+                        value = None
                     gpu_count = row.get("gpu_count") if row else None
                     per_gpu_value = metric_per_gpu(metric, value, gpu_count)
                     delta_pct = metric_delta(metric, baseline_value, value) if baseline_value is not None else None
@@ -770,6 +854,27 @@ def build_payload(runs: list[dict], baseline: str | None = None, allowed_suites:
     payload["comparability_summary"] = comparability_summary(payload)
     payload["executive_summary"] = compute_executive_summary(payload)
     payload["single_gpu_summary"] = single_gpu_summary(payload)
+    payload['energy_summary'] = []
+    for run in runs:
+        for row in run['summary_rows']:
+            if row.get('status') != 'ok' or (allowed_suites is not None and row.get('suite') not in allowed_suites):
+                continue
+            complete = (row.get('power_sampler_available') is True
+                        and row.get('energy_method') == 'board_power_trapezoid_v1'
+                        and row.get('energy_j_count', 0) == row.get('summary_count', -1))
+            joules = row.get('energy_j_mean') if complete else None
+            unit, efficiency = None, None
+            if complete:
+                for field, label in (('tokens_per_joule_mean', 'tokens/J'),
+                                     ('gen_tokens_per_watt_mean', 'tokens/J'),
+                                     ('images_per_joule_mean', 'images/J')):
+                    if is_number(row.get(field)):
+                        unit, efficiency = label, row[field]
+                        break
+            payload['energy_summary'].append(dict(run=run['label'], suite=row.get('suite'),
+                workload=format_key_summary(row_key(row)), energy_j_mean=joules,
+                efficiency=efficiency, efficiency_unit=unit,
+                status='measured' if is_number(joules) else 'unavailable/incomplete'))
     return payload
 
 
@@ -900,11 +1005,24 @@ def render_markdown(payload: dict) -> str:
         lines.append(f"| {item['suite']} | {item['best_quality']} | {item['group_count']} | {issues_text} |")
     lines.append("")
 
+    lines.extend(['## Energy measurements', '',
+                  'Board energy per measured run; excludes unverified or incomplete telemetry. No energy winner is inferred.', '',
+                  '| Run | Suite | Workload | Mean joules | Efficiency | Status |',
+                  '| --- | --- | --- | ---: | --- | --- |'])
+    for item in payload.get('energy_summary', []):
+        efficiency = 'n/a' if item['efficiency'] is None else f"{format_value(item['efficiency'])} {item['efficiency_unit']}"
+        lines.append(f"| {item['run']} | {item['suite']} | {item['workload']} | {format_value(item['energy_j_mean'])} | {efficiency} | {item['status']} |")
+    lines.append('')
+
     for suite, suite_payload in sorted(payload["suites"].items()):
         lines.append(f"## Suite: {suite}")
         lines.append("")
+        lines.append(f"Category: {suite_payload.get('category', 'Application benchmarks')}")
+        lines.append("")
         if not suite_payload["groups"]:
             lines.append("No successful comparable rows found.")
+            lines.append('Statuses: ' + '; '.join(f"{label}: {', '.join(values)}"
+                                                for label, values in suite_payload.get('statuses', {}).items()))
             lines.append("")
             continue
 

@@ -6,12 +6,13 @@ import os
 import shutil
 import statistics
 import subprocess
-import threading
 import time
 import traceback
 from typing import List
 
 import yaml
+from energy import EnergySampler
+from benchmark_protocol import SEED, resolve_revision, text_hash
 
 try:
     from transformers import AutoTokenizer
@@ -65,83 +66,6 @@ def make_prompt(tokenizer, target_tokens: int) -> tuple[str, int]:
             lo = mid + 1
 
     return best, best_count
-
-# ---------- NVML power sampler ----------
-class PowerSampler:
-    def __init__(self, gpu_limit: int, interval_s: float = 0.5):
-        self.interval = interval_s
-        self.gpu_limit = max(1, int(gpu_limit))
-        self.samples = []  # watts (total across visible GPUs)
-        self._stop = threading.Event()
-        self._thr = None
-        self._ok = False
-        self.backend = detect_backend()
-        try:
-            if self.backend == "nvidia":
-                import pynvml as N
-                self.N = N
-                N.nvmlInit()
-                self.handles = self._resolve_handles()
-                self._ok = True
-        except Exception:
-            self._ok = False
-
-    def _resolve_handles(self):
-        visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        visible = [x.strip() for x in visible_env.split(",") if x.strip()]
-        selected = visible[: self.gpu_limit] if visible else []
-        handles = []
-
-        if selected:
-            for item in selected:
-                try:
-                    if item.isdigit():
-                        handles.append(self.N.nvmlDeviceGetHandleByIndex(int(item)))
-                    else:
-                        handles.append(self.N.nvmlDeviceGetHandleByUUID(item.encode()))
-                except Exception:
-                    continue
-            if handles:
-                return handles
-
-        count = self.N.nvmlDeviceGetCount()
-        for i in range(min(self.gpu_limit, count)):
-            handles.append(self.N.nvmlDeviceGetHandleByIndex(i))
-        return handles
-
-    def _tick(self):
-        while not self._stop.is_set():
-            total_w = 0.0
-            if self._ok and self.backend == "nvidia":
-                for h in self.handles:
-                    try:
-                        # powerUsage is in milliwatts
-                        mw = self.N.nvmlDeviceGetPowerUsage(h)
-                        total_w += (mw or 0.0) / 1000.0
-                    except Exception:
-                        pass
-            self.samples.append(total_w if total_w > 0 else 0.0)
-            time.sleep(self.interval)
-
-    def start(self):
-        self._thr = threading.Thread(target=self._tick, daemon=True)
-        self._thr.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thr:
-            self._thr.join()
-        if self._ok:
-            try:
-                self.N.nvmlShutdown()
-            except Exception:
-                pass
-
-    def mean_watts(self) -> float:
-        return sum(self.samples)/len(self.samples) if self.samples else 0.0
-
-    def available(self) -> bool:
-        return self._ok and bool(getattr(self, "handles", []))
 
 def detect_gpu_name() -> str:
     try:
@@ -250,12 +174,15 @@ def write_skip_row(cfg, reason: str, detail: str):
 
 
 def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
-              out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float):
+              out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float, revision=None):
     llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=8192, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
-        tensor_parallel_size=tp, gpu_memory_utilization=gpu_mem_util, trust_remote_code=True, disable_log_stats=True)
+        tensor_parallel_size=tp, gpu_memory_utilization=gpu_mem_util, trust_remote_code=True, disable_log_stats=True,
+        revision=revision, tokenizer_revision=revision, seed=SEED)
     sp = SamplingParams(
         temperature=0.0,
         max_tokens=out_len,
+        min_tokens=out_len,
+        ignore_eos=True,
         top_p=1.0,
         repetition_penalty=1.0,
     )
@@ -267,30 +194,45 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         _ = llm.generate(prompts, sp)
 
     # Timed loop + power sampling
-    ps = PowerSampler(gpu_limit=tp, interval_s=0.5); ps.start()
+    ps = EnergySampler(detect_backend(), device_indices=list(range(tp)))
+    ps.start()
     gen_tokens = 0
     reqs = 0
     batch_latencies_ms = []
-    t0 = time.time()
+    t0 = time.perf_counter()
     t_end = t0 + duration_s
-    while time.time() < t_end:
-        t_batch = time.perf_counter()
-        outputs = llm.generate(prompts, sp)
-        batch_latencies_ms.append((time.perf_counter() - t_batch) * 1000.0)
-        reqs += len(outputs)
-        for out in outputs:
-            gen_tokens += len(out.outputs[0].token_ids)
-    elapsed = time.time() - t0
-    ps.stop()
+    try:
+        while time.perf_counter() < t_end:
+            t_batch = time.perf_counter()
+            outputs = llm.generate(prompts, sp)
+            batch_latencies_ms.append((time.perf_counter() - t_batch) * 1000.0)
+            reqs += len(outputs)
+            for out in outputs:
+                if len(out.outputs[0].token_ids) != out_len:
+                    raise ValueError('vLLM returned an unexpected output token count')
+                gen_tokens += len(out.outputs[0].token_ids)
+        finished = time.perf_counter()
+        elapsed = finished - t0
+    finally:
+        energy = ps.stop(started_s=t0, ended_s=time.perf_counter())
 
     gpu_name = detect_gpu_name()
-    mean_w = ps.mean_watts()
     batch_latency_mean = round(statistics.fmean(batch_latencies_ms), 3) if batch_latencies_ms else 0.0
     batch_latency_p50 = round(percentile(batch_latencies_ms, 0.50), 3)
     batch_latency_p95 = round(percentile(batch_latencies_ms, 0.95), 3)
     row = {
         "benchmark_schema_version": 2,
         "suite": "llm_infer",
+        "backend": "vllm",
+        "model_revision": revision,
+        "tokenizer_revision": revision,
+        "prompt_sha256": text_hash(prompt),
+        "seed": SEED,
+        "generation_mode": "greedy_fixed_length",
+        "timing_method": "vllm_blocking_generate_v1",
+        "multi_gpu_mode": "tensor_parallel" if tp > 1 else "single",
+        "gpu_count": tp,
+        "per_gpu_batch_size": bs,
         "status": "ok",
         "gpu_backend": detect_backend(),
         "model": model,
@@ -313,9 +255,8 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         "batch_latency_per_item_proxy_ms_p50": round(batch_latency_p50 / bs, 3) if bs > 0 else 0.0,
         "batch_latency_per_item_proxy_ms_p95": round(batch_latency_p95 / bs, 3) if bs > 0 else 0.0,
         "latency_samples": len(batch_latencies_ms),
-        "power_sampler_available": ps.available(),
-        "mean_power_w": round(mean_w, 2),
-        "gen_tokens_per_watt": (gen_tokens / elapsed / mean_w) if mean_w > 1e-6 else 0.0,
+        **energy,
+        "gen_tokens_per_watt": gen_tokens / energy['energy_j'] if energy.get('energy_j') else None,
         "gpu_name": gpu_name,
         "time_s": elapsed,
     }
@@ -349,17 +290,20 @@ def main():
     out_len = int(cfg.get("output_len", 128))
     batch_sizes: List[int] = list(map(int, cfg.get("batch_sizes", [1,4,16,64])))
     tp_sizes: List[int] = list(map(int, cfg.get("tensor_parallel_sizes", [1])))
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    revision = resolve_revision(model, cfg.get('revision'))
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, revision=revision)
     prompt, actual_prompt_tokens = make_prompt(tokenizer, prompt_len)
 
+    failures = 0
     for tp in tp_sizes:
         for bs in batch_sizes:
             try:
                 row = run_combo(model, dtype, tp, bs, prompt, actual_prompt_tokens, prompt_len, out_len,
-                                args.warmup, args.duration, args.gpu_mem)
+                                args.warmup, args.duration, args.gpu_mem, revision=revision)
                 write_metric(row)
                 print(json.dumps(row, indent=2))
             except Exception as e:
+                failures += 1
                 row = {
                     "benchmark_schema_version": 2,
                     "suite": "llm_infer",
@@ -382,6 +326,8 @@ def main():
                 }
                 write_metric(row)
                 print(f"[ERROR] TP={tp} BS={bs}: {e}")
+    if failures:
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

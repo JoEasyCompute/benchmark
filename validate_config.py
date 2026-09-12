@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+from suite_config import validate_optional_suites
 
 try:
     import yaml
@@ -31,15 +32,20 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f) or {}
 
-    errors = []
+    if not isinstance(cfg, dict):
+        raise SystemExit('[CONFIG][ERROR] root must be a mapping')
+    errors = validate_optional_suites(cfg)
     expect_keys(
         "root",
         cfg,
-        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "smoke_mode"},
+        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "vision_infer", "kernel_bench", "llm_serve", "smoke_mode", "benchmark_profile"},
         errors,
     )
     if cfg.get("gpu_backend", "auto") not in {"auto", "nvidia", "amd"}:
         errors.append("gpu_backend must be one of auto, nvidia, amd")
+
+    if cfg.get("benchmark_profile", "general") not in {"general", "single_gpu_baseline"}:
+        errors.append("benchmark_profile must be general or single_gpu_baseline")
 
     if not is_pos_int(cfg.get("repeat", 1)):
         errors.append("repeat must be a positive integer")
@@ -71,7 +77,7 @@ def main():
         expect_keys(
             "llm_train",
             llm_train,
-            {"dtype", "world_sizes", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"},
+            {"enabled", "dtype", "world_sizes", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps", "pair_selection"},
             errors,
         )
         if llm_train.get("dtype") not in {"bf16", "fp16", "fp32"}:
@@ -82,6 +88,26 @@ def main():
         for key in ("hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"):
             if not is_pos_int(llm_train.get(key)):
                 errors.append(f"llm_train.{key} must be a positive integer")
+        pair_selection = llm_train.get("pair_selection", {})
+        if pair_selection is not None:
+            if not isinstance(pair_selection, dict):
+                errors.append("llm_train.pair_selection must be a mapping if provided")
+            else:
+                expect_keys(
+                    "llm_train.pair_selection",
+                    pair_selection,
+                    {"enabled", "strategy", "probe_steps", "candidate_limit"},
+                    errors,
+                )
+                if "enabled" in pair_selection and not isinstance(pair_selection["enabled"], bool):
+                    errors.append("llm_train.pair_selection.enabled must be true or false")
+                if pair_selection.get("strategy", "benchmark") not in {"benchmark", "topology", "first"}:
+                    errors.append("llm_train.pair_selection.strategy must be one of benchmark, topology, first")
+                if "probe_steps" in pair_selection and not is_pos_int(pair_selection["probe_steps"]):
+                    errors.append("llm_train.pair_selection.probe_steps must be a positive integer")
+                if "candidate_limit" in pair_selection and not is_nonneg_int(pair_selection["candidate_limit"]):
+                    errors.append("llm_train.pair_selection.candidate_limit must be a non-negative integer")
+
         if is_pos_int(llm_train.get("hidden_size")) and is_pos_int(llm_train.get("n_heads")):
             if llm_train["hidden_size"] % llm_train["n_heads"] != 0:
                 errors.append("llm_train.hidden_size must be divisible by llm_train.n_heads")
@@ -94,7 +120,7 @@ def main():
             expect_keys(
                 "llm_train_real",
                 llm_train_real,
-                {"enabled", "model", "dtype", "seq_len", "batch_size", "steps"},
+                {"enabled", "model", "revision", "dtype", "seq_len", "batch_size", "steps", "warmup_steps"},
                 errors,
             )
             if "enabled" in llm_train_real and not isinstance(llm_train_real["enabled"], bool):
@@ -107,6 +133,10 @@ def main():
                 for key in ("seq_len", "batch_size", "steps"):
                     if not is_pos_int(llm_train_real.get(key)):
                         errors.append(f"llm_train_real.{key} must be a positive integer when enabled")
+                if is_pos_int(llm_train_real.get('seq_len')) and llm_train_real['seq_len'] < 2:
+                    errors.append('llm_train_real.seq_len must be at least 2')
+                if not is_nonneg_int(llm_train_real.get('warmup_steps', 2)):
+                    errors.append('llm_train_real.warmup_steps must be a non-negative integer')
 
     llm_infer = cfg.get("llm_infer")
     if not isinstance(llm_infer, dict):
@@ -115,7 +145,7 @@ def main():
         expect_keys(
             "llm_infer",
             llm_infer,
-            {"backend", "model", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes", "multi_gpu_mode"},
+            {"enabled", "backend", "model", "revision", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes", "multi_gpu_mode"},
             errors,
         )
         if llm_infer.get("backend", "transformers") not in {"transformers", "vllm"}:
@@ -141,7 +171,7 @@ def main():
         expect_keys(
             "sd_infer",
             sd_infer,
-            {"model", "steps", "sizes", "per_gpu_batch", "multi_gpu_mode", "emit_worker_rows"},
+            {"enabled", "model", "revision", "steps", "sizes", "per_gpu_batch", "multi_gpu_mode", "emit_worker_rows"},
             errors,
         )
         if not isinstance(sd_infer.get("model"), str) or not sd_infer["model"].strip():
@@ -157,6 +187,15 @@ def main():
             errors.append("sd_infer.multi_gpu_mode must be 'single' or 'replicated'")
         if "emit_worker_rows" in sd_infer and not isinstance(sd_infer["emit_worker_rows"], bool):
             errors.append("sd_infer.emit_worker_rows must be true or false")
+
+    for section in ("llm_train", "llm_infer", "sd_infer", "llm_train_real"):
+        values = cfg.get(section)
+        if isinstance(values, dict) and 'enabled' in values and not isinstance(values['enabled'], bool):
+            errors.append(f'{section}.enabled must be boolean')
+        if isinstance(values, dict) and "revision" in values:
+            revision = values["revision"]
+            if not isinstance(revision, str) or not revision.strip():
+                errors.append(f"{section}.revision must be a non-empty string")
 
     blender = cfg.get("blender", {})
     if not isinstance(blender, dict):

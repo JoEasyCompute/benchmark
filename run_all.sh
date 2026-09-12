@@ -10,6 +10,11 @@ BASE_CONFIG_PATH="$BASE_DIR/config.yaml"
 CONFIG_UTILS="$BASE_DIR/config_utils.py"
 GPU_PLATFORM="$BASE_DIR/gpu_platform.py"
 SMOKE_MODE=0
+BASELINE_MODE=0
+BACKEND_OVERRIDE=""
+GPU_OVERRIDE=""
+GPU_OVERRIDE_SET=0
+DRY_RUN=0
 
 # Include common user-local bin directories so host-level tools installed by
 # helper scripts are discoverable even in non-login shells.
@@ -17,6 +22,41 @@ export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --help|-h)
+      cat <<'HELP'
+Usage: bash run_all.sh [--config PATH] [--backend auto|nvidia|amd]
+                      [--gpus 0,1] [--baseline] [--smoke] [--dry-run]
+
+Defaults to config.yaml and automatic backend selection when gpu_backend is auto.
+--config PATH  Read a sample/custom config without copying it over config.yaml.
+--backend NAME Override the config backend (required to disambiguate mixed hosts).
+--gpus IDS     Select physical GPU indices within any inherited visibility mask.
+--baseline     Use one detected/selected GPU and five repeats.
+--smoke        Reduce enabled workloads and use one repeat.
+--dry-run      Print resolved config; do not install the GPU stack or run workloads.
+HELP
+      exit 0
+      ;;
+    --config|--backend|--gpus)
+      if [[ $# -lt 2 || "$2" == --* || -z "$2" ]]; then
+        echo "[ERROR] $1 requires a value" >&2
+        exit 2
+      fi
+      case "$1" in
+        --config) BASE_CONFIG_PATH="$2" ;;
+        --backend) BACKEND_OVERRIDE="$2" ;;
+        --gpus) GPU_OVERRIDE="$2"; GPU_OVERRIDE_SET=1 ;;
+      esac
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --baseline)
+      BASELINE_MODE=1
+      shift
+      ;;
     --smoke)
       SMOKE_MODE=1
       shift
@@ -28,49 +68,88 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$BACKEND_OVERRIDE" in
+  ""|auto|nvidia|amd) ;;
+  *) echo "[ERROR] --backend must be auto, nvidia, or amd" >&2; exit 2 ;;
+esac
+if [[ ! -f "$BASE_CONFIG_PATH" ]]; then
+  echo "[ERROR] Config file not found: $BASE_CONFIG_PATH" >&2
+  exit 2
+fi
+BASE_CONFIG_PATH="$(cd -- "$(dirname -- "$BASE_CONFIG_PATH")" && pwd)/$(basename -- "$BASE_CONFIG_PATH")"
+
+python_env_ready() {
+  local py_bin="$1" backend="$2"
+  [[ -x "$py_bin" ]] || return 1
+  "$py_bin" - "$backend" <<'PY' >/dev/null 2>&1
+import sys
+import accelerate, diffusers, pandas, safetensors, torch, transformers, tqdm, yaml
+actual = 'amd' if torch.version.hip else 'nvidia' if torch.version.cuda else 'cpu'
+raise SystemExit(0 if actual == sys.argv[1] else 1)
+PY
+}
+
 ensure_python_env() {
   local py_bin="$VENV_DIR/bin/python"
   local backend="$1"
-  if [[ ! -x "$py_bin" ]]; then
-    echo "[SETUP] Python environment missing; running env_setup.sh"
-    GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
-    return
+  if ! python_env_ready "$py_bin" "$backend"; then
+    echo "[SETUP] Installing/repairing the $backend Python stack"
+    VENV_DIR="$VENV_DIR" GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
   fi
-
-  if ! "$py_bin" - <<'PY' >/dev/null 2>&1
-import accelerate
-import diffusers
-import pandas
-import safetensors
-import torch
-import transformers
-import tqdm
-import yaml
-PY
-  then
-    echo "[SETUP] Python environment incomplete; running env_setup.sh"
-    GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
+  if ! python_env_ready "$py_bin" "$backend"; then
+    echo "[ERROR] The Python environment does not provide the selected $backend stack after setup" >&2
+    exit 1
   fi
 }
-GPU_BACKEND="$(python3 "$GPU_PLATFORM" detect-backend --backend "$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path gpu_backend --default '"auto"' --format text)")"
-ensure_python_env "$GPU_BACKEND"
 
-# Activate repo venv
+# Reading YAML must work before choosing which GPU stack to install.
+CONFIG_PYTHON="python3"
+if [[ -x "$VENV_DIR/bin/python" ]] && "$VENV_DIR/bin/python" -c 'import yaml' >/dev/null 2>&1; then
+  CONFIG_PYTHON="$VENV_DIR/bin/python"
+elif ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[ERROR] Dry run requires Python with PyYAML; activate the project environment first" >&2
+    exit 2
+  fi
+  VENV_DIR="$VENV_DIR" bash "$ENV_SETUP_SCRIPT" --config-only
+  CONFIG_PYTHON="$VENV_DIR/bin/python"
+fi
+"$CONFIG_PYTHON" "$BASE_DIR/validate_config.py" --config "$BASE_CONFIG_PATH" >&2
+# Resolve the profile before selecting devices or determining run metadata.
+EFFECTIVE_CONFIG_TMP="$(mktemp)"
+trap 'rm -f "$EFFECTIVE_CONFIG_TMP"' EXIT
+EFFECTIVE_CONFIG_ARGS=(--resolve-hardware)
+if [[ -n "$BACKEND_OVERRIDE" ]]; then EFFECTIVE_CONFIG_ARGS+=(--backend "$BACKEND_OVERRIDE"); fi
+if [[ "$GPU_OVERRIDE_SET" == "1" ]]; then EFFECTIVE_CONFIG_ARGS+=(--gpus "$GPU_OVERRIDE"); fi
+if [[ "$SMOKE_MODE" == "1" ]]; then EFFECTIVE_CONFIG_ARGS+=(--smoke); fi
+if [[ "$BASELINE_MODE" == "1" ]]; then EFFECTIVE_CONFIG_ARGS+=(--baseline); fi
+"$CONFIG_PYTHON" "$CONFIG_UTILS" write-effective --config "$BASE_CONFIG_PATH" --output "$EFFECTIVE_CONFIG_TMP" "${EFFECTIVE_CONFIG_ARGS[@]}"
+"$CONFIG_PYTHON" "$BASE_DIR/validate_config.py" --config "$EFFECTIVE_CONFIG_TMP" >&2
+if [[ "$DRY_RUN" == "1" ]]; then
+  cat "$EFFECTIVE_CONFIG_TMP"
+  exit 0
+fi
+GPU_BACKEND="$("$CONFIG_PYTHON" "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path gpu_backend --format text)"
+echo "[GPU] Selected backend: $GPU_BACKEND (config: $BASE_CONFIG_PATH)"
+if [[ "$GPU_BACKEND" == "amd" ]]; then
+  unset CUDA_VISIBLE_DEVICES
+else
+  unset HIP_VISIBLE_DEVICES
+fi
+ensure_python_env "$GPU_BACKEND"
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
-
-python3 "$BASE_DIR/validate_config.py" --config "$BASE_CONFIG_PATH"
-MACHINE_STATE_STRICT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path preflight.machine_state_strict --default 'false' --format bool-int)"
+MACHINE_STATE_STRICT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path preflight.machine_state_strict --default 'false' --format bool-int)"
 
 # Determine results root from config.yaml (fallback: results)
-RESULTS_ROOT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path results_dir --default '"results"' --format text)"
+RESULTS_ROOT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path results_dir --default '"results"' --format text)"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
-REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path repeat --default '1' --format text)"
+REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path repeat --default '1' --format text)"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
-readarray -t GPU_INCLUDE_VALUES < <(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path gpu_include --default '[]' --format lines)
+readarray -t GPU_INCLUDE_VALUES < <(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path gpu_include --default '[]' --format lines)
 VISIBLE_ENV_VAR="$(python3 "$GPU_PLATFORM" visible-env-var --backend "$GPU_BACKEND")"
 GPU_SYSTEM_TOOL="$(python3 "$GPU_PLATFORM" system-tool --backend "$GPU_BACKEND")"
-BLENDER_BACKEND_CFG="$(python3 "$CONFIG_UTILS" get --config "$BASE_CONFIG_PATH" --path blender.backend --default '"auto"' --format text)"
+BLENDER_BACKEND_CFG="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path blender.backend --default '"auto"' --format text)"
 if [[ "$BLENDER_BACKEND_CFG" == "auto" ]]; then
   BLENDER_GPU_BACKEND="$(python3 "$GPU_PLATFORM" blender-backend --backend "$GPU_BACKEND")"
 else
@@ -86,10 +165,21 @@ SELECTED_GPU_IDS=("${ALL_GPU_IDS[@]}")
 if [[ "${#GPU_INCLUDE_VALUES[@]}" -gt 0 ]]; then
   SELECTED_GPU_IDS=("${GPU_INCLUDE_VALUES[@]}")
 fi
+if [[ "$BASELINE_MODE" == "1" ]]; then
+  BASELINE_GPU_FOUND=0
+  for gpu_id in "${ALL_GPU_IDS[@]}"; do
+    if [[ "$gpu_id" == "${SELECTED_GPU_IDS[0]}" ]]; then BASELINE_GPU_FOUND=1; fi
+  done
+  if [[ "$BASELINE_GPU_FOUND" != "1" ]]; then
+    echo "[ERROR] Baseline GPU ${SELECTED_GPU_IDS[0]} is not present on this host" >&2
+    exit 1
+  fi
+fi
 if [[ "${#SELECTED_GPU_IDS[@]}" -gt 0 ]]; then
   SELECTED_GPU_CSV="$(IFS=,; echo "${SELECTED_GPU_IDS[*]}")"
-  export "$VISIBLE_ENV_VAR=$SELECTED_GPU_CSV"
-  echo "[INFO] $VISIBLE_ENV_VAR=$SELECTED_GPU_CSV"
+  VISIBLE_DEVICE_MASK="$(python3 "$GPU_PLATFORM" visibility-mask --backend "$GPU_BACKEND" --visible-devices "$SELECTED_GPU_CSV")"
+  export "$VISIBLE_ENV_VAR=$VISIBLE_DEVICE_MASK"
+  echo "[INFO] Physical GPU indices: $SELECTED_GPU_CSV; $VISIBLE_ENV_VAR=$VISIBLE_DEVICE_MASK"
 fi
 VISIBLE_GPU_COUNT="${#SELECTED_GPU_IDS[@]}"
 if [[ "$VISIBLE_GPU_COUNT" -eq 0 ]]; then
@@ -132,11 +222,7 @@ mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
 RUN_CONFIG_PATH="$RUN_DIR/effective_config.yaml"
-if [[ "$SMOKE_MODE" == "1" ]]; then
-  python3 "$CONFIG_UTILS" write-effective --config "$BASE_CONFIG_PATH" --output "$RUN_CONFIG_PATH" --smoke
-else
-  python3 "$CONFIG_UTILS" write-effective --config "$BASE_CONFIG_PATH" --output "$RUN_CONFIG_PATH"
-fi
+cp "$EFFECTIVE_CONFIG_TMP" "$RUN_CONFIG_PATH"
 echo "[INFO] Effective config: $RUN_CONFIG_PATH"
 if [[ "$SMOKE_MODE" == "1" ]]; then
   echo "[INFO] Smoke mode enabled"
@@ -153,6 +239,7 @@ fi
 
 python3 "$BASE_DIR/estimate_runtime.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/runtime_estimate.json"
 python3 "$BASE_DIR/check_system_requirements.py" --config "$RUN_CONFIG_PATH" --json-out "$RUN_DIR/system_requirements.json"
+python3 "$BASE_DIR/lock_model_revisions.py" --config "$RUN_CONFIG_PATH" --manifest "$RUN_DIR/model_revisions.json"
 if [[ "$MACHINE_STATE_STRICT" == "1" ]]; then
   python3 "$BASE_DIR/check_machine_state.py" --config "$RUN_CONFIG_PATH" --strict --json-out "$RUN_DIR/machine_state.json"
 else
@@ -205,6 +292,9 @@ data = {
     "kernel": platform.release(),
     "python": platform.python_version(),
     "gpu_backend": backend,
+    "selected_gpu_indices": visible_csv.split(',') if visible_csv else [],
+    "visible_device_env": visible_env_var,
+    "visible_devices": os.environ.get(visible_env_var),
     "gpu_smi": gpu,
     "cpu_lscpu": cpu,
     "mem_free": mem,
@@ -308,7 +398,45 @@ append_jsonl_row () {
 }
 
 # --- 1) LLM Training ---
+if [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train.enabled --default 'true' --format bool-int)" == "1" ]]; then
 readarray -t TRAIN_WORLD_SIZES < <(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train.world_sizes --default '[1]' --format lines)
+TRAIN_WS2_GPU_CSV=""
+TRAIN_PAIR_SELECTION_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train.pair_selection.enabled --default 'false' --format bool-int)"
+TRAIN_WORLD_SIZE_2_REQUESTED=0
+for requested_world_size in "${TRAIN_WORLD_SIZES[@]}"; do
+  if [[ "$requested_world_size" == "2" ]]; then
+    TRAIN_WORLD_SIZE_2_REQUESTED=1
+  fi
+done
+if [[ "$TRAIN_PAIR_SELECTION_ENABLED" == "1" && "$TRAIN_WORLD_SIZE_2_REQUESTED" == "1" && "$VISIBLE_GPU_COUNT" -ge 2 ]]; then
+  if [[ -n "${SELECTED_GPU_CSV:-}" ]]; then
+    echo "[PAIR] Selecting best llm_train world_size=2 GPU pair from: $SELECTED_GPU_CSV"
+    PAIR_SELECTION_JSON="$RUN_DIR/llm_train_ws2_pair_selection.json"
+    PAIR_SELECTION_LOG_DIR="$RUN_DIR/logs/gpu_pair_selection"
+    python3 "$BASE_DIR/select_gpu_pair.py" \
+      --config "$RUN_CONFIG_PATH" \
+      --gpu-ids "$SELECTED_GPU_CSV" \
+      --backend "$GPU_BACKEND" \
+      --visible-env-var "$VISIBLE_ENV_VAR" \
+      --bench-script "$BENCH_DIR/llm_train.py" \
+      --output "$PAIR_SELECTION_JSON" \
+      --log-dir "$PAIR_SELECTION_LOG_DIR" \
+      --python-bin "$(command -v python3)"
+    TRAIN_WS2_GPU_CSV="$(python3 - "$PAIR_SELECTION_JSON" <<'PYJSON'
+import json, sys
+with open(sys.argv[1]) as f:
+    payload = json.load(f)
+print(payload.get("selected_pair_csv", ""))
+PYJSON
+)"
+    if [[ -n "$TRAIN_WS2_GPU_CSV" ]]; then
+      echo "[PAIR] Selected llm_train world_size=2 GPU pair: $TRAIN_WS2_GPU_CSV"
+    else
+      echo "[PAIR][WARN] Pair selector did not return a pair; using first two visible GPUs"
+    fi
+  fi
+fi
+
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   for world_size in "${TRAIN_WORLD_SIZES[@]}"; do
     if [[ "$world_size" -gt "$VISIBLE_GPU_COUNT" ]]; then
@@ -337,20 +465,27 @@ PY
       continue
     fi
 
-    train_gpu_ids=("${SELECTED_GPU_IDS[@]:0:$world_size}")
-    train_gpu_csv="$(IFS=,; echo "${train_gpu_ids[*]}")"
+    if [[ "$world_size" == "2" && -n "$TRAIN_WS2_GPU_CSV" ]]; then
+      train_gpu_csv="$TRAIN_WS2_GPU_CSV"
+    else
+      train_gpu_ids=("${SELECTED_GPU_IDS[@]:0:$world_size}")
+      train_gpu_csv="$(IFS=,; echo "${train_gpu_ids[*]}")"
+    fi
+    train_visibility="$(python3 "$GPU_PLATFORM" visibility-mask --backend "$GPU_BACKEND" --visible-devices "$train_gpu_csv")"
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     if [[ "$world_size" -gt 1 ]]; then
-      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
+      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_visibility" \
         python3 -m torch.distributed.run --standalone --nproc_per_node "$world_size" \
         "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     else
-      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_gpu_csv" \
+      run_and_log_allow_fail "llm_train_ws${world_size}_r${rep}" env "$VISIBLE_ENV_VAR=$train_visibility" \
         python3 "$BENCH_DIR/llm_train.py" --config "$RUN_CONFIG_PATH"
     fi
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train" "$rep" "$REPEAT_COUNT"
   done
 done
+
+fi
 
 LLM_TRAIN_REAL_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_train_real.enabled --default 'false' --format bool-int)"
 if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
@@ -362,6 +497,7 @@ if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
 fi
 
 # --- 2) LLM Inference ---
+if [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.enabled --default 'true' --format bool-int)" == "1" ]]; then
 LLM_INFER_BACKEND="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.backend --default '"transformers"' --format text)"
 LLM_INFER_SCRIPT="$BENCH_DIR/llm_infer_hf.py"
 LLM_INFER_LOG_NAME="llm_infer_transformers"
@@ -376,8 +512,11 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
 done
 
 # --- 3) Stable Diffusion Inference ---
+fi
+if [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.enabled --default 'true' --format bool-int)" == "1" ]]; then
 readarray -t SD_SIZES < <(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.sizes --default '[512]' --format lines)
 SD_MODEL="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.model --default '"stabilityai/stable-diffusion-2-1"' --format text)"
+SD_REVISION="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.revision --default '"main"' --format text)"
 SD_STEPS="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.steps --default '20' --format text)"
 SD_BS="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.per_gpu_batch --default '1' --format text)"
 SD_MULTI_GPU_MODE="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.multi_gpu_mode --default '"single"' --format text)"
@@ -387,7 +526,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     if [[ "$SD_EMIT_WORKER_ROWS" == "1" ]]; then
       run_and_log_allow_fail "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
-        --model "$SD_MODEL" --width "$sz" --height "$sz" \
+        --model "$SD_MODEL" --revision "$SD_REVISION" --width "$sz" --height "$sz" \
         --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
         --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
@@ -395,7 +534,7 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
         --emit-worker-rows
     else
       run_and_log_allow_fail "sd_infer_${sz}_r${rep}" python3 "$BENCH_DIR/sd_infer.py" \
-        --model "$SD_MODEL" --width "$sz" --height "$sz" \
+        --model "$SD_MODEL" --revision "$SD_REVISION" --width "$sz" --height "$sz" \
         --steps "$SD_STEPS" --batch-size "$SD_BS" --iterations "$SD_ITERATIONS" \
         --metrics-path "$RUN_DIR/results/metrics.jsonl" \
         --repeat-index "$rep" --repeat-count "$REPEAT_COUNT" \
@@ -405,8 +544,13 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
   done
 done
 
+fi
+
+run_and_log_allow_fail "optional_suites" python3 "$BASE_DIR/run_optional_suites.py" --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR"
+
 # --- 4) Blender CUDA Bench (if Blender available) ---
 if command -v blender >/dev/null 2>&1; then
+  export BENCHMARK_PROFILE="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path benchmark_profile --default '"general"' --format text)"
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"

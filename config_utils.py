@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+from suite_config import smoke_optional_suites
 
 try:
     import yaml
@@ -24,9 +25,28 @@ def get_path_value(data, dotted_path, default=None):
     return current
 
 
-def write_effective_config(src_path, dst_path, smoke_mode):
+def write_effective_config(src_path, dst_path, smoke_mode, baseline=False,
+                           resolve_hardware=False, backend_override=None, gpu_override=None):
     cfg = load_config(src_path)
+    if resolve_hardware:
+        from gpu_platform import resolve_config
+        cfg = resolve_config(cfg, backend_override, gpu_override)
     cfg["smoke_mode"] = smoke_mode
+    cfg["benchmark_profile"] = "single_gpu_baseline" if baseline else "general"
+
+    if baseline:
+        cfg["gpu_include"] = (cfg.get("gpu_include") or [0])[:1]
+        cfg["repeat"] = 5
+        llm_train = cfg.setdefault("llm_train", {})
+        llm_train["world_sizes"] = [1]
+        pair_selection = llm_train.get("pair_selection") or {}
+        pair_selection["enabled"] = False
+        llm_train["pair_selection"] = pair_selection
+        llm_infer = cfg.setdefault("llm_infer", {})
+        llm_infer["backend"] = "transformers"
+        llm_infer["multi_gpu_mode"] = "single"
+        llm_infer["tensor_parallel_sizes"] = [1]
+        cfg.setdefault("sd_infer", {})["multi_gpu_mode"] = "single"
 
     if smoke_mode:
         cfg["repeat"] = 1
@@ -67,6 +87,10 @@ def write_effective_config(src_path, dst_path, smoke_mode):
             blender["scenes"] = [scenes[0]]
         cfg["blender"] = blender
 
+        smoke_optional_suites(cfg)
+        if (cfg.get('llm_train_real') or {}).get('enabled'):
+            cfg['llm_train_real']['warmup_steps'] = 1
+
     output_path = Path(dst_path)
     output_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
@@ -93,7 +117,8 @@ def cmd_get(args):
 
 
 def cmd_write_effective(args):
-    write_effective_config(args.config, args.output, args.smoke)
+    write_effective_config(args.config, args.output, args.smoke, args.baseline,
+                           args.resolve_hardware, args.backend, args.gpus)
 
 
 def main():
@@ -111,10 +136,17 @@ def main():
     write_ap.add_argument("--config", required=True)
     write_ap.add_argument("--output", required=True)
     write_ap.add_argument("--smoke", action="store_true")
+    write_ap.add_argument("--baseline", action="store_true")
+    write_ap.add_argument('--resolve-hardware', action='store_true')
+    write_ap.add_argument('--backend', choices=('auto', 'nvidia', 'amd'))
+    write_ap.add_argument('--gpus', help='Comma-separated physical GPU indices')
     write_ap.set_defaults(func=cmd_write_effective)
 
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except ValueError as exc:
+        ap.exit(2, f'[CONFIG][ERROR] {exc}\n')
 
 
 if __name__ == "__main__":

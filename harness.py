@@ -21,6 +21,17 @@ SUMMARY_METRIC_KEYS = {
     "gen_tokens_per_s",
     "mean_power_w",
     "gen_tokens_per_watt",
+    "energy_j",
+    "latency_ms_mean",
+    "latency_ms_p50",
+    "latency_ms_p95",
+    "ttft_ms_mean",
+    "throughput",
+    "generated_tokens_per_s", "tflops", "bandwidth_gbps", "tokens_per_joule", "images_per_joule",
+    "memory_peak_bytes", "peak_memory_bytes", "final_loss", "render_time_s", "startup_load_time_s",
+    "power_sample_count", "power_coverage", "power_started_s", "power_ended_s",
+    "drain_s", "requests_without_token_usage", "observed_output_tokens_min", "observed_output_tokens_max",
+    "queue_s", "inter_token_latency_ms", "errors",
     "images_total",
     "images_per_sec",
     "load_seconds",
@@ -28,7 +39,20 @@ SUMMARY_METRIC_KEYS = {
     "warm",
     "cold",
     "compile",
+    "requests",
+    "latency_samples",
+    "batch_latency_ms_mean",
+    "batch_latency_ms_p50",
+    "batch_latency_ms_p95",
+    "batch_latency_per_item_proxy_ms_mean",
+    "batch_latency_per_item_proxy_ms_p50",
+    "batch_latency_per_item_proxy_ms_p95",
 }
+SUMMARY_METRIC_KEYS.update(
+    f'{prefix}_{stat}' for prefix in ('latency_ms', 'ttft_ms', 'stream_chunk_gap_ms',
+                                      'inter_token_latency_ms', 'queue_ms')
+    for stat in ('mean', 'p50', 'p95', 'p99')
+)
 
 
 def is_number(value):
@@ -53,7 +77,7 @@ def summarize_rows(rows):
             sorted(
                 (k, json.dumps(v, sort_keys=True))
                 for k, v in row.items()
-                if k not in SUMMARY_METRIC_KEYS and k not in {"repeat_index", "repeat_count"}
+                if k not in SUMMARY_METRIC_KEYS and k not in {"repeat_index", "repeat_count", "power_sampler_available"}
             )
         )
         groups.setdefault(group_key, []).append(row)
@@ -65,6 +89,8 @@ def summarize_rows(rows):
             {int(r["repeat_index"]) for r in group_rows if is_number(r.get("repeat_index"))}
         )
         summary["summary_count"] = len(group_rows)
+        if any('power_sampler_available' in row for row in group_rows):
+            summary['power_sampler_available'] = all(row.get('power_sampler_available', False) for row in group_rows)
         if repeat_values:
             summary["repeat_indices"] = ",".join(map(str, repeat_values))
 
@@ -73,6 +99,8 @@ def summarize_rows(rows):
             if not values:
                 continue
             summary[f"{metric_key}_mean"] = round(statistics.fmean(values), 6)
+            summary[f"{metric_key}_count"] = len(values)
+            summary[f"{metric_key}_median"] = round(statistics.median(values), 6)
             summary[f"{metric_key}_min"] = round(min(values), 6)
             summary[f"{metric_key}_max"] = round(max(values), 6)
             summary[f"{metric_key}_stdev"] = round(statistics.stdev(values), 6) if len(values) > 1 else 0.0

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
+import re
 from pathlib import Path
+from config_utils import load_config
 
 
 REQUIRED_FILES = (
@@ -13,6 +16,52 @@ REQUIRED_FILES = (
 
 REQUIRED_SUITES = ("llm_train", "llm_infer", "sd_infer")
 OPTIONAL_SUITES = ("llm_train_real", "blender")
+
+
+def metric_issues(rows, cfg):
+    errors, warnings = [], []
+    present = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            errors.append(f'metric row {index} must be an object')
+            continue
+        present.add(row.get('suite'))
+        if row.get('status') not in ('ok', 'skipped', 'failed'):
+            errors.append(f'metric row {index} has invalid status')
+        for key, value in row.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                errors.append(f'metric row {index} has nonfinite {key}')
+        if row.get('status') != 'ok':
+            continue
+        for key, value in row.items():
+            if key.endswith('_sha256') and value is not None:
+                if not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None:
+                    errors.append(f'metric row {index} has malformed {key}')
+        if cfg.get('benchmark_profile') == 'single_gpu_baseline':
+            count = row.get('gpu_count', row.get('num_gpus'))
+            if count is not None and count != 1:
+                errors.append(f'baseline {row.get("suite")} row uses {count} GPUs')
+        energy = row.get('energy_j')
+        available = row.get('power_sampler_available')
+        if available and energy is None and row.get('energy_method') == 'board_power_trapezoid_v1':
+            errors.append(f'metric row {index} declares telemetry available without integrated energy')
+        if energy is not None:
+            if not available or not isinstance(energy, (int, float)) or isinstance(energy, bool) or energy < 0:
+                errors.append(f'metric row {index} claims energy without valid telemetry')
+            coverage = row.get('power_coverage')
+            if (row.get('energy_method') != 'board_power_trapezoid_v1' or not isinstance(coverage, (int, float))
+                    or not math.isfinite(coverage) or coverage < 1 - 1e-9):
+                errors.append(f'metric row {index} energy has missing method or incomplete coverage')
+        if row.get('timing_method') == 'blender_render_operator_v1':
+            if row.get('render_time_s') != row.get('time_s') or row.get('time_s', 0) <= 0:
+                errors.append('Blender render-only timing is inconsistent')
+        if row.get('suite') in ('llm_train_real', 'vision_infer', 'kernel_bench'):
+            if not row.get('correctness_check') and not row.get('correctness_passed'):
+                warnings.append(f'{row.get("suite")} row lacks correctness evidence')
+    for suite in ('llm_train_real', 'vision_infer', 'kernel_bench', 'llm_serve', 'blender'):
+        if (cfg.get(suite) or {}).get('enabled', False) and suite not in present:
+            errors.append(f'enabled suite missing from metrics.jsonl: {suite}')
+    return errors, warnings
 
 
 def load_json(path: Path):
@@ -75,6 +124,7 @@ def main():
     metrics_rows = []
     meta = {}
     machine_state = {}
+    cfg = {}
     if not payload["errors"]:
         try:
             meta = load_json(run_dir / "meta.json")
@@ -88,6 +138,14 @@ def main():
             metrics_rows = load_jsonl(run_dir / "results/metrics.jsonl")
         except Exception as exc:
             add_issue(payload, "error", f"failed to parse results/metrics.jsonl: {exc}")
+        if (run_dir / 'effective_config.yaml').exists():
+            try:
+                cfg = load_config(run_dir / 'effective_config.yaml')
+            except Exception as exc:
+                add_issue(payload, 'error', f'failed to parse effective_config.yaml: {exc}')
+        errors, warnings = metric_issues(metrics_rows, cfg)
+        payload['errors'].extend(errors)
+        payload['warnings'].extend(warnings)
 
     if payload["errors"]:
         payload["status"] = "error"
@@ -115,6 +173,8 @@ def main():
         payload["checks"].append({"suite_summary": summary})
 
         for suite in REQUIRED_SUITES:
+            if not (cfg.get(suite) or {}).get('enabled', True):
+                continue
             if suite not in summary:
                 add_issue(payload, "error", f"required suite missing from metrics.jsonl: {suite}")
                 continue
@@ -122,6 +182,8 @@ def main():
                 add_issue(payload, "warning", f"suite has no successful rows: {suite}")
 
         for suite in OPTIONAL_SUITES:
+            if cfg and not (cfg.get(suite) or {}).get('enabled', suite == 'blender'):
+                continue
             if suite not in summary:
                 add_issue(payload, "warning", f"optional suite missing from metrics.jsonl: {suite}")
 

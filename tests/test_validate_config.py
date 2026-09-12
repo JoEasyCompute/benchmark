@@ -2,6 +2,8 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+
+import yaml
 from pathlib import Path
 
 
@@ -22,6 +24,16 @@ class ValidateConfigTest(unittest.TestCase):
                 check=False,
             )
 
+    def test_optional_model_revisions_are_validated(self):
+        config = yaml.safe_load((ROOT / "config.yaml").read_text())
+        for section in ("llm_infer", "sd_infer"):
+            config[section]["revision"] = "a" * 40
+        result = self.run_validate(yaml.safe_dump(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config["sd_infer"]["revision"] = 123
+        result = self.run_validate(yaml.safe_dump(config))
+        self.assertNotEqual(result.returncode, 0)
+
     def test_valid_config_passes(self):
         result = self.run_validate(
             """
@@ -39,6 +51,11 @@ class ValidateConfigTest(unittest.TestCase):
               seq_len: 512
               batch_size: 4
               steps: 2
+              pair_selection:
+                enabled: true
+                strategy: topology
+                probe_steps: 2
+                candidate_limit: 4
             llm_train_real:
               enabled: false
               model: "Qwen/Qwen2.5-0.5B"
@@ -87,6 +104,11 @@ class ValidateConfigTest(unittest.TestCase):
               seq_len: 512
               batch_size: 4
               steps: 2
+              pair_selection:
+                enabled: yes
+                strategy: invalid
+                probe_steps: 0
+                candidate_limit: -1
             llm_infer:
               backend: invalid
               model: "Qwen/Qwen2.5-0.5B"
@@ -114,6 +136,9 @@ class ValidateConfigTest(unittest.TestCase):
         self.assertIn("llm_infer.multi_gpu_mode must be 'single' or 'replicated'", result.stderr)
         self.assertIn("blender.require_installed must be true or false", result.stderr)
         self.assertIn("unsupported key 'bogus'", result.stderr)
+        self.assertIn("llm_train.pair_selection.strategy must be one of benchmark, topology, first", result.stderr)
+        self.assertIn("llm_train.pair_selection.probe_steps must be a positive integer", result.stderr)
+        self.assertIn("llm_train.pair_selection.candidate_limit must be a non-negative integer", result.stderr)
 
 
 if __name__ == "__main__":

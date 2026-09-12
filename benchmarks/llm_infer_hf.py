@@ -7,13 +7,17 @@ import signal
 import shutil
 import statistics
 import subprocess
-import threading
 import time
 import traceback
 from queue import Empty
 from typing import List
 
 import yaml
+from energy import EnergySampler, aggregate_energy
+
+from benchmark_protocol import (MeasurementWindow, SEED, TIMING_METHOD,
+                                fixed_generation_kwargs, resolve_revision,
+                                text_hash, timed_call)
 
 try:
     import torch
@@ -148,80 +152,16 @@ def render_chat_prompt(tokenizer, user_prompt: str) -> str:
     return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-class PowerSampler:
-    def __init__(self, gpu_limit: int, interval_s: float = 0.5):
-        self.interval = interval_s
-        self.gpu_limit = max(1, int(gpu_limit))
-        self.samples = []
-        self._stop = threading.Event()
-        self._thr = None
-        self._ok = False
-        self.backend = detect_backend()
-        try:
-            if self.backend == "nvidia":
-                import pynvml as N
+class PowerSampler(EnergySampler):
+    """Compatibility adapter for existing callers."""
+    def __init__(self, gpu_limit=1, interval_s=0.5, device_indices=None):
+        super().__init__(detect_backend(), device_indices or list(range(gpu_limit)), interval_s)
 
-                self.N = N
-                N.nvmlInit()
-                self.handles = self._resolve_handles()
-                self._ok = True
-        except Exception:
-            self._ok = False
+    def mean_watts(self):
+        return (self.result or {}).get('mean_power_w')
 
-    def _resolve_handles(self):
-        visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        visible = [x.strip() for x in visible_env.split(",") if x.strip()]
-        selected = visible[: self.gpu_limit] if visible else []
-        handles = []
-
-        if selected:
-            for item in selected:
-                try:
-                    if item.isdigit():
-                        handles.append(self.N.nvmlDeviceGetHandleByIndex(int(item)))
-                    else:
-                        handles.append(self.N.nvmlDeviceGetHandleByUUID(item.encode()))
-                except Exception:
-                    continue
-            if handles:
-                return handles
-
-        count = self.N.nvmlDeviceGetCount()
-        for i in range(min(self.gpu_limit, count)):
-            handles.append(self.N.nvmlDeviceGetHandleByIndex(i))
-        return handles
-
-    def _tick(self):
-        while not self._stop.is_set():
-            total_w = 0.0
-            if self._ok and self.backend == "nvidia":
-                for h in self.handles:
-                    try:
-                        total_w += (self.N.nvmlDeviceGetPowerUsage(h) or 0.0) / 1000.0
-                    except Exception:
-                        pass
-            self.samples.append(total_w if total_w > 0 else 0.0)
-            time.sleep(self.interval)
-
-    def start(self):
-        self._thr = threading.Thread(target=self._tick, daemon=True)
-        self._thr.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thr:
-            self._thr.join()
-        if self._ok:
-            try:
-                self.N.nvmlShutdown()
-            except Exception:
-                pass
-
-    def mean_watts(self) -> float:
-        return sum(self.samples) / len(self.samples) if self.samples else 0.0
-
-    def available(self) -> bool:
-        return self._ok and bool(getattr(self, "handles", []))
+    def available(self):
+        return (self.result or {}).get('power_sampler_available', False)
 
 
 def classify_failure(exc: Exception) -> str:
@@ -277,12 +217,12 @@ def write_skip_row(cfg, batch_size: int, tensor_parallel: int, reason: str, deta
     print(f"[SKIP] {detail}")
 
 
-def load_model(model_name: str, dtype_name: str, device: str):
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+def load_model(model_name: str, dtype_name: str, device: str, revision=None):
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, revision=revision)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs = {"trust_remote_code": True}
+    model_kwargs = {"trust_remote_code": True, "revision": revision}
     dtype = dtype_for_config(dtype_name)
     if dtype is not None:
         model_kwargs["dtype"] = dtype
@@ -310,6 +250,8 @@ def run_combo(
     warmup_s: int,
     duration_s: int,
     device_index: int = 0,
+    revision=None,
+    measurement_window=None,
 ):
     if torch is None:
         raise RuntimeError("PyTorch is unavailable")
@@ -318,19 +260,19 @@ def run_combo(
 
     torch.cuda.set_device(device_index)
     device = f"cuda:{device_index}"
+    torch.manual_seed(SEED)
     load_started = time.perf_counter()
-    tokenizer, model = load_model(model_name, dtype_name, device)
+    tokenizer, model = load_model(model_name, dtype_name, device, revision)
+    torch.cuda.synchronize()
     load_seconds = time.perf_counter() - load_started
 
     encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = encoded["input_ids"].repeat(batch_size, 1).to(device)
     attention_mask = encoded["attention_mask"].repeat(batch_size, 1).to(device)
-    generate_kwargs = {
-        "max_new_tokens": out_len,
-        "do_sample": False,
-        "use_cache": True,
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-    }
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    generate_kwargs = fixed_generation_kwargs(out_len, pad_id)
 
     def generate_once():
         with torch.no_grad():
@@ -342,25 +284,34 @@ def run_combo(
         torch.cuda.synchronize()
         return outputs
 
-    warmup_deadline = time.time() + warmup_s
-    while time.time() < warmup_deadline:
+    warmup_deadline = time.perf_counter() + warmup_s
+    while time.perf_counter() < warmup_deadline:
         _ = generate_once()
 
-    ps = PowerSampler(gpu_limit=1, interval_s=0.5)
-    ps.start()
+    ps = PowerSampler(gpu_limit=1, interval_s=0.5, device_indices=[device_index])
     generated_tokens = 0
     requests = 0
     batch_latencies_ms = []
-    started = time.time()
-    ended = started + duration_s
-    while time.time() < ended:
-        batch_started = time.perf_counter()
-        outputs = generate_once()
-        batch_latencies_ms.append((time.perf_counter() - batch_started) * 1000.0)
-        requests += batch_size
-        generated_tokens += int((outputs.shape[1] - input_ids.shape[1]) * batch_size)
-    elapsed = time.time() - started
-    ps.stop()
+    ps.start()
+    started = None
+    finished = None
+    try:
+        torch.cuda.synchronize()
+        started = (measurement_window.start(torch.cuda.synchronize)
+                   if measurement_window is not None else time.perf_counter())
+        ended = started + duration_s
+        while time.perf_counter() < ended:
+            outputs, batch_elapsed = timed_call(generate_once, torch.cuda.synchronize)
+            actual_output_len = outputs.shape[1] - input_ids.shape[1]
+            if actual_output_len != out_len:
+                raise RuntimeError(f"Expected {out_len} output tokens, got {actual_output_len}")
+            batch_latencies_ms.append(batch_elapsed * 1000.0)
+            requests += batch_size
+            generated_tokens += int((outputs.shape[1] - input_ids.shape[1]) * batch_size)
+        finished = time.perf_counter()
+        elapsed = finished - started
+    finally:
+        energy = ps.stop(started_s=started, ended_s=finished)
 
     mean_w = ps.mean_watts()
     batch_latency_mean = round(statistics.fmean(batch_latencies_ms), 3) if batch_latencies_ms else 0.0
@@ -371,6 +322,12 @@ def run_combo(
         "suite": "llm_infer",
         "status": "ok",
         "backend": "transformers",
+        "timing_method": TIMING_METHOD,
+        "seed": SEED,
+        "model_revision": revision,
+        "tokenizer_revision": revision,
+        "prompt_sha256": text_hash(prompt),
+        "generation_mode": "greedy_fixed_length",
         "gpu_backend": detect_backend(),
         "model": model_name,
         "dtype": dtype_name,
@@ -393,8 +350,9 @@ def run_combo(
         "batch_latency_per_item_proxy_ms_p95": round(batch_latency_p95 / batch_size, 3) if batch_size > 0 else 0.0,
         "latency_samples": len(batch_latencies_ms),
         "power_sampler_available": ps.available(),
-        "mean_power_w": round(mean_w, 2),
-        "gen_tokens_per_watt": (generated_tokens / elapsed / mean_w) if mean_w > 1e-6 else 0.0,
+        "mean_power_w": round(mean_w, 2) if ps.available() else None,
+        "energy_j": energy.get('energy_j'),
+        "gen_tokens_per_watt": generated_tokens / energy['energy_j'] if energy.get('energy_j') else None,
         "gpu_name": detect_gpu_name(),
         "gpu_index": device_index,
         "gpu_count": 1,
@@ -409,6 +367,7 @@ def run_combo(
     del attention_mask
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    row.update(energy)
     return row
 
 
@@ -424,6 +383,8 @@ def run_worker(
     warmup_s: int,
     duration_s: int,
     device_index: int,
+    revision=None,
+    measurement_window=None,
 ):
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -438,9 +399,13 @@ def run_worker(
             warmup_s=warmup_s,
             duration_s=duration_s,
             device_index=device_index,
+            revision=revision,
+            measurement_window=measurement_window,
         )
         q.put(row)
     except Exception as exc:
+        if measurement_window is not None:
+            measurement_window.abort()
         q.put(
             {
                 "benchmark_schema_version": 2,
@@ -477,7 +442,6 @@ def aggregate_rows(rows, worker_count: int, batch_size: int, mode: str):
     timed_s = max(float(row.get("time_s", 0.0)) for row in ok_rows) if ok_rows else 0.0
     requests = sum(int(row.get("requests", 0)) for row in ok_rows)
     generated_tokens = sum(int(row.get("generated_tokens", 0)) for row in ok_rows)
-    mean_power_w = sum(float(row.get("mean_power_w", 0.0)) for row in ok_rows)
     aggregate = {
         "benchmark_schema_version": 2,
         "suite": "llm_infer",
@@ -485,6 +449,8 @@ def aggregate_rows(rows, worker_count: int, batch_size: int, mode: str):
         "backend": "transformers",
         "gpu_backend": detect_backend(),
         "model": ref_row.get("model"),
+        **{key: ref_row.get(key) for key in ("timing_method", "seed",
+           "model_revision", "tokenizer_revision", "prompt_sha256", "generation_mode")},
         "dtype": ref_row.get("dtype"),
         "tensor_parallel": 1,
         "batch_size": batch_size * worker_count if mode == "replicated" else batch_size,
@@ -519,9 +485,6 @@ def aggregate_rows(rows, worker_count: int, batch_size: int, mode: str):
             sum(float(row.get("batch_latency_per_item_proxy_ms_p95", 0.0)) for row in ok_rows) / len(ok_rows), 3
         ) if ok_rows else None,
         "latency_samples": sum(int(row.get("latency_samples", 0)) for row in ok_rows),
-        "power_sampler_available": all(bool(row.get("power_sampler_available")) for row in ok_rows) if ok_rows else False,
-        "mean_power_w": round(mean_power_w, 2),
-        "gen_tokens_per_watt": (generated_tokens / timed_s / mean_power_w) if timed_s > 0 and mean_power_w > 1e-6 else 0.0,
         "gpu_name": ref_row.get("gpu_name"),
         "load_seconds": round(max(float(row.get("load_seconds", 0.0)) for row in ok_rows), 3) if ok_rows else None,
         "time_s": timed_s if timed_s > 0 else None,
@@ -532,6 +495,8 @@ def aggregate_rows(rows, worker_count: int, batch_size: int, mode: str):
         aggregate["error"] = " | ".join(
             f"gpu{row.get('gpu_index', '?')}: {row.get('error', 'unknown error')}" for row in failed_rows
         )
+    aggregate.update(aggregate_energy(ok_rows))
+    aggregate['gen_tokens_per_watt'] = generated_tokens / aggregate['energy_j'] if aggregate.get('energy_j') else None
     return aggregate
 
 
@@ -558,7 +523,8 @@ def main():
     tp_sizes: List[int] = list(map(int, cfg.get("tensor_parallel_sizes", [1])))
     requested_multi_gpu_mode = (cfg.get("multi_gpu_mode", "single") or "single").lower()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    revision = resolve_revision(model_name, cfg.get("revision"))
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, revision=revision)
     user_prompt, _ = make_prompt(tokenizer, prompt_len)
     prompt = render_chat_prompt(tokenizer, user_prompt)
     actual_prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
@@ -589,11 +555,13 @@ def main():
                         out_len,
                         args.warmup,
                         args.duration,
+                        revision=revision,
                     )
                     row["multi_gpu_mode"] = actual_mode
                     row["gpu_count"] = 1
                 else:
                     mp.set_start_method("spawn", force=True)
+                    measurement_window = MeasurementWindow(mp.get_context("spawn"), worker_count)
                     q: mp.Queue = mp.Queue(maxsize=worker_count)
                     workers = []
                     for device_index in range(worker_count):
@@ -611,6 +579,8 @@ def main():
                                 warmup_s=args.warmup,
                                 duration_s=args.duration,
                                 device_index=device_index,
+                                revision=revision,
+                                measurement_window=measurement_window,
                             ),
                             daemon=True,
                         )

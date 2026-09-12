@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import subprocess
 import tempfile
 import textwrap
@@ -20,7 +21,94 @@ def write_run(root: Path, name: str, meta: dict, config_text: str, summary_rows:
     return run_dir
 
 
+class WorkloadIdentityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("compare_runs", SCRIPT)
+        cls.compare = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.compare)
+
+    def test_incompatible_identity_never_matches(self):
+        suites = {
+            "llm_train": {"hidden_size": 256, "n_layers": 4, "n_heads": 8,
+                          "seed": 1234, "timing_method": "synchronized_v1"},
+            "llm_infer": {"model_revision": "abc", "tokenizer_revision": "abc",
+                          "prompt_len": 512, "output_len": 128,
+                          "prompt_sha256": "abc", "seed": 1234,
+                          "generation_mode": "greedy_fixed_length",
+                          "timing_method": "synchronized_v1"},
+            "sd_infer": {"model_revision": "abc", "prompt_sha256": "abc",
+                         "negative_prompt_sha256": "def", "scheduler_name": "DDIM",
+                         "guidance_scale": 7.5, "xformers_enabled": False,
+                         "seed": 1234, "timing_method": "synchronized_v1"},
+        }
+        for suite, identity in suites.items():
+            row = dict(suite=suite, **identity)
+            for field in identity:
+                with self.subTest(suite=suite, field=field):
+                    changed = dict(row, **{field: "different"})
+                    self.assertNotEqual(self.compare.row_key(row), self.compare.row_key(changed))
+                    missing = dict(row)
+                    del missing[field]
+                    self.assertNotEqual(self.compare.row_key(row), self.compare.row_key(missing))
+
+    def test_legacy_and_unresolved_identity_are_directional(self):
+        for suite in ("llm_train", "llm_infer", "sd_infer", "blender"):
+            with self.subTest(suite=suite):
+                quality, notes = self.compare.compare_quality(suite, [{"suite": suite}], 1)
+                self.assertEqual(quality, "directional")
+                self.assertTrue(any("Missing workload identity" in note for note in notes))
+
+    def test_null_revision_prevents_strict_comparison(self):
+        row = dict(suite="llm_infer", backend="transformers", model="qwen",
+                   dtype="float16", multi_gpu_mode="single", per_gpu_batch_size=1,
+                   tensor_parallel=1, requested_prompt_len=512, prompt_len=512,
+                   output_len=128, model_revision=None, tokenizer_revision="abc",
+                   prompt_sha256="abc", generation_mode="greedy_fixed_length",
+                   seed=1234, timing_method="synchronized_v1", gpu_count=1)
+        quality, notes = self.compare.compare_quality("llm_infer", [row], 1)
+        self.assertEqual(quality, "directional")
+        self.assertIn("model_revision", notes[-1])
+        row["model_revision"] = "abc"
+        self.assertEqual(self.compare.compare_quality("llm_infer", [row], 1)[0], "strict")
+
+    def test_complete_training_identity_can_be_strict(self):
+        row = dict(suite="llm_train", dtype="bf16", seq_len=512, batch_size=4,
+                   hidden_size=256, n_layers=4, n_heads=8, world_size=1,
+                   seed=1234, timing_method="synchronized_v1", gpu_count=1)
+        self.assertEqual(self.compare.compare_quality("llm_train", [row], 1)[0], "strict")
+
+
 class CompareRunsTest(unittest.TestCase):
+    def run_comparison(self, rows):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runs = [write_run(root, name, {"gpu_backend": name}, "{}", rows)
+                    for name in ("amd", "nvidia")]
+            result = subprocess.run(
+                [str(PYTHON), str(SCRIPT), *map(str, runs),
+                 "--out-dir", str(root / "report")], capture_output=True, text=True)
+            payload = None
+            if result.returncode == 0:
+                payload = json.loads((root / "report/comparison.json").read_text())
+            return result, payload
+
+    def test_sd_emitted_dimensions_and_batch_sizes_stay_separate(self):
+        rows = [dict(suite="sd_infer", status="ok", model="sd", steps=20,
+                     hw=f"{size}x{size}", per_gpu_batch_size=batch,
+                     dtype="float16", images_per_sec_mean=1, gpu_count=1)
+                for size in (512, 1024) for batch in (1, 4)]
+        result, payload = self.run_comparison(rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(payload["suites"]["sd_infer"]["groups"]), 4)
+
+    def test_duplicate_workload_rows_are_rejected(self):
+        row = dict(suite="llm_infer", status="ok", model="qwen",
+                   batch_size=1, gen_tokens_per_s_mean=10, summary_count=1)
+        result, _ = self.run_comparison([row, dict(row, gen_tokens_per_s_mean=20)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Duplicate", result.stderr)
+
     def test_generates_markdown_and_json_for_matching_groups(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -582,6 +670,10 @@ class CompareRunsTest(unittest.TestCase):
                         "suite": "blender",
                         "status": "ok",
                         "scene": "classroom.blend",
+                        "scene_sha256": "fixed-scene-hash",
+                        "blender_version": "4.2.18",
+                        "render_settings_sha256": "fixed-settings-hash",
+                        "timing_method": "process_elapsed_v1",
                         "mode": "single",
                         "backend": "CUDA",
                         "time_s_mean": 10.0,
@@ -625,6 +717,10 @@ class CompareRunsTest(unittest.TestCase):
                         "suite": "blender",
                         "status": "ok",
                         "scene": "classroom.blend",
+                        "scene_sha256": "fixed-scene-hash",
+                        "blender_version": "4.2.18",
+                        "render_settings_sha256": "fixed-settings-hash",
+                        "timing_method": "process_elapsed_v1",
                         "mode": "single",
                         "backend": "CUDA",
                         "time_s_mean": 20.0,

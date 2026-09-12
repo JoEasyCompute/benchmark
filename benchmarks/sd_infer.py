@@ -14,6 +14,7 @@ Example:
 """
 
 import argparse
+from energy import EnergySampler, aggregate_energy
 import json
 import multiprocessing as mp
 import os
@@ -23,6 +24,9 @@ import sys
 import time
 from queue import Empty
 from typing import Optional
+
+from benchmark_protocol import (MeasurementWindow, SEED, TIMING_METHOD,
+                                resolve_revision, text_hash, timed_call)
 
 import torch
 from diffusers import (
@@ -126,6 +130,8 @@ def run_worker(
     prefer_bf16: bool,
     enable_xformers: bool,
     device_index: int,
+    revision=None,
+    measurement_window=None,
 ):
     try:
         # child: ignore SIGINT; parent handles it
@@ -141,19 +147,19 @@ def run_worker(
         t0 = time.perf_counter()
 
         # --- Manual assembly to avoid offload_state_dict being forwarded ---
-        text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder")
-        tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer")
-        vae = AutoencoderKL.from_pretrained(model, subfolder="vae")
-        unet = UNet2DConditionModel.from_pretrained(model, subfolder="unet")
-        feature_extractor = CLIPImageProcessor.from_pretrained(model, subfolder="feature_extractor")
+        text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder", revision=revision)
+        tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", revision=revision)
+        vae = AutoencoderKL.from_pretrained(model, subfolder="vae", revision=revision)
+        unet = UNet2DConditionModel.from_pretrained(model, subfolder="unet", revision=revision)
+        feature_extractor = CLIPImageProcessor.from_pretrained(model, subfolder="feature_extractor", revision=revision)
 
         # Load a scheduler from the repo (or derive sensible defaults)
         scheduler_source = "model_repo"
         try:
-            sd_scheduler = EulerDiscreteScheduler.from_pretrained(model, subfolder="scheduler")
+            sd_scheduler = EulerDiscreteScheduler.from_pretrained(model, subfolder="scheduler", revision=revision)
         except Exception:
             try:
-                sd_scheduler = PNDMScheduler.from_pretrained(model, subfolder="scheduler")
+                sd_scheduler = PNDMScheduler.from_pretrained(model, subfolder="scheduler", revision=revision)
             except Exception:
                 scheduler_source = "built_in_fallback"
                 # Fallback defaults commonly used for SD1.5
@@ -197,16 +203,17 @@ def run_worker(
         scheduler_override = (scheduler or "").strip().lower() or None
 
         _ = pipe(
-            prompt="warmup image",
-            negative_prompt="",
-            height=min(height, 512),
-            width=min(width, 512),
-            num_inference_steps=10,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=steps,
             guidance_scale=guidance,
-            num_images_per_prompt=1,
+            num_images_per_prompt=batch_size,
             generator=torch.Generator(device=device).manual_seed(1234),
         )
 
+        torch.cuda.synchronize(device)
         load_s = time.perf_counter() - t0
 
         g = torch.Generator(device=device)
@@ -216,21 +223,24 @@ def run_worker(
         times = []
         total_images = iterations * batch_size
 
+        synchronize = lambda: torch.cuda.synchronize(device)
+        sampler = EnergySampler(detect_backend(), [device_index])
+        sampler.start()
+        started = (measurement_window.start(synchronize)
+                   if measurement_window is not None else time.perf_counter())
         for _ in range(iterations):
-            t_iter = time.perf_counter()
-            _ = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=height,
-                width=width,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                num_images_per_prompt=batch_size,
-                generator=g,
-            )
-            times.append(time.perf_counter() - t_iter)
-
-        imgs_per_sec = total_images / sum(times) if times else 0.0
+            _, elapsed = timed_call(
+                lambda: pipe(
+                    prompt=prompt, negative_prompt=negative_prompt,
+                    height=height, width=width, num_inference_steps=steps,
+                    guidance_scale=guidance, num_images_per_prompt=batch_size,
+                    generator=g,
+                ), synchronize)
+            times.append(elapsed)
+        synchronize()
+        measured_s = time.perf_counter() - started
+        energy = sampler.stop(started_s=started, ended_s=started + measured_s)
+        imgs_per_sec = total_images / measured_s if measured_s > 0 else 0.0
 
         try:
             pipe._execution_device = None
@@ -245,6 +255,11 @@ def run_worker(
                 "suite": "sd_infer",
                 "status": "ok",
                 "gpu_backend": detect_backend(),
+                "timing_method": TIMING_METHOD,
+                "seed": seed,
+                "model_revision": revision,
+                "prompt_sha256": text_hash(prompt),
+                "negative_prompt_sha256": text_hash(negative_prompt),
                 "model": model,
                 "dtype": str(dtype),
                 "dtype_reason": dtype_reason,
@@ -265,11 +280,16 @@ def run_worker(
                 "mean_s_per_iter": round(sum(times) / len(times), 4) if times else None,
                 "images_total": total_images,
                 "images_per_sec": round(imgs_per_sec, 3),
-                "time_s": round(sum(times), 4),
+                "time_s": measured_s,
                 "gpu_index": device_index,
+                **energy,
             }
         )
     except Exception as e:
+        if 'sampler' in locals() and hasattr(sampler, 'started'):
+            sampler.stop()
+        if measurement_window is not None:
+            measurement_window.abort()
         q.put(
             {
                 "benchmark_schema_version": 2,
@@ -320,6 +340,9 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
         timed_s = max(float(r.get("time_s", 0.0)) for r in ok_results)
         row.update(
             {
+                **{key: ok_results[0].get(key) for key in (
+                    "timing_method", "seed", "model_revision", "prompt_sha256",
+                    "negative_prompt_sha256")},
                 "dtype": ok_results[0].get("dtype"),
                 "dtype_reason": ok_results[0].get("dtype_reason"),
                 "bf16_requested": ok_results[0].get("bf16_requested"),
@@ -348,6 +371,8 @@ def aggregate_results(results, args, worker_count: int, mode: str, wall_time_s: 
         if xformers_errors:
             row["xformers_error"] = " | ".join(xformers_errors)
 
+    row.update(aggregate_energy(ok_results))
+    row['images_per_joule'] = row.get('images_total', 0) / row['energy_j'] if row.get('energy_j') else None
     return row
 
 
@@ -368,6 +393,7 @@ def worker_result_rows(results, args, mode):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF repo id or local path")
+    ap.add_argument("--revision", default=None, help="HF model commit or ref")
     ap.add_argument("--prompt", default="A photo of a cute corgi wearing sunglasses, cinematic, high detail")
     ap.add_argument("--neg", "--negative-prompt", dest="negative_prompt", default="")
     ap.add_argument("--width", type=int, default=512)
@@ -376,7 +402,7 @@ def main():
     ap.add_argument("--cfg", "--guidance", dest="guidance", type=float, default=7.5)
     ap.add_argument("--bs", "--batch-size", dest="batch_size", type=int, default=1)
     ap.add_argument("--it", "--iterations", dest="iterations", type=int, default=5)
-    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--scheduler", default="", help="euler, euler_a, ...")
     ap.add_argument("--bf16", action="store_true", help="prefer bfloat16 if available")
     ap.add_argument("--xformers", action="store_true", help="enable xFormers attention")
@@ -425,6 +451,8 @@ def main():
     worker_count = max(1, worker_count)
     actual_mode = "replicated" if requested_mode == "replicated" and worker_count > 1 else "single"
 
+    revision = resolve_revision(args.model, args.revision, "model_index.json")
+    measurement_window = MeasurementWindow(mp.get_context("spawn"), worker_count)
     q: mp.Queue = mp.Queue(maxsize=worker_count)
     workers = []
     for device_index in range(worker_count):
@@ -446,6 +474,8 @@ def main():
                 prefer_bf16=args.bf16,
                 enable_xformers=args.xformers,
                 device_index=device_index,
+                revision=revision,
+                measurement_window=measurement_window,
             ),
             daemon=True,
         )
