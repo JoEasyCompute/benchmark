@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from benchmark_protocol import SEED, TIMING_METHOD
+from benchmark_protocol import SEED, TIMING_METHOD, runtime_gpu_name
 from energy import EnergySampler
 
 # Enable TensorFloat32 on Ampere/Lovelace for better speed without extra memory
@@ -189,7 +189,8 @@ def main():
         "tokens_per_step": tokens_per_step,
         "steps_per_sec": n / elapsed if elapsed > 0 else 0.0,
         "tokens_per_sec": tokens_per_sec(tokens_per_step, elapsed / n) if n else 0.0,
-        "gpu_name": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
+        "gpu_name": runtime_gpu_name(backend, local_rank, torch.cuda.get_device_name(device)) if torch.cuda.is_available() else "cpu",
+        "framework_gpu_name": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
         "time_s": elapsed,
         **energy,
     }

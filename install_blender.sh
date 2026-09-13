@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INSTALL_SYSTEM_DEPS=0
+if [[ "${1:-}" == "--install-system-deps" && $# -eq 1 ]]; then
+  INSTALL_SYSTEM_DEPS=1
+elif [[ $# -gt 0 ]]; then
+  echo "Usage: bash install_blender.sh [--install-system-deps]" >&2
+  exit 2
+fi
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "[BLENDER][ERROR] install_blender.sh currently supports Linux hosts only." >&2
   exit 1
+fi
+
+if [[ "$INSTALL_SYSTEM_DEPS" == "1" ]]; then
+  command -v apt-get >/dev/null 2>&1 || { echo "[BLENDER][ERROR] --install-system-deps requires apt-get." >&2; exit 1; }
+  command -v sudo >/dev/null 2>&1 || { echo "[BLENDER][ERROR] --install-system-deps requires sudo." >&2; exit 1; }
+  echo "[BLENDER] Installing runtime libraries required by the official Linux build"
+  sudo apt-get update
+  sudo apt-get install -y libsm6 libxrender1 libxi6 libxfixes3 libxkbcommon0 libgl1
 fi
 
 ARCH="$(uname -m)"
@@ -52,7 +68,15 @@ fi
 
 rm -rf "$TARGET_DIR"
 mv "$EXTRACTED_DIR" "$TARGET_DIR"
-ln -sfn "$TARGET_DIR/blender" "$BIN_DIR/blender"
+# The official binary uses RUNPATH=$ORIGIN/lib. A symlink in BIN_DIR changes
+# $ORIGIN to BIN_DIR, so use a wrapper that restores the installation's lib path.
+cat > "$BIN_DIR/blender" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export LD_LIBRARY_PATH="$TARGET_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$TARGET_DIR/blender" "\$@"
+EOF
+chmod 0755 "$BIN_DIR/blender"
 
 echo "[BLENDER] Installed Blender $BLENDER_VERSION"
 echo "[BLENDER] Binary: $BIN_DIR/blender"

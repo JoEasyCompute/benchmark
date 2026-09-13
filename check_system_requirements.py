@@ -2,6 +2,7 @@
 import argparse
 import importlib
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -15,6 +16,25 @@ except ModuleNotFoundError:
 from gpu_platform import blender_backend, detect_backend, system_tool
 REQUIRED_BINS = ("stdbuf", "tee", "hostname")
 OPTIONAL_BINS = ("lscpu", "free")
+
+
+def parse_missing_shared_libs(output):
+    missing = []
+    for line in output.splitlines():
+        if ' => not found' in line:
+            name = line.split(' => ', 1)[0].strip()
+            if name and name not in missing:
+                missing.append(name)
+    return missing
+
+
+def check_shared_libs(binary, runner=subprocess.run):
+    try:
+        result = runner(['ldd', binary], capture_output=True, text=True, timeout=15, check=False,
+                        env=dict(os.environ, LD_LIBRARY_PATH=str(Path(binary).resolve().parent / 'lib')))
+        return parse_missing_shared_libs(result.stdout + '\n' + result.stderr)
+    except (OSError, subprocess.SubprocessError):
+        return []
 
 
 def optional_capabilities(cfg, backend, importer=importlib.import_module):
@@ -131,16 +151,25 @@ def main():
         payload["checks"].append({"blender_backend": blender_backend(backend)})
 
         if blender_path:
-            try:
-                probe = subprocess.run([blender_path, '--background', '--factory-startup', '--python-expr',
-                    "import bpy; print('BENCH_CYCLES_AVAILABLE=' + str('cycles' in bpy.context.preferences.addons))"],
-                    capture_output=True, text=True, timeout=30, check=False)
-                cycles = probe.returncode == 0 and 'BENCH_CYCLES_AVAILABLE=True' in probe.stdout
-                payload['checks'].append({'blender_cycles_available': cycles})
-                if not cycles:
-                    payload['warnings'].append('Blender Cycles capability probe failed; render suite may fail')
-            except (OSError, subprocess.SubprocessError) as exc:
-                payload['warnings'].append(f'Blender capability probe unavailable: {type(exc).__name__}')
+            missing_libs = check_shared_libs(blender_path)
+            payload['checks'].append({'blender_missing_shared_libs': missing_libs})
+            if missing_libs:
+                message = 'Blender missing shared libraries: ' + ', '.join(missing_libs)
+                if blender_require_installed or blender_strict:
+                    payload['errors'].append(message)
+                else:
+                    payload['warnings'].append(message + '; Blender benchmark will be skipped')
+            else:
+                try:
+                    probe = subprocess.run([blender_path, '--background', '--factory-startup', '--python-expr',
+                        "import bpy; print('BENCH_CYCLES_AVAILABLE=' + str('cycles' in bpy.context.preferences.addons))"],
+                        capture_output=True, text=True, timeout=30, check=False)
+                    cycles = probe.returncode == 0 and 'BENCH_CYCLES_AVAILABLE=True' in probe.stdout
+                    payload['checks'].append({'blender_cycles_available': cycles})
+                    if not cycles:
+                        payload['warnings'].append('Blender Cycles capability probe failed; render suite may fail')
+                except (OSError, subprocess.SubprocessError) as exc:
+                    payload['warnings'].append(f'Blender capability probe unavailable: {type(exc).__name__}')
 
     if payload["errors"]:
         payload["status"] = "error"

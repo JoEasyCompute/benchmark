@@ -70,6 +70,12 @@ those checks. `run_all.sh` records an inventory and runtime plan in every normal
 the explicit resolver command is the safe path for changing an environment.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
 Blender is intentionally not installed by `env_setup.sh`; use [install_blender.sh](./install_blender.sh) if you want full-suite host setup.
+If the downloaded Blender binary reports missing desktop/X11 libraries, install
+them through the repository installer with `bash install_blender.sh --install-system-deps`.
+This is explicit because it uses `sudo apt-get` and changes host packages.
+The installer also creates a wrapper in `~/.local/bin/blender` that sets Blender's
+bundled `lib/` directory in `LD_LIBRARY_PATH`; this is required because a plain
+symlink breaks the binary's `$ORIGIN/lib` lookup.
 
 For a quick validation run, use:
 
@@ -995,6 +1001,7 @@ System requirements:
 - `check_system_requirements.py` verifies the Linux GPU host assumptions and required binaries such as `nvidia-smi` or `rocm-smi` and `stdbuf`.
 - Missing required host tools are a hard stop before benchmark execution begins.
 - If Blender is enabled and required, a missing `blender` is a hard stop. Optional checks cover Cycles, vision/kernel APIs, serving dependencies and power tooling.
+- Preflight runs `ldd` on Blender and reports missing shared objects before attempting a render.
 
 ## Blender Install
 

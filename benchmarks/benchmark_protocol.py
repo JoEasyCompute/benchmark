@@ -1,5 +1,6 @@
 """Shared measurement and workload controls, independent of GPU libraries."""
 import hashlib
+import json
 from pathlib import Path
 import re
 import time
@@ -7,6 +8,19 @@ import subprocess
 
 TIMING_METHOD = 'synchronized_v1'
 SEED = 1234
+
+
+def runtime_gpu_name(backend, index=0, fallback=None):
+    if backend == 'amd':
+        try:
+            raw = subprocess.check_output(['rocm-smi', '--showproductname', '--json'], text=True,
+                                          stderr=subprocess.DEVNULL, timeout=5)
+            card = json.loads(raw).get('card' + str(index), {})
+            if isinstance(card, dict):
+                return card.get('Card Series') or card.get('Device Name') or card.get('Card Model') or fallback
+        except Exception:
+            pass
+    return fallback
 
 
 class MeasurementWindow:

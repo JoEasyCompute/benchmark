@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from check_system_requirements import optional_capabilities
+from check_system_requirements import optional_capabilities, parse_missing_shared_libs
 
 
 class CapabilityTest(unittest.TestCase):
@@ -28,3 +28,8 @@ class CapabilityTest(unittest.TestCase):
         checks, warnings = optional_capabilities({'kernel_bench': {'enabled': True, 'cases': ['attention']}},
                                                 'amd', importer=load)
         self.assertTrue(any('scaled_dot_product_attention' in item for item in warnings))
+
+    def test_blender_missing_shared_objects_are_reported(self):
+        missing = parse_missing_shared_libs('libSM.so.6 => not found\nlibXrender.so.1 => /lib/xrender.so\n')
+        self.assertEqual(missing, ['libSM.so.6'])
+        self.assertEqual(parse_missing_shared_libs(''), [])

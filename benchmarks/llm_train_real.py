@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from benchmark_protocol import SEED, resolve_revision
+from benchmark_protocol import SEED, resolve_revision, runtime_gpu_name
 
 
 def supervised_tokens(batch_size, seq_len):
@@ -105,7 +105,8 @@ def run(cfg):
             steps_per_sec=steps/elapsed, time_s=elapsed, final_loss=float(loss.detach()),
             correctness_passed=True, optimizer='AdamW', learning_rate=learning_rate,
             weight_decay=weight_decay, adam_epsilon=epsilon, adam_betas=[0.9, 0.999],
-            allow_tf32=False, gpu_name=torch.cuda.get_device_name(device),
+            allow_tf32=False, gpu_name=runtime_gpu_name(backend, 0, torch.cuda.get_device_name(device)),
+            framework_gpu_name=torch.cuda.get_device_name(device),
             peak_memory_bytes=torch.cuda.max_memory_allocated(device),
             **energy)
         if metric.get('energy_j'):

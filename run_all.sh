@@ -380,6 +380,20 @@ jsonl_line_count () {
   fi
 }
 
+last_suite_status () {
+  local fp="$1" suite="$2"
+  if [[ ! -f "$fp" ]]; then echo missing; return; fi
+  python3 - "$fp" "$suite" <<'PY'
+import json, sys
+rows=[]
+for line in open(sys.argv[1]):
+    if line.strip():
+        row=json.loads(line)
+        if row.get('suite') == sys.argv[2]: rows.append(row)
+print(rows[-1].get('status', 'unknown') if rows else 'missing')
+PY
+}
+
 annotate_jsonl_rows () {
   local fp="$1" start_line="$2" suite="$3" repeat_index="$4" repeat_count="$5"
   python3 - "$fp" "$start_line" "$suite" "$repeat_index" "$repeat_count" <<'PY'
@@ -510,6 +524,10 @@ if [[ "$LLM_TRAIN_REAL_ENABLED" == "1" ]]; then
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     run_and_log_allow_fail "llm_train_real_r${rep}" python3 "$BENCH_DIR/llm_train_real.py" --config "$RUN_CONFIG_PATH"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_train_real" "$rep" "$REPEAT_COUNT"
+    if [[ "$(last_suite_status "$RUN_DIR/results/metrics.jsonl" llm_train_real)" == "failed" ]]; then
+      echo "[WARN] llm_train_real failed; stopping remaining repeats for this deterministic workload"
+      break
+    fi
   done
 fi
 

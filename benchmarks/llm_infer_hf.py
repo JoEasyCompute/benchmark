@@ -17,7 +17,7 @@ from energy import EnergySampler, aggregate_energy
 
 from benchmark_protocol import (MeasurementWindow, SEED, TIMING_METHOD,
                                 fixed_generation_kwargs, resolve_revision,
-                                text_hash, timed_call)
+                                runtime_gpu_name, text_hash, timed_call)
 
 try:
     import torch
@@ -210,7 +210,8 @@ def write_skip_row(cfg, batch_size: int, tensor_parallel: int, reason: str, deta
         "tensor_parallel": tensor_parallel,
         "prompt_len": int(cfg.get("prompt_len", 512)),
         "output_len": int(cfg.get("output_len", 128)),
-        "gpu_name": detect_gpu_name(),
+        "gpu_name": runtime_gpu_name(detect_backend(), device_index, detect_gpu_name()),
+        "framework_gpu_name": detect_gpu_name(),
         "detail": detail,
     }
     write_metric(row)
