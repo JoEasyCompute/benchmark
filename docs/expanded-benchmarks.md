@@ -107,7 +107,8 @@ HBM bandwidth. Kernel results appear in diagnostic tables, not application picks
 
 ## Blender
 
-`blender_bench_cuda.sh` delegates to `blender_render.py`. Blender executes a blocking
+`blender_bench_cuda.sh` delegates to `blender_render.py`. The installer defaults to
+Blender 4.5.12, which includes Cycles AMD RDNA4 support. Blender executes a blocking
 `bpy.ops.render.render(write_still=False)` call. `time_s` and `render_time_s` cover
 that call, including scene setup/compilation done internally by the render
 operator; they are not pure GPU-kernel time. `end_to_end_time_s` covers the process,

@@ -1012,8 +1012,8 @@ bash install_blender.sh
 ```
 
 Defaults:
-- Blender version: `4.2.18`
-- install root: `~/.local/opt/blender-4.2.18`
+- Blender version: `4.5.12` (default; required for AMD RDNA4/R9700-class Cycles support)
+- install root: `~/.local/opt/blender-4.5.12`
 - symlink: `~/.local/bin/blender`
 
 `run_all.sh` prepends `~/.local/bin` and `~/bin` to `PATH`, and `check_system_requirements.py` also checks those locations directly, so the installed Blender binary is discoverable even in non-login shell sessions.
@@ -1021,14 +1021,15 @@ Defaults:
 Example with explicit version:
 
 ```bash
-BLENDER_VERSION=4.2.18 bash install_blender.sh
+BLENDER_VERSION=4.5.12 bash install_blender.sh
 ```
 
 The installer downloads Blender from the official archive:
-- `https://download.blender.org/release/Blender4.2/blender-4.2.18-linux-x64.tar.xz`
+- `https://download.blender.org/release/Blender4.5/blender-4.5.12-linux-x64.tar.xz`
 
 Recommended practice:
 - use the same Blender version on every benchmark host
+- use Blender 4.4 or newer for AMD RDNA4/Radeon AI PRO R9700/R9700S cards; Blender 4.2 does not list RX 90x0 support
 - set `blender.require_installed: true` once Blender is part of your required comparison suite
 
 Post-run validation:
