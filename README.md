@@ -41,6 +41,33 @@ On the first run, `run_all.sh` bootstraps `.venv` automatically by invoking `env
 It first makes YAML configuration readable when necessary, probes responding GPU
 devices, and selects the CUDA or ROCm installation path. You do not need to change
 `gpu_backend: auto` when moving between NVIDIA-only and AMD-only hosts.
+For the stricter driver/architecture-aware package resolver and post-install checks,
+see [Runtime compatibility](docs/runtime-compatibility.md). The normal runner records
+the inspection and plan; use the resolver's `--install` mode in a new virtual
+environment when changing framework versions.
+
+For driver/architecture-aware environment setup, inspect and resolve the host first:
+
+```bash
+python3 inspect_runtime.py --backend auto --json-out host_inventory.json
+python3 runtime_resolver.py --host-json host_inventory.json --json-out runtime_plan.json
+```
+
+The resolver selects a complete pinned profile from the detected GPU architecture,
+driver/runtime, OS, kernel and Python ABI. It stops when the host is outside the
+published compatibility matrix. To run an experimental installation after reviewing
+the warning, use `--allow-unverified-host`; it never changes drivers or kernels:
+
+```bash
+python3 runtime_resolver.py --host-json host_inventory.json \
+  --allow-unverified-host --install --venv .venv-rocm72
+```
+
+The installation writes `runtime-lock.json` and runs `verify_runtime.py`, which
+checks package identity, a known 2×2 GPU matmul on every visible card, and optional
+multi-GPU all-reduce. Keep the existing `.venv` until this new environment passes
+those checks. `run_all.sh` records an inventory and runtime plan in every normal run;
+the explicit resolver command is the safe path for changing an environment.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
 Blender is intentionally not installed by `env_setup.sh`; use [install_blender.sh](./install_blender.sh) if you want full-suite host setup.
 

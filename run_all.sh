@@ -15,6 +15,7 @@ BACKEND_OVERRIDE=""
 GPU_OVERRIDE=""
 GPU_OVERRIDE_SET=0
 DRY_RUN=0
+ALLOW_UNVERIFIED_HOST=0
 
 # Include common user-local bin directories so host-level tools installed by
 # helper scripts are discoverable even in non-login shells.
@@ -25,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       cat <<'HELP'
 Usage: bash run_all.sh [--config PATH] [--backend auto|nvidia|amd]
-                      [--gpus 0,1] [--baseline] [--smoke] [--dry-run]
+                      [--gpus 0,1] [--baseline] [--smoke] [--dry-run] [--allow-unverified-host]
 
 Defaults to config.yaml and automatic backend selection when gpu_backend is auto.
 --config PATH  Read a sample/custom config without copying it over config.yaml.
@@ -34,6 +35,7 @@ Defaults to config.yaml and automatic backend selection when gpu_backend is auto
 --baseline     Use one detected/selected GPU and five repeats.
 --smoke        Reduce enabled workloads and use one repeat.
 --dry-run      Print resolved config; do not install the GPU stack or run workloads.
+--allow-unverified-host  Continue when OS/kernel is outside the published runtime matrix.
 HELP
       exit 0
       ;;
@@ -51,6 +53,10 @@ HELP
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --allow-unverified-host)
+      ALLOW_UNVERIFIED_HOST=1
       shift
       ;;
     --baseline)
@@ -228,6 +234,17 @@ if [[ "$SMOKE_MODE" == "1" ]]; then
   echo "[INFO] Smoke mode enabled"
 fi
 REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path repeat --default '1' --format text)"
+
+# Capture the inspected host and resolve a concrete, vendor-compatible runtime profile.
+HOST_INVENTORY="$RUN_DIR/host_inventory.json"
+python3 "$BASE_DIR/inspect_runtime.py" --backend "$GPU_BACKEND" --gpus "$SELECTED_GPU_CSV" --json-out "$HOST_INVENTORY" || true
+RUNTIME_PLAN="$RUN_DIR/runtime_plan.json"
+resolver_flags=(--host-json "$HOST_INVENTORY" --json-out "$RUNTIME_PLAN")
+if [[ "$ALLOW_UNVERIFIED_HOST" == "1" ]]; then resolver_flags+=(--allow-unverified-host); fi
+if ! python3 "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}" >/dev/null; then
+  echo "[ERROR] Runtime compatibility blocked; inspect $RUNTIME_PLAN" >&2
+  exit 1
+fi
 LLM_INFER_WARMUP_S=5
 LLM_INFER_DURATION_S=30
 SD_ITERATIONS=5
