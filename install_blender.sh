@@ -70,6 +70,7 @@ rm -rf "$TARGET_DIR"
 mv "$EXTRACTED_DIR" "$TARGET_DIR"
 # The official binary uses RUNPATH=$ORIGIN/lib. A symlink in BIN_DIR changes
 # $ORIGIN to BIN_DIR, so use a wrapper that restores the installation's lib path.
+rm -f "$BIN_DIR/blender"
 cat > "$BIN_DIR/blender" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
