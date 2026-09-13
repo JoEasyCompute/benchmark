@@ -31,6 +31,8 @@ class InspectRuntimeTests(unittest.TestCase):
                 output = json.dumps(products)
             elif '--showdriverversion' in args:
                 output = json.dumps({'system': {'Driver version': '6.16.13'}})
+            elif '--version' in args:
+                output = 'ROCM-SMI version: 4.0.0+6b0e43f3\nROCM-SMI-LIB version: 7.8.0'
             elif args[0] == 'modinfo':
                 output = '7.1.3.31500000'
             return subprocess.CompletedProcess(args, 0, output, '')
@@ -55,6 +57,8 @@ class InspectRuntimeTests(unittest.TestCase):
         self.assertEqual(result['rocm_version'], '7.2.0')
         self.assertEqual(result['amdgpu_module_version'], '7.1.3.31500000')
         self.assertEqual(result['amdgpu_driver_version'], '6.16.13')
+        self.assertEqual(result['rocm_smi_version'], '4.0.0+6b0e43f3')
+        self.assertEqual(result['rocm_smi_lib_version'], '7.8.0')
         self.assertEqual(result['os_release'], '24.04.3')
         self.assertEqual(result['python_version'], '3.12.3')
         self.assertEqual(result['glibc_version'], '2.39')
@@ -82,6 +86,18 @@ class InspectRuntimeTests(unittest.TestCase):
         gpus = inspect_runtime.parse_amd('{"card3":{"Card Series":"AMD GPU"}}')
         self.assertEqual(gpus[0]['index'], '3')
         self.assertIsNone(gpus[0]['architecture'])
+
+    def test_new_therock_core_layout_is_detected(self):
+        with patch('inspect_runtime.Path.read_text', side_effect=['ID=ubuntu\nVERSION_ID="24.04"', '', '10.0.0', '']), \
+                patch('inspect_runtime.platform.system', return_value='Linux'), \
+                patch('inspect_runtime.platform.machine', return_value='x86_64'), \
+                patch('inspect_runtime.platform.release', return_value='6.8.0'), \
+                patch('inspect_runtime.platform.python_version', return_value='3.12.3'), \
+                patch('inspect_runtime.platform.libc_ver', return_value=('glibc', '2.39')), \
+                patch('inspect_runtime.subprocess.run', return_value=subprocess.CompletedProcess([], 0, '{}', '')), \
+                patch('inspect_runtime.importlib.metadata.version', return_value='1.0'):
+            result = inspect_runtime.collect_host('amd')
+        self.assertEqual(result['rocm_version'], '10.0.0')
 
 
 if __name__ == '__main__':

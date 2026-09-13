@@ -14,7 +14,7 @@ from inspect_runtime import collect_host
 
 CATALOG_VERSION = '2026-09-13.1'
 COMMON = {'transformers': '4.57.0', 'diffusers': '0.29.2', 'accelerate': '1.10.1', 'numpy': '1.26.4'}
-PROFILE_IDS = ('torch291-cu128', 'torch291-cu126', 'torch291-rocm72')
+PROFILE_IDS = ('torch291-cu128', 'torch291-cu126', 'torch291-rocm72', 'existing-torch28-rocm64-compat')
 SOURCES = {
     'torch': 'https://pytorch.org/get-started/previous-versions/#v291',
     'cuda128': 'https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html',
@@ -54,6 +54,10 @@ def make_profile(identifier, python_version):
         return dict(id=identifier, backend='amd', torch_version='2.9.1', runtime_version='7.2', rocm_release='7.2.0',
                     expected_packages=expected, core_install=dict(packages=urls),
                     sources=[SOURCES['amd'], SOURCES['amd_matrix']])
+    if identifier == 'existing-torch28-rocm64-compat':
+        return dict(id=identifier, backend='amd', torch_version='2.8.0', runtime_version='10.0',
+                    expected_packages={}, core_install={'packages': []},
+                    sources=[SOURCES['amd_matrix']], experimental=True)
     raise ValueError(f'Unknown runtime profile {identifier!r}; choose auto or one of {PROFILE_IDS}')
 
 
@@ -78,7 +82,11 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
         newer_arch = any(gpu.get('architecture') in ('sm_100', 'sm_101', 'sm_120', 'sm_121') for gpu in gpus)
         profile = 'torch291-cu128' if newer_arch or all(d and d >= (570, 26, 0) for d in drivers) else 'torch291-cu126'
     elif profile == 'auto' and backend == 'amd':
-        profile = 'torch291-rocm72'
+        installed_torch = str((host.get('installed_packages') or {}).get('torch') or '')
+        if version(host.get('rocm_version')) and version(host.get('rocm_version'))[0] >= 10 and installed_torch.startswith('2.8.0+rocm6.4'):
+            profile = 'existing-torch28-rocm64-compat'
+        else:
+            profile = 'torch291-rocm72'
     if profile != 'auto':
         try:
             candidate = make_profile(profile, host.get('python_version'))
@@ -97,7 +105,10 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
             if gpu.get('architecture') not in supported:
                 errors.append(f"GPU {gpu.get('index')}: architecture {gpu.get('architecture')} is not covered by {candidate['id']}.")
     elif candidate and backend == 'amd':
-        if version(host.get('rocm_version')) != (7, 2, 0):
+        rocm = version(host.get('rocm_version'))
+        if candidate.get('experimental'):
+            host_exceptions.append('Existing Torch 2.8/ROCm 6.4 wheel build is running against a ROCm 10 user-space stack; this compatibility profile is experimental and requires numerical validation.')
+        elif rocm != (7, 2, 0):
             errors.append('This Radeon bundle is qualified against ROCm 7.2.0; no automatic fallback from another ROCm release.')
         if not host.get('amdgpu_module_version') and not any(gpu.get('driver_version') for gpu in gpus):
             errors.append('Cannot identify the loaded AMDGPU driver/module.')

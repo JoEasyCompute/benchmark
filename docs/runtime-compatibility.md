@@ -13,12 +13,22 @@ Current curated profiles:
 | `torch291-cu128` | NVIDIA Blackwell or modern NVIDIA with driver ≥570.26 | PyTorch 2.9.1 CUDA 12.8, torchvision 0.24.1, torchaudio 2.9.1 | Curated from PyTorch’s 2.9.1 matrix |
 | `torch291-cu126` | NVIDIA Ada/older supported NVIDIA with driver ≥560.28 | PyTorch 2.9.1 CUDA 12.6, torchvision 0.24.1, torchaudio 2.9.1 | Curated from PyTorch’s 2.9.1 matrix |
 | `torch291-rocm72` | AMD Radeon/Radeon AI Pro on ROCm 7.2, Ubuntu 22.04/24.04 and matching Python ABI | AMD’s versioned ROCm 7.2.0 Torch 2.9.1, torchvision 0.24.0, torchaudio 2.9.0, Triton 3.5.1 wheels | Curated from AMD’s published Radeon wheels |
+| `existing-torch28-rocm64-compat` | Existing Torch 2.8 ROCm 6.4 wheels on an AMD host exposing a newer TheRock runtime | No installation; validates the existing environment only | Experimental compatibility profile |
 
 The resolver selects `cu128` for Blackwell architectures such as `sm_120` when
 the driver meets its conservative floor, and `cu126` for Ada `sm_89` when a
 12.8 driver is unavailable. NVIDIA documents CUDA 12.x minor-version compatibility
 from driver 525 upward, but the resolver uses stricter profile floors to keep
 framework support explicit.
+
+AMD installations using the newer TheRock layout may expose `/opt/rocm` as
+`/opt/rocm/core-10.0` while `hipconfig` and `amdgpu` report different component
+versions. The inspector records the core, HIP, SMI library, SMI CLI, kernel module
+and package versions separately. If such a host already has a Torch 2.8 ROCm 6.4
+wheel build, the resolver selects the experimental compatibility profile so a
+benchmark can be run after review without pretending that the wheel and user-space
+runtime were built as one qualified release. Use a fresh ROCm 7.2/2.9.1 environment
+for a release-matched comparison.
 
 For AMD, the R9700/R9700S `gfx1201` architecture is covered by the ROCm 7.2 matrix.
 The inspected server `ezc-amdtest-7v13-47` reports Ubuntu 24.04.3, kernel

@@ -79,3 +79,12 @@ class RuntimeResolverTest(unittest.TestCase):
             host = nvidia_host()
             host['gpus'][0][field] = None
             self.assertEqual(resolve_runtime(host)['status'], 'blocked')
+
+    def test_existing_torch28_on_rocm10_is_explicitly_experimental(self):
+        host = amd_host('6.8.0-139-generic')
+        host['rocm_version'] = '10.0.0'
+        host['installed_packages'] = {'torch': '2.8.0+rocm6.4'}
+        plan = resolve_runtime(host, allow_unverified_host=True)
+        self.assertEqual(plan['profile']['id'], 'existing-torch28-rocm64-compat')
+        self.assertEqual(plan['status'], 'compatible_with_warnings')
+        self.assertTrue(plan['profile']['experimental'])

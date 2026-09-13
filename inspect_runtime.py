@@ -136,10 +136,18 @@ def collect_host(backend='auto', gpu_ids=None):
         gpus = [by_index[index] for index in requested]
     result['gpus'] = gpus
     if backend == 'amd':
-        result['rocm_version'] = read('/opt/rocm/.info/version') or None
+        result['rocm_version'] = (read('/opt/rocm/.info/version')
+                                  or read('/opt/rocm/core-10.0/.info/version')
+                                  or read('/opt/rocm-7.2.0/core-10.0/.info/version')
+                                  or None)
         if not result['rocm_version']:
             result['rocm_version'] = run(['dpkg-query', '-W', '-f=${Version}', 'rocm-core']) or None
         result['amdgpu_module_version'] = run(['modinfo', '-F', 'version', 'amdgpu']) or None
+        smi_version = run(['rocm-smi', '--version'])
+        match = re.search(r'ROCM-SMI version:\s*([^\s]+)', smi_version)
+        lib_match = re.search(r'ROCM-SMI-LIB version:\s*([^\s]+)', smi_version)
+        result['rocm_smi_version'] = match.group(1) if match else None
+        result['rocm_smi_lib_version'] = lib_match.group(1) if lib_match else None
         result['amdgpu_driver_version'] = None
         raw = run(['rocm-smi', '--showdriverversion', '--json'])
         try:
