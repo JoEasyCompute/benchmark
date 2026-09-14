@@ -1,0 +1,97 @@
+# AMD example. Workload settings match the other vendor examples.
+gpu_backend: amd
+
+# Matched, conservative example: all suite families enabled.
+# Select eight GPUs with --gpus 0,1,2,3,4,5,6,7.
+gpu_include: []
+repeat: 5
+results_dir: results
+
+preflight:
+  machine_state_strict: false
+  blender_strict: false
+
+llm_train:
+  enabled: true
+  dtype: bf16
+  world_sizes: [1, 2, 4, 8]
+  hidden_size: 1024
+  n_layers: 12
+  n_heads: 16
+  seq_len: 512
+  batch_size: 4
+  steps: 100
+  pair_selection:
+    enabled: false
+    strategy: benchmark
+    probe_steps: 10
+    candidate_limit: 0
+
+llm_train_real:
+  enabled: true
+  model: Qwen/Qwen2.5-0.5B
+  revision: main
+  dtype: fp16
+  seq_len: 512
+  batch_size: 2
+  steps: 20
+  warmup_steps: 2
+
+llm_infer:
+  enabled: true
+  backend: transformers
+  model: Qwen/Qwen3-8B
+  dtype: float16
+  prompt_len: 512
+  output_len: 128
+  batch_sizes: [1, 4]
+  tensor_parallel_sizes: [1]
+  multi_gpu_mode: replicated
+
+sd_infer:
+  enabled: true
+  model: stable-diffusion-v1-5/stable-diffusion-v1-5
+  steps: 20
+  sizes: [512]
+  per_gpu_batch: 1
+  multi_gpu_mode: replicated
+  emit_worker_rows: false
+
+vision_infer:
+  enabled: true
+  model: resnet18
+  weights: ResNet18_Weights.IMAGENET1K_V1
+  dtype: float32
+  modes: [throughput, latency]
+  batch_sizes: [1, 8]
+  sizes: [224]
+  iterations: 50
+  warmup: 5
+
+kernel_bench:
+  enabled: true
+  cases: [gemm, attention, memory]
+  size: 2048
+  dtype: float32
+  iterations: 20
+  warmup: 3
+  heads: 8
+  head_dim: 64
+
+llm_serve:
+  enabled: true
+  provider: transformers
+  endpoint: ""
+  model: Qwen/Qwen2.5-0.5B
+  dtype: float16
+  concurrency: [1, 4]
+  duration: 30
+  warmup: 1
+  timeout: 120
+  output_len: 32
+
+blender:
+  enabled: true
+  require_installed: false
+  backend: auto
+  scenes: []

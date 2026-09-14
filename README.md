@@ -124,6 +124,9 @@ to see all supported switches.
 | [configs/auto.yaml](configs/auto.yaml) | Detect NVIDIA or AMD; all suite families enabled |
 | [configs/nvidia.yaml](configs/nvidia.yaml) | Require NVIDIA, with the same workloads |
 | [configs/amd.yaml](configs/amd.yaml) | Require AMD, with the same workloads |
+| [configs/auto-8gpu.yaml](configs/auto-8gpu.yaml) | Detect either vendor; eight-GPU scaling profile |
+| [configs/nvidia-8gpu.yaml](configs/nvidia-8gpu.yaml) | NVIDIA eight-GPU scaling profile |
+| [configs/amd-8gpu.yaml](configs/amd-8gpu.yaml) | AMD eight-GPU scaling profile |
 
 The examples differ only in their backend selector. Detection selects devices,
 the visibility environment variable, Blender CUDA/HIP and the compatible Python
@@ -149,6 +152,18 @@ explicit `--backend`, and if neither responds it reports a driver/tooling error.
 NVIDIA indices are translated to UUIDs for execution so CUDA enumeration order
 cannot silently select another card. AMD selection uses HIP device indices.
 See [sample configuration details](configs/README.md) for precedence and limitations.
+
+The `*-8gpu.yaml` profiles set synthetic training world sizes to `[1, 2, 4, 8]`
+and enable replicated LLM inference and Stable Diffusion workers. Select the
+profile directly at runtime; no YAML editing is required:
+
+```bash
+./run_all.sh --config configs/amd-8gpu.yaml --gpus 0,1,2,3,4,5,6,7 --smoke --allow-unverified-host
+./run_all.sh --config configs/amd-8gpu.yaml --gpus 0,1,2,3,4,5,6,7 --allow-unverified-host
+```
+
+The base `auto.yaml`, `amd.yaml`, and `nvidia.yaml` files remain single-GPU
+workload profiles. `--baseline` additionally forces one GPU and five repeats.
 
 ## Recommended Run Procedure
 
