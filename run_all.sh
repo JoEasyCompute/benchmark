@@ -100,7 +100,7 @@ ensure_python_env() {
   local backend="$1"
   if ! python_env_ready "$py_bin" "$backend"; then
     echo "[SETUP] Installing/repairing the $backend Python stack"
-    VENV_DIR="$VENV_DIR" GPU_BACKEND="$backend" bash "$ENV_SETUP_SCRIPT"
+    VENV_DIR="$VENV_DIR" GPU_BACKEND="$backend" ALLOW_UNVERIFIED_HOST="$ALLOW_UNVERIFIED_HOST" bash "$ENV_SETUP_SCRIPT"
   fi
   if ! python_env_ready "$py_bin" "$backend"; then
     echo "[ERROR] The Python environment does not provide the selected $backend stack after setup" >&2
@@ -243,6 +243,14 @@ resolver_flags=(--host-json "$HOST_INVENTORY" --json-out "$RUNTIME_PLAN")
 if [[ "$ALLOW_UNVERIFIED_HOST" == "1" ]]; then resolver_flags+=(--allow-unverified-host); fi
 if ! python3 "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}" >/dev/null; then
   echo "[ERROR] Runtime compatibility blocked; inspect $RUNTIME_PLAN" >&2
+  exit 1
+fi
+# Host acknowledgement never bypasses the package, device, or arithmetic checks.
+RUNTIME_VALIDATION="$RUN_DIR/runtime_validation.json"
+echo "[RUNTIME] Checking packages and arithmetic on all $VISIBLE_GPU_COUNT selected GPU(s)"
+if ! python3 "$BASE_DIR/verify_runtime.py" --lock "$RUNTIME_PLAN" --distributed \
+    --json-out "$RUNTIME_VALIDATION" >"$RUN_DIR/logs/runtime_validation.log" 2>&1; then
+  echo "[ERROR] Runtime validation failed; inspect $RUNTIME_VALIDATION and $RUN_DIR/logs/runtime_validation.log" >&2
   exit 1
 fi
 LLM_INFER_WARMUP_S=5

@@ -55,7 +55,7 @@ def make_profile(identifier, python_version):
                     expected_packages=expected, core_install=dict(packages=urls),
                     sources=[SOURCES['amd'], SOURCES['amd_matrix']])
     if identifier == 'existing-torch28-rocm64-compat':
-        return dict(id=identifier, backend='amd', torch_version='2.8.0', runtime_version='10.0',
+        return dict(id=identifier, backend='amd', torch_version='2.8.0', runtime_version='6.4',
                     expected_packages={}, core_install={'packages': []},
                     sources=[SOURCES['amd_matrix']], experimental=True)
     raise ValueError(f'Unknown runtime profile {identifier!r}; choose auto or one of {PROFILE_IDS}')
@@ -107,6 +107,10 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
     elif candidate and backend == 'amd':
         rocm = version(host.get('rocm_version'))
         if candidate.get('experimental'):
+            observed = host.get('installed_packages') or {}
+            if not re.fullmatch(r'2\.8\.0\+rocm6\.4(?:[.a-zA-Z0-9_-]*)', str(observed.get('torch') or '')):
+                errors.append('Existing runtime profile requires an installed Torch 2.8.0+rocm6.4 build.')
+            candidate['expected_packages'] = {name: value for name, value in observed.items() if value}
             host_exceptions.append('Existing Torch 2.8/ROCm 6.4 wheel build is running against a ROCm 10 user-space stack; this compatibility profile is experimental and requires numerical validation.')
         elif rocm != (7, 2, 0):
             errors.append('This Radeon bundle is qualified against ROCm 7.2.0; no automatic fallback from another ROCm release.')
@@ -153,6 +157,8 @@ def package_inventory():
 
 
 def install_commands(profile, python):
+    if profile.get('experimental'):
+        raise ValueError('Existing experimental profiles are validation-only; they cannot install a new runtime.')
     core = profile['core_install']
     commands = [[python, '-m', 'pip', 'install', '--upgrade', 'pip', 'wheel']]
     core_args = ['--index-url', core['index_url']] if core.get('index_url') else []
@@ -212,9 +218,12 @@ def main():
         parser.exit(2, '[RUNTIME][ERROR] Target venv Python differs from the resolved wheel ABI. Run setup using the target interpreter.\n')
     lock = target / 'runtime-lock.json'
     lock.write_text(json.dumps(plan, indent=2) + '\n')
-    print(f"[RUNTIME] Installing {plan['profile']['id']} into {target}", flush=True)
-    for command in install_commands(plan['profile'], python):
-        subprocess.run(command, check=True)
+    if plan['profile'].get('experimental'):
+        print(f"[RUNTIME] Retaining existing experimental packages in {target}; validating without installation", flush=True)
+    else:
+        print(f"[RUNTIME] Installing {plan['profile']['id']} into {target}", flush=True)
+        for command in install_commands(plan['profile'], python):
+            subprocess.run(command, check=True)
     verification = [python, str(Path(__file__).with_name('verify_runtime.py')), '--lock', str(lock),
                     '--json-out', str(target / 'runtime-validation.json')]
     if args.distributed:

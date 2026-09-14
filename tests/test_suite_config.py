@@ -42,3 +42,23 @@ class SuiteConfigTest(unittest.TestCase):
 
     def test_disabled_suites_produce_no_jobs(self):
         self.assertEqual(optional_jobs({}), [])
+
+    def test_measurement_duration_defaults_and_override_reach_commands(self):
+        jobs = optional_jobs({'vision_infer': {'enabled': True},
+                              'kernel_bench': {'enabled': True, 'min_duration_s': 7}})
+        for job in jobs:
+            args = job['args']
+            value = args[args.index('--min-duration-s') + 1]
+            self.assertEqual(float(value), 5 if job['suite'] == 'vision_infer' else 7)
+
+    def test_invalid_measurement_durations_are_rejected(self):
+        for suite in ('vision_infer', 'kernel_bench'):
+            for value in (-1, float('nan'), float('inf'), True, '5', 3601):
+                with self.subTest(suite=suite, value=value):
+                    self.assertTrue(validate_optional_suites({suite: {'min_duration_s': value}}))
+
+    def test_smoke_disables_measurement_time_minimum(self):
+        cfg = {suite: {'enabled': True} for suite in ('vision_infer', 'kernel_bench')}
+        smoke_optional_suites(cfg)
+        for suite in cfg:
+            self.assertEqual(cfg[suite]['min_duration_s'], 0)

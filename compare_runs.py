@@ -64,14 +64,16 @@ SUITE_KEY_FIELDS = {
     ),
     "vision_infer": ("model", "weights", "weights_sha256", "model_revision", "torchvision_version",
                      "preprocessing_sha256", "input_sha256", "input_size", "dtype", "mode",
-                     "batch_size", "seed", "timing_method"),
-    "kernel_bench": ("case", "size", "dtype", "heads", "head_dim", "work_convention", "seed", "timing_method"),
+                     "batch_size", "iterations", "min_duration_s", "seed", "timing_method"),
+    "kernel_bench": ("case", "size", "dtype", "heads", "head_dim", "work_convention", "iterations", "min_duration_s", "seed", "timing_method"),
     "llm_serve": ("provider", "model", "model_revision", "tokenizer_revision", "dtype", "concurrency",
                   "prompt_sha256", "prompt_len", "output_len", "generation_protocol",
                   "scheduling_protocol", "seed", "timing_method"),
     "llm_train_real": ("model", "model_revision", "dtype", "seq_len", "batch_size", "world_size",
                        "objective", "data_protocol", "optimizer", "learning_rate", "weight_decay",
-                       "adam_epsilon", "adam_betas", "allow_tf32", "seed", "timing_method"),
+                       "adam_epsilon", "adam_betas", "allow_tf32", "seed", "timing_method",
+                       "training_precision_protocol", "parameter_dtype", "gradient_scaling",
+                       "max_overflow_retries"),
 }
 SUITE_KEY_FIELDS['blender'] += ('blender_version', 'render_settings_sha256')
 

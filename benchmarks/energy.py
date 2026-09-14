@@ -1,7 +1,10 @@
 """Board energy from timestamped samples; unavailable telemetry stays missing."""
+import ctypes
 import json
 import math
 import os
+from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -15,6 +18,46 @@ def physical_devices(backend, indices, environ=None):
     raw = env.get(key, env.get('CUDA_VISIBLE_DEVICES') if backend == 'amd' else None)
     visible = raw.split(',') if raw is not None else None
     return [visible[i].strip() if visible is not None else str(i) for i in indices]
+
+
+def hip_pci_devices(indices):
+    """Resolve logical ordinals using the HIP library already used by the workload.
+
+    Loading a different system HIP runtime could apply a different visibility/order
+    policy. If no unique loaded runtime can be identified, telemetry stays missing.
+    """
+    try:
+        paths = {line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines()
+                 if '/libamdhip64.so' in line and line.split()[-1].startswith('/')}
+        if len(paths) != 1:
+            return None
+        runtime = ctypes.CDLL(paths.pop())
+        query = runtime.hipDeviceGetPCIBusId
+        query.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        query.restype = ctypes.c_int
+        buses = []
+        for index in indices:
+            bus = ctypes.create_string_buffer(32)
+            if query(bus, len(bus), index) != 0:
+                return None
+            buses.append(bus.value.decode('ascii').lower())
+        return buses
+    except (OSError, AttributeError, ValueError, UnicodeError):
+        return None
+
+
+def match_rocm_devices(buses, payload):
+    if not buses or not isinstance(payload, dict):
+        return None
+    devices = []
+    for bus in buses:
+        matches = [name[4:] for name, card in payload.items()
+                   if re.fullmatch(r'card[0-9]+', name) and isinstance(card, dict)
+                   and str(card.get('PCI Bus', '')).strip().lower() == bus.lower()]
+        if len(matches) != 1:
+            return None
+        devices.append(matches[0])
+    return devices if len(set(devices)) == len(devices) else None
 
 
 def parse_rocm_power(payload, device_ids):
@@ -64,7 +107,11 @@ class EnergySampler:
         if interval_s <= 0:
             raise ValueError('Power interval must be positive')
         self.backend, self.interval = backend, interval_s
-        self.device_ids = physical_devices(backend, device_indices or [0])
+        self.device_indices = device_indices if device_indices is not None else [0]
+        self.device_ids = ([] if backend == 'amd' else
+                           physical_devices(backend, self.device_indices))
+        self.mapping_verified = backend != 'amd'
+        self.unavailable_reason = None
         self.samples = []
         self._stop = threading.Event()
         self._thread = None
@@ -75,6 +122,8 @@ class EnergySampler:
     def _read(self):
         try:
             if self.backend == 'amd':
+                if not self.mapping_verified:
+                    return None
                 raw = subprocess.check_output(['rocm-smi', '--showpower', '--json'], text=True,
                                               stderr=subprocess.DEVNULL, timeout=2)
                 return parse_rocm_power(json.loads(raw), self.device_ids)
@@ -102,6 +151,19 @@ class EnergySampler:
     def start(self):
         if hasattr(self, 'started'):
             raise RuntimeError('EnergySampler is single-use')
+        if self.backend == 'amd':
+            try:
+                buses = hip_pci_devices(self.device_indices)
+                raw = subprocess.check_output(['rocm-smi', '--showbus', '--json'], text=True,
+                                              stderr=subprocess.DEVNULL, timeout=2) if buses else '{}'
+                devices = match_rocm_devices(buses, json.loads(raw))
+                self.mapping_verified = devices is not None
+                self.device_ids = devices or []
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self.mapping_verified = False
+                self.device_ids = []
+            if not self.mapping_verified:
+                self.unavailable_reason = 'unverified_hip_to_smi_pci_mapping'
         if self.backend == 'nvidia':
             try:
                 import pynvml
@@ -127,6 +189,13 @@ class EnergySampler:
             self._thread.join()
         self._sample()
         energy, coverage = integrate_samples(self.samples, started, ended, self.interval*3)
+        in_window = sum(started <= t <= ended and watts is not None
+                        and math.isfinite(watts) and watts >= 0 for t, watts in self.samples)
+        if in_window < 3:
+            energy = None
+            self.unavailable_reason = self.unavailable_reason or 'insufficient_in_window_samples'
+        elif energy is None:
+            self.unavailable_reason = self.unavailable_reason or 'incomplete_power_coverage'
         if self._nvml is not None:
             try:
                 self._nvml.nvmlShutdown()
@@ -136,6 +205,7 @@ class EnergySampler:
                            power_sampler_available=energy is not None, energy_method=METHOD,
                            power_sample_count=len(self.samples), power_coverage=coverage,
                            power_device_ids=self.device_ids, power_interval_s=self.interval,
+                           power_unavailable_reason=self.unavailable_reason,
                            power_started_s=started, power_ended_s=ended)
         self.result['power_source'] = ('rocm-smi' if self.backend == 'amd' else
                                        'nvml' if self._handles else 'nvidia-smi')

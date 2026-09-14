@@ -121,3 +121,18 @@ class RuntimeTests(unittest.TestCase):
         result = runtime.run_checks(torch, fixture)
         self.assertEqual(result['status'], 'pass')
         self.assertEqual(result['devices'][0]['architecture'], 'gfx1201')
+
+    def test_validation_records_host_qualification_and_physical_selection(self):
+        fixture = lock()
+        fixture.update(host_qualified=False, allow_unverified_host=True)
+        fixture['host']['gpus'] = [{'index': '3'}]
+        result = runtime.run_checks(fake_torch(), fixture)
+        self.assertEqual(result['status'], 'pass')
+        self.assertFalse(result['host_qualified'])
+        self.assertEqual(result['devices'][0]['physical_index'], '3')
+
+    def test_unverified_host_flag_cannot_bypass_arithmetic(self):
+        fixture = lock()
+        fixture.update(host_qualified=False, allow_unverified_host=True)
+        result = runtime.run_checks(fake_torch(broken=True), fixture)
+        self.assertEqual(result['status'], 'error')

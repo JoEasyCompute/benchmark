@@ -25,6 +25,19 @@ def summarize(samples, work):
                 latency_ms_p95=percentile(samples, .95) * 1000)
 
 
+def measure_iterations(operation, synchronize, iterations, min_duration_s):
+    """Meet both count and measured-time minima; synchronization is timed."""
+    samples, total = [], 0.0
+    while len(samples) < iterations or total < min_duration_s:
+        output, elapsed = timed_call(operation, synchronize)
+        del output
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise ValueError('Measured durations must be finite and positive')
+        samples.append(elapsed)
+        total += elapsed
+    return samples
+
+
 def operation_work(case, size, heads=8, head_dim=64, itemsize=4):
     if case == 'gemm':
         return 2 * size ** 3
@@ -91,16 +104,13 @@ def run(args, row):
         sampler = EnergySampler(backend, device_indices=[0])
         sampler.start()
         try:
-            samples = []
-            for _ in range(args.iterations):
-                output, elapsed = timed_call(operation, torch.cuda.synchronize)
-                samples.append(elapsed)
-                del output
+            samples = measure_iterations(operation, torch.cuda.synchronize,
+                                         args.iterations, args.min_duration_s)
         finally:
             row.update(sampler.stop())
     row.update(summarize(samples, work))
     rate = row['throughput']
-    row.update(status='ok', work_per_iteration=work,
+    row.update(status='ok', measured_iterations=len(samples), work_per_iteration=work,
                work_unit='bytes' if args.case == 'memory' else 'flops',
                work_convention='read_plus_write' if args.case == 'memory' else
                'matmul_multiply_add_2flops_softmax_excluded',
@@ -115,6 +125,7 @@ def main(argv=None):
     parser.add_argument('--case', choices=('gemm', 'attention', 'memory'), default='gemm')
     parser.add_argument('--size', type=int, default=2048)
     parser.add_argument('--iterations', type=int, default=20)
+    parser.add_argument('--min-duration-s', type=float, default=5.0)
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--heads', type=int, default=8)
     parser.add_argument('--head-dim', type=int, default=64)
@@ -122,11 +133,13 @@ def main(argv=None):
     parser.add_argument('--metrics-path', default='results/metrics.jsonl')
     args = parser.parse_args(argv)
     row = dict(benchmark_schema_version=2, suite='kernel_bench', status='failed',
-               seed=SEED, timing_method='synchronized_iteration_v2',
+               seed=SEED, timing_method='synchronized_iteration_min_duration_v3',
                **{k: v for k, v in vars(args).items() if k != 'metrics_path'})
     try:
         if min(args.size, args.iterations, args.heads, args.head_dim) <= 0 or args.warmup < 0:
             raise ValueError('Sizes and iterations must be positive; warmup nonnegative')
+        if not math.isfinite(args.min_duration_s) or not 0 <= args.min_duration_s <= 3600:
+            raise ValueError('min_duration_s must be finite and between 0 and 3600')
         run(args, row)
     except Exception as exc:
         row.update(status='failed', error_type=type(exc).__name__, error=str(exc))

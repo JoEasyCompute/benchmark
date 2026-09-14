@@ -1,7 +1,7 @@
 from copy import deepcopy
 import unittest
 
-from runtime_resolver import resolve_runtime, installed_matches
+from runtime_resolver import resolve_runtime, installed_matches, install_commands
 
 
 def amd_host(kernel='6.14.0-20-generic'):
@@ -88,3 +88,22 @@ class RuntimeResolverTest(unittest.TestCase):
         self.assertEqual(plan['profile']['id'], 'existing-torch28-rocm64-compat')
         self.assertEqual(plan['status'], 'compatible_with_warnings')
         self.assertTrue(plan['profile']['experimental'])
+
+    def test_experimental_profile_locks_observed_wheel_not_host_runtime(self):
+        host = amd_host()
+        host.update(rocm_version='10.0.0', installed_packages={'torch': '2.8.0+rocm6.4', 'torchvision': '0.23.0+rocm6.4'})
+        plan = resolve_runtime(host, allow_unverified_host=True)
+        self.assertEqual(plan['profile']['runtime_version'], '6.4')
+        self.assertEqual(plan['profile']['expected_packages'], host['installed_packages'])
+        self.assertFalse(installed_matches(plan, {}))
+
+    def test_explicit_experimental_profile_requires_matching_installed_torch(self):
+        plan = resolve_runtime(amd_host(), profile='existing-torch28-rocm64-compat', allow_unverified_host=True)
+        self.assertEqual(plan['status'], 'blocked')
+
+    def test_existing_profile_never_generates_install_commands(self):
+        host = amd_host()
+        host.update(rocm_version='10.0.0', installed_packages={'torch': '2.8.0+rocm6.4'})
+        plan = resolve_runtime(host, allow_unverified_host=True)
+        with self.assertRaisesRegex(ValueError, 'validation-only'):
+            install_commands(plan['profile'], '/unused/python')

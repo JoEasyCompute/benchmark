@@ -12,42 +12,35 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BootstrapTest(unittest.TestCase):
-    def test_setup_replaces_wrong_vendor_build_using_the_official_index(self):
-        for installed, force in (('nvidia', True), ('amd', False)):
-            with self.subTest(installed=installed), tempfile.TemporaryDirectory(prefix='stack-select-') as directory:
-                root = Path(directory)
-                tools = root / 'tools'
-                tools.mkdir()
-                venv = root / 'venv'
-                bin_dir = venv / 'bin'
-                bin_dir.mkdir(parents=True)
-                (bin_dir / 'activate').write_text(f'export PATH="{bin_dir}:$PATH"\n')
-                python = bin_dir / 'python'
-                python.write_text('#!/usr/bin/env python3\nimport os, sys\n'
-                                  'source = sys.stdin.read() if sys.argv[1:] == ["-"] else ""\n'
-                                  'if "version_info" in source: print("3.12")\n'
-                                  'elif "torch.version" in source: print(os.environ["FAKE_TORCH_BACKEND"])\n')
-                pip = bin_dir / 'pip'
-                pip.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
-                               'with open(os.environ["PIP_LOG"], "a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n')
-                for item in (python, pip):
-                    item.chmod(0o755)
-                for name, output in (('uname', 'Linux'), ('rocm-smi', '{"card0":{}}')):
-                    command = tools / name
-                    command.write_text(f'#!/bin/sh\nprintf "%s\\n" \'{output}\'\n')
-                    command.chmod(0o755)
-                log = root / 'pip.jsonl'
-                env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
-                           VENV_DIR=str(venv), PYTHON_BIN=sys.executable, GPU_BACKEND='amd',
-                           FAKE_TORCH_BACKEND=installed, PIP_LOG=str(log))
-                result = subprocess.run(['bash', str(ROOT / 'env_setup.sh')], env=env,
-                                        capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                calls = [json.loads(line) for line in log.read_text().splitlines()]
-                torch_call = next(call for call in calls if 'torch==2.8.0' in call)
-                self.assertIn('--index-url', torch_call)
-                self.assertIn('https://download.pytorch.org/whl/rocm6.4', torch_call)
-                self.assertEqual('--force-reinstall' in torch_call, force)
+    def test_setup_uses_same_resolver_as_runtime_gate(self):
+        with tempfile.TemporaryDirectory(prefix='stack-select-') as directory:
+            root = Path(directory)
+            tools = root / 'tools'
+            tools.mkdir()
+            venv = root / 'venv'
+            bin_dir = venv / 'bin'
+            bin_dir.mkdir(parents=True)
+            (bin_dir / 'activate').write_text(f'export PATH="{bin_dir}:$PATH"\n')
+            python = bin_dir / 'python'
+            python.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                              'if sys.argv[1:] == ["-"]: print("3.12")\n'
+                              'elif "runtime_resolver.py" in sys.argv[1]:\n'
+                              ' with open(os.environ["RESOLVER_LOG"], "w") as f: json.dump(sys.argv[1:], f)\n')
+            python.chmod(0o755)
+            for name, output in (('uname', 'Linux'), ('rocm-smi', '{"card0":{}}')):
+                command = tools / name
+                command.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
+                command.chmod(0o755)
+            log = root / 'resolver.json'
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                       VENV_DIR=str(venv), PYTHON_BIN=sys.executable, GPU_BACKEND='amd',
+                       ALLOW_UNVERIFIED_HOST='1', RESOLVER_LOG=str(log))
+            result = subprocess.run(['bash', str(ROOT / 'env_setup.sh')], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            args = json.loads(log.read_text())
+            self.assertEqual(args, [str(ROOT / 'runtime_resolver.py'), '--backend', 'amd',
+                                   '--install', '--venv', str(venv), '--allow-unverified-host'])
 
     def test_runner_passes_detected_backend_and_absolute_venv_to_setup(self):
         with tempfile.TemporaryDirectory(prefix='benchmark-bootstrap-') as directory:

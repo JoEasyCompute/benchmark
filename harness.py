@@ -33,6 +33,8 @@ SUMMARY_METRIC_KEYS = {
     "drain_s", "requests_without_token_usage", "observed_output_tokens_min", "observed_output_tokens_max",
     "queue_s", "inter_token_latency_ms", "errors",
     "images_total",
+    "measured_iterations",
+    "overflow_retries",
     "images_per_sec",
     "load_seconds",
     "mean_s_per_iter",
@@ -77,7 +79,8 @@ def summarize_rows(rows):
             sorted(
                 (k, json.dumps(v, sort_keys=True))
                 for k, v in row.items()
-                if k not in SUMMARY_METRIC_KEYS and k not in {"repeat_index", "repeat_count", "power_sampler_available"}
+                if k not in SUMMARY_METRIC_KEYS and k not in {
+                    "repeat_index", "repeat_count", "power_sampler_available", "power_unavailable_reason"}
             )
         )
         groups.setdefault(group_key, []).append(row)

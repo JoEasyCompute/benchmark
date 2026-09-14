@@ -129,9 +129,10 @@ The examples differ only in their backend selector. Detection selects devices,
 the visibility environment variable, Blender CUDA/HIP and the compatible Python
 stack. It does not silently change model, precision or batch settings between
 vendors. Run folders record the resolved choices; source YAML files stay unchanged.
-The pinned PyTorch 2.8 installer uses CUDA 12.8 or ROCm 6.4 wheel indexes; see
-[PyTorch's version-specific instructions](https://pytorch.org/get-started/previous-versions/#v280).
-Existing incompatible CPU/vendor builds are replaced during setup.
+Environment setup uses the runtime resolver's package profile so installation
+and validation agree. An acknowledged experimental existing stack is preserved
+for validation; it is not an installation recipe. Optional vLLM/xformers stacks
+must match the chosen runtime and are not installed automatically.
 
 For mixed-vendor machines or a specific card, override from the command line:
 
@@ -550,6 +551,9 @@ What it does:
 - Loads a real causal LM from Hugging Face
 - Runs synthetic token batches through actual model weights
 - Measures forward/backward/update throughput
+- Keeps parameters and AdamW state in FP32; `fp16`/`bf16` select autocast
+  compute precision. FP16 uses gradient scaling. Failed runs record the phase
+  and step so warmup failures can be distinguished from measured-step failures.
 
 Notes:
 - Controlled by `llm_train_real.enabled` in `config.yaml`
@@ -1036,6 +1040,28 @@ Post-run validation:
 - `validate_run_artifacts.py` checks a completed run folder for missing artifacts, backend mismatches, missing suite rows, failed/skipped rows, and AMD power-metric caveats before you compare runs across vendors.
 
 ## Smoke-Test Checklist
+
+The runner now writes `runtime_validation.json` before launching suites. It checks
+the selected GPUs numerically and checks collectives when multiple GPUs are
+visible. `--allow-unverified-host` accepts an experimental host combination; it
+does not bypass these checks or qualify the host as vendor-supported.
+
+Before moving from one GPU to eight, pass a smoke run on each intended GPU,
+then test two GPUs before the full eight-GPU run. Omit `--baseline` for multi-GPU
+runs and explicitly configure training world sizes and inference replication;
+selecting eight visible GPUs alone does not make every suite distributed.
+Real-model training and local Transformers serving remain single-GPU workloads.
+
+Vision and kernel benchmarks use `min_duration_s: 5` by default in addition to
+their minimum iteration count. Smoke mode disables that duration minimum.
+Use the same duration and iteration settings on comparison hosts. Local
+Transformers serving uses a FIFO serial queue; it measures that queue's behaviour,
+not continuous batching as offered by a dedicated serving engine.
+
+Treat energy as unavailable when device identity or sufficient power samples
+cannot be verified. Do not compare the historical 11–12 W readings from
+`20260913_newGen4-1x9700` as board-power efficiency. Rerun the baseline after these
+measurement changes; protocol identifiers distinguish the new results.
 
 Use this before trusting cross-vendor comparisons:
 

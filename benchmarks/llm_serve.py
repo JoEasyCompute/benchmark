@@ -146,8 +146,29 @@ class TokenEventStreamer:
         self.ended = True
 
 
+class FifoLock:
+    """Admit waiting clients in arrival order, including after request errors."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.next_ticket = 0
+        self.serving_ticket = 0
+
+    def __enter__(self):
+        with self.condition:
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            self.condition.wait_for(lambda: ticket == self.serving_ticket)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        with self.condition:
+            self.serving_ticket += 1
+            self.condition.notify_all()
+
+
 class TransformersProvider:
-    timing_method = 'local_transformers_serial_queue_closed_loop_v1'
+    timing_method = 'local_transformers_fifo_queue_closed_loop_v2'
     ttft_method = 'first_generated_token_id_cpu_arrival_including_queue'
 
     def __init__(self, model, revision, dtype, prompt, output_len, gpu_index=0):
@@ -180,7 +201,7 @@ class TransformersProvider:
         self.inputs = self.tokenizer(prompt, return_tensors='pt').to(self.device)
         self.prompt_tokens = int(self.inputs['input_ids'].shape[-1])
         self.output_len = output_len
-        self.lock = threading.Lock()
+        self.lock = FifoLock()
         self.options = fixed_generation_kwargs(
             output_len, self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None
             else self.tokenizer.eos_token_id)

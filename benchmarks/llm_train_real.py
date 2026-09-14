@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from benchmark_protocol import SEED, resolve_revision, runtime_gpu_name
@@ -15,19 +16,44 @@ def supervised_tokens(batch_size, seq_len):
     return batch_size * (seq_len - 1)
 
 
-def training_step(model, optimizer, tokens, torch):
-    optimizer.zero_grad(set_to_none=True)
-    # AutoModelForCausalLM shifts logits and labels internally exactly once.
-    output = model(input_ids=tokens, labels=tokens.clone())
-    loss = output.loss.float()
-    if not torch.isfinite(loss).all():
-        raise FloatingPointError('Nonfinite training loss')
-    loss.backward()
-    for parameter in model.parameters():
-        if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
-            raise FloatingPointError('Nonfinite training gradient')
-    optimizer.step()
-    return loss
+def training_step(model, optimizer, tokens, torch, *, autocast_context=nullcontext,
+                  scaler=None, diagnostics=None, max_overflow_retries=8):
+    diagnostics = diagnostics if diagnostics is not None else {}
+    for attempt in range(max_overflow_retries + 1):
+        diagnostics['stage'] = 'zero_grad'
+        optimizer.zero_grad(set_to_none=True)
+        diagnostics['stage'] = 'forward_loss'
+        # AutoModelForCausalLM shifts logits and labels internally exactly once.
+        with autocast_context():
+            output = model(input_ids=tokens, labels=tokens.clone())
+            loss = output.loss.float()
+        if not torch.isfinite(loss).all():
+            raise FloatingPointError('Nonfinite training loss')
+        diagnostics['stage'] = 'backward'
+        (scaler.scale(loss) if scaler is not None else loss).backward()
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        diagnostics['stage'] = 'gradient_check'
+        finite = all(torch.isfinite(p.grad).all() for p in model.parameters()
+                     if p.grad is not None)
+        if not finite:
+            if scaler is None:
+                raise FloatingPointError('Nonfinite training gradient')
+            # GradScaler skips this update and reduces its scale. Retry the same
+            # batch so requested steps count actual updates, including retry cost.
+            scaler.step(optimizer)
+            scaler.update()
+            diagnostics['overflow_retries'] = diagnostics.get('overflow_retries', 0) + 1
+            if attempt == max_overflow_retries:
+                raise FloatingPointError('Nonfinite training gradient after loss-scale retries')
+            continue
+        diagnostics['stage'] = 'optimizer_step'
+        if scaler is None:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+            scaler.update()
+        return loss
 
 
 def run(cfg):
@@ -48,6 +74,7 @@ def run(cfg):
     backend = 'amd' if getattr(torch.version, 'hip', None) else 'nvidia'
     metric.update(gpu_backend=backend, gpu_count=1, world_size=1)
     sampler = None
+    diagnostics = {'phase': 'setup', 'stage': 'configuration', 'overflow_retries': 0}
     try:
         batch_size, seq_len = int(cfg['batch_size']), int(cfg['seq_len'])
         steps, warmup = int(cfg['steps']), int(cfg.get('warmup_steps', 2))
@@ -58,14 +85,21 @@ def run(cfg):
         dtype_name = cfg.get('dtype', 'fp16')
         dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16,
                  'fp32': torch.float32}[dtype_name]
+        metric.update(dtype=dtype_name, training_precision_protocol='fp32_parameters_autocast_v1',
+                      parameter_dtype='fp32', gradient_scaling=dtype_name == 'fp16',
+                      max_overflow_retries=8)
         torch.manual_seed(seed)
         torch.backends.cuda.matmul.allow_tf32 = False
         device = torch.device('cuda:0')
         name = cfg['model']
         revision = resolve_revision(name, cfg.get('revision'))
+        diagnostics['stage'] = 'model_load'
         model = AutoModelForCausalLM.from_pretrained(
-            name, revision=revision, torch_dtype=dtype,
+            name, revision=revision, torch_dtype=torch.float32,
             trust_remote_code=False).to(device).train()
+        autocast_context = lambda: torch.autocast(
+            device_type='cuda', dtype=dtype, enabled=dtype_name != 'fp32')
+        scaler = torch.amp.GradScaler('cuda') if dtype_name == 'fp16' else None
         model_revision = getattr(model.config, '_commit_hash', None) or revision
         learning_rate = float(cfg.get('learning_rate', 3e-4))
         weight_decay = float(cfg.get('weight_decay', 0.01))
@@ -77,22 +111,29 @@ def run(cfg):
         # Fixed synthetic batch generated and transferred before warmup.
         tokens = torch.randint(vocab_size, (batch_size, seq_len),
                                generator=generator, dtype=torch.long).to(device)
-        for _ in range(warmup):
-            training_step(model, optim, tokens, torch)
+        diagnostics['phase'] = 'warmup'
+        for step in range(warmup):
+            diagnostics['step'] = step + 1
+            training_step(model, optim, tokens, torch, autocast_context=autocast_context,
+                          scaler=scaler, diagnostics=diagnostics)
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         sampler = EnergySampler(backend, device_indices=[0])
         sampler.start()
         started = time.perf_counter()
-        for _ in range(steps):
-            loss = training_step(model, optim, tokens, torch)
+        diagnostics['phase'] = 'measurement'
+        for step in range(steps):
+            diagnostics['step'] = step + 1
+            loss = training_step(model, optim, tokens, torch,
+                                 autocast_context=autocast_context,
+                                 scaler=scaler, diagnostics=diagnostics)
         torch.cuda.synchronize(device)
         finished = time.perf_counter()
         elapsed = finished - started
         energy = sampler.stop(started_s=started, ended_s=finished)
         sampler = None
         metric.update(
-            status='ok', timing_method='synchronized_training_compute_v2',
+            status='ok', timing_method='synchronized_training_compute_v3',
             data_protocol='fixed_seeded_random_tokens_resident_v1',
             objective='causal_next_token_internal_shift', seed=seed,
             model_source='local_path' if Path(name).is_dir() else 'huggingface',
@@ -112,10 +153,12 @@ def run(cfg):
         if metric.get('energy_j'):
             metric['tokens_per_joule'] = steps*tokens_per_step/metric['energy_j']
     except Exception as exc:
-        metric.update(status='failed', error=str(exc))
+        metric.update(status='failed', error=str(exc), failure_phase=diagnostics['phase'],
+                      failure_stage=diagnostics['stage'], failure_step=diagnostics.get('step'))
     finally:
         if sampler is not None:
             sampler.stop()
+    metric['overflow_retries'] = diagnostics['overflow_retries']
     return metric
 
 

@@ -60,7 +60,9 @@ def run_collective(count):
 
 def run_checks(torch_module, lock, distributed=False):
     report = {'status': 'error', 'errors': [], 'installed_packages': {}, 'devices': [],
-              'compile_architectures': [], 'collective': {'status': 'not_requested'}}
+              'compile_architectures': [], 'collective': {'status': 'not_requested'},
+              'host_qualified': bool(lock.get('host_qualified', False)),
+              'host_runtime_version': lock.get('host', {}).get('rocm_version')}
     torch = torch_module
     try:
         profile = lock['profile']
@@ -102,7 +104,9 @@ def run_checks(torch_module, lock, distributed=False):
             if expected_arch and str(architecture).split(':')[0] != expected_arch:
                 raise RuntimeError(f'GPU {index} architecture {architecture} differs from locked {expected_arch}')
             numerical_check(torch, index)
-            report['devices'].append({'index': index, 'name': torch.cuda.get_device_name(index),
+            report['devices'].append({'index': index,
+                                      'physical_index': lock['host']['gpus'][index].get('index'),
+                                      'name': torch.cuda.get_device_name(index),
                                       'architecture': architecture, 'numerical_check': 'pass'})
         if distributed:
             report['collective'] = run_collective(count) if count > 1 else {'status': 'skipped_single_gpu'}

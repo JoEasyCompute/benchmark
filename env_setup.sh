@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Idempotent env setup for vLLM + Stable Diffusion benches (CUDA 12.8 wheels)
-# - vLLM 0.11.0 stack: torch 2.8.0 + xformers 0.0.32.post1 + setuptools <80
-# - SD stack pinned to avoid offload_state_dict issues: diffusers 0.29.2
-# - Transformers kept compatible with vLLM + tokenizers 0.22.x
+# Install the curated GPU profile and validate it before benchmarking.
+# Provider-specific vLLM environments are managed separately.
 
 set -euo pipefail
 
@@ -93,100 +91,11 @@ if [[ "$CONFIG_ONLY" == "1" ]]; then
   exit 0
 fi
 
-python -c 'import sys; print("Python:", sys.version)'
-
-# Base tooling
-pip install --upgrade pip wheel
-
-# setuptools pinned for vLLM compatibility
-pip install "setuptools<80,>=77.0.3"
-
-# Torch stack
-INSTALLED_GPU_BACKEND="$(python - <<'PY'
-try:
-    import torch
-    print('amd' if torch.version.hip else 'nvidia' if torch.version.cuda else 'cpu')
-except Exception:
-    print('missing')
-PY
-)"
-if [[ "$GPU_BACKEND" == "amd" ]]; then
-  TORCH_INDEX="https://download.pytorch.org/whl/rocm6.4"
-else
-  TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+# Resolve and install the same concrete package profile used by run_all.sh.
+# Existing experimental stacks are retained and validated by the resolver.
+resolver_flags=(--backend "$GPU_BACKEND" --install --venv "$VENV_DIR")
+if [[ "${ALLOW_UNVERIFIED_HOST:-0}" == "1" ]]; then
+  resolver_flags+=(--allow-unverified-host)
 fi
-TORCH_INSTALL_ARGS=(--index-url "$TORCH_INDEX")
-if [[ "$INSTALLED_GPU_BACKEND" != "missing" && "$INSTALLED_GPU_BACKEND" != "$GPU_BACKEND" ]]; then
-  # An installed CUDA/CPU build can satisfy the same version pin on an AMD host.
-  TORCH_INSTALL_ARGS+=(--force-reinstall)
-fi
-pip install "${TORCH_INSTALL_ARGS[@]}" \
-  "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0"
-
-# Optional acceleration stack
-if [[ "$GPU_BACKEND" == "nvidia" ]]; then
-  pip install \
-    "vllm==0.11.0" \
-    "xformers==0.0.32.post1"
-else
-  pip uninstall -y vllm xformers >/dev/null 2>&1 || true
-  echo "[ENV][WARN] Skipping default vLLM install on AMD; llm_infer_vllm requires a separately validated ROCm-compatible vLLM build."
-  echo "[ENV][WARN] Skipping xformers install on AMD; Stable Diffusion will run without it unless you install a compatible build manually."
-fi
-
-# Stable Diffusion trio (pins that avoid CLIP offload kw issues)
-# --no-deps prevents pulling mismatched transitive deps, so install
-# the shared requirements explicitly afterward.
-pip install --upgrade --no-deps \
-  "diffusers==0.29.2" \
-  "transformers==4.57.0" \
-  "accelerate==1.10.1"
-pip install --upgrade \
-  "huggingface-hub>=0.34.0,<1.0" \
-  "importlib-metadata>=6.0" \
-  "tokenizers>=0.22.0,<=0.23.0" \
-  "regex!=2019.12.17" \
-  "psutil>=5.9.8"
-
-# Bench deps
-if [[ "$GPU_BACKEND" == "nvidia" ]]; then
-  pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0" "nvidia-ml-py>=12.560.30"
-else
-  pip install "safetensors>=0.4.3" "pandas>=2.2.0" "tqdm>=4.66" "pyyaml>=6.0"
-fi
-
-echo "---- versions ----"
-python - <<'PY'
-import os
-import torch, torchvision, torchaudio, setuptools
-import transformers, diffusers, accelerate
-import tokenizers
-print("torch", torch.__version__)
-print("torchvision", torchvision.__version__)
-print("torchaudio", torchaudio.__version__)
-print("setuptools", setuptools.__version__)
-print("transformers", transformers.__version__)
-print("tokenizers", tokenizers.__version__)
-print("diffusers", diffusers.__version__)
-print("accelerate", accelerate.__version__)
-try:
-    import xformers
-    print("xformers", xformers.__version__)
-except Exception:
-    print("xformers", None)
-try:
-    import vllm
-    print("vllm", vllm.__version__)
-except Exception:
-    print("vllm", None)
-try:
-    import pynvml
-    print("pynvml", pynvml.__version__)
-except Exception:
-    print("pynvml", None)
-PY
-
-# This will warn if anything is still mismatched (ok to continue if warnings appear for optional extras)
-pip check || true
-
+python "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}"
 echo "Environment ready."

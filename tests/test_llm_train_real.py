@@ -1,8 +1,10 @@
 import math
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 import llm_train_real as training
@@ -29,6 +31,95 @@ class TorchStub:
 
 
 class TrainingTests(unittest.TestCase):
+    def test_low_precision_run_loads_fp32_master_parameters(self):
+        loaded_dtypes = []
+        def load_model(*args, **kwargs):
+            loaded_dtypes.append(kwargs['torch_dtype'])
+            raise RuntimeError('deliberate model load stop')
+        torch = SimpleNamespace(
+            float16='fp16', bfloat16='bf16', float32='fp32',
+            cuda=SimpleNamespace(is_available=lambda: True),
+            version=SimpleNamespace(hip='test'), manual_seed=lambda seed: None,
+            backends=SimpleNamespace(cuda=SimpleNamespace(matmul=SimpleNamespace())),
+            device=lambda name: name)
+        transformers = SimpleNamespace(AutoModelForCausalLM=SimpleNamespace(from_pretrained=load_model))
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), \
+             patch.object(training, 'resolve_revision', return_value='fixed'):
+            for dtype in ('fp16', 'bf16', 'fp32'):
+                result = training.run({'enabled': True, 'model': 'tiny', 'dtype': dtype,
+                                       'batch_size': 1, 'seq_len': 4, 'steps': 1})
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['failure_stage'], 'model_load')
+                self.assertEqual(result['parameter_dtype'], 'fp32')
+                self.assertEqual(result['gradient_scaling'], dtype == 'fp16')
+        self.assertEqual(loaded_dtypes, ['fp32', 'fp32', 'fp32'])
+
+    def test_amp_unscales_before_checking_and_updating(self):
+        events = []
+        class Model:
+            def __call__(self, **kw):
+                events.append('forward')
+                return SimpleNamespace(loss=Scalar(1.0))
+            def parameters(self):
+                return []
+        scaler = SimpleNamespace(
+            scale=lambda loss: (events.append('scale') or loss),
+            unscale_=lambda opt: events.append('unscale'),
+            step=lambda opt: events.append('step'),
+            update=lambda: events.append('update'))
+        optimizer = SimpleNamespace(zero_grad=lambda **kw: None)
+        training.training_step(Model(), optimizer, Tokens([1, 2]), TorchStub,
+                               autocast_context=nullcontext, scaler=scaler)
+        self.assertEqual(events, ['forward', 'scale', 'unscale', 'step', 'update'])
+
+    def test_failure_diagnostics_identify_forward_loss(self):
+        diagnostics = {}
+        model = lambda **kw: SimpleNamespace(loss=Scalar(float('nan')))
+        optimizer = SimpleNamespace(zero_grad=lambda **kw: None)
+        with self.assertRaises(FloatingPointError):
+            training.training_step(model, optimizer, Tokens([1, 2]), TorchStub,
+                                   diagnostics=diagnostics)
+        self.assertEqual(diagnostics['stage'], 'forward_loss')
+
+    def test_scaled_overflow_retries_without_counting_skipped_update(self):
+        updates, attempts = [], []
+        parameter = SimpleNamespace(grad=Scalar(float('inf')))
+        class Model:
+            def __call__(self, **kw):
+                attempts.append(1)
+                return SimpleNamespace(loss=Scalar(1.0))
+            def parameters(self):
+                return [parameter]
+        def update_scale():
+            parameter.grad = Scalar(1.0)
+        scaler = SimpleNamespace(
+            scale=lambda loss: loss, unscale_=lambda opt: None,
+            step=lambda opt: updates.append(1) if math.isfinite(parameter.grad.value) else None,
+            update=update_scale)
+        diagnostics = {}
+        training.training_step(Model(), SimpleNamespace(zero_grad=lambda **kw: None),
+                               Tokens([1, 2]), TorchStub, scaler=scaler,
+                               diagnostics=diagnostics)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(updates, [1])
+        self.assertEqual(diagnostics['overflow_retries'], 1)
+
+    def test_persistent_overflow_stops_at_retry_limit(self):
+        attempts = []
+        class Model:
+            def __call__(self, **kw):
+                attempts.append(1)
+                return SimpleNamespace(loss=Scalar(1.0))
+            def parameters(self):
+                return [SimpleNamespace(grad=Scalar(float('inf')))]
+        scaler = SimpleNamespace(scale=lambda loss: loss, unscale_=lambda opt: None,
+                                 step=lambda opt: None, update=lambda: None)
+        with self.assertRaisesRegex(FloatingPointError, 'loss-scale retries'):
+            training.training_step(Model(), SimpleNamespace(zero_grad=lambda **kw: None),
+                                   Tokens([1, 2]), TorchStub, scaler=scaler,
+                                   max_overflow_retries=2)
+        self.assertEqual(len(attempts), 3)
+
     def test_causal_model_receives_unshifted_labels(self):
         class TinyCausal:
             def __call__(self, input_ids, labels):

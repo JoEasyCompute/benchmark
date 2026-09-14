@@ -9,10 +9,10 @@ OPTIONAL_DEFAULTS = {
     'vision_infer': {'enabled': False, 'model': 'resnet18',
                      'weights': 'ResNet18_Weights.IMAGENET1K_V1',
                      'batch_sizes': [1, 32], 'sizes': [224], 'dtype': 'float32',
-                     'modes': ['throughput'], 'iterations': 50, 'warmup': 5},
+                     'modes': ['throughput'], 'iterations': 50, 'warmup': 5, 'min_duration_s': 5.0},
     'kernel_bench': {'enabled': False, 'cases': ['gemm', 'attention', 'memory'],
                      'size': 2048, 'dtype': 'float32', 'iterations': 20, 'warmup': 3,
-                     'heads': 8, 'head_dim': 64},
+                     'heads': 8, 'head_dim': 64, 'min_duration_s': 5.0},
     'llm_serve': {'enabled': False, 'provider': 'transformers', 'endpoint': '',
                   'model': '', 'revision': '', 'dtype': 'float16', 'concurrency': [1, 4],
                   'prompt': 'A deterministic benchmark prompt.', 'output_len': 32,
@@ -43,6 +43,10 @@ def validate_optional_suites(cfg):
         for key in ('iterations', 'size', 'heads', 'head_dim', 'output_len'):
             if key in values and (type(values[key]) is not int or values[key] <= 0):
                 errors.append(f'{suite}.{key} must be a positive integer')
+        if 'min_duration_s' in values:
+            duration = values['min_duration_s']
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or not 0 <= duration <= 3600:
+                errors.append(f'{suite}.min_duration_s must be finite and between 0 and 3600')
         if type(values['warmup']) is not int or values['warmup'] < 0:
             errors.append(f'{suite}.warmup must be a non-negative integer')
         for key in ('sizes', 'batch_sizes', 'concurrency'):
@@ -97,9 +101,9 @@ def smoke_optional_suites(cfg):
         values = suite_values(cfg, suite)
         values['warmup'] = min(values['warmup'], 1)
         if suite == 'vision_infer':
-            values.update(batch_sizes=[1], sizes=[values['sizes'][0]], modes=[values['modes'][0]], iterations=2)
+            values.update(batch_sizes=[1], sizes=[values['sizes'][0]], modes=[values['modes'][0]], iterations=2, min_duration_s=0)
         elif suite == 'kernel_bench':
-            values.update(size=min(values['size'], 64), iterations=2)
+            values.update(size=min(values['size'], 64), iterations=2, min_duration_s=0)
         else:
             values.update(duration=1, concurrency=[1], output_len=min(values['output_len'], 8))
         cfg[suite] = values
@@ -116,10 +120,10 @@ def optional_jobs(cfg):
             combinations = [dict(size=size, batch_size=batch, mode=mode)
                             for mode in values['modes'] for size, batch in
                             product(values['sizes'], [1] if mode == 'latency' else values['batch_sizes'])]
-            keys = ('model', 'weights', 'dtype', 'iterations', 'warmup')
+            keys = ('model', 'weights', 'dtype', 'iterations', 'warmup', 'min_duration_s')
         elif suite == 'kernel_bench':
             combinations = [dict(case=case) for case in values['cases']]
-            keys = ('size', 'dtype', 'iterations', 'warmup', 'heads', 'head_dim')
+            keys = ('size', 'dtype', 'iterations', 'warmup', 'heads', 'head_dim', 'min_duration_s')
         else:
             combinations = [dict(concurrency=c) for c in values['concurrency']]
             keys = ('provider', 'model', 'revision', 'dtype', 'endpoint', 'prompt',

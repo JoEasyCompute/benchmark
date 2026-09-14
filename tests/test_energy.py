@@ -44,8 +44,9 @@ class EnergyTests(unittest.TestCase):
              patch('benchmarks.energy.threading.Thread'):
             sampler.start()
             result = sampler.stop()
-        self.assertEqual(result['energy_j'], 300)
-        self.assertEqual(result['mean_power_w'], 150)
+        self.assertIsNone(result['energy_j'])
+        self.assertIsNone(result['mean_power_w'])
+        self.assertEqual(result['power_unavailable_reason'], 'insufficient_in_window_samples')
         self.assertEqual(result['power_coverage'], 1)
         self.assertEqual(result['power_sample_count'], 2)
 
@@ -59,3 +60,49 @@ class EnergyTests(unittest.TestCase):
                 with sampler:
                     raise ValueError('operation failed')
             stop.assert_called_once()
+
+
+class VerifiedMappingTests(unittest.TestCase):
+    def test_hip_ordinal_is_matched_by_pci_not_smi_card_number(self):
+        from benchmarks.energy import match_rocm_devices
+        payload = {'card0': {'PCI Bus': '0000:03:00.0'},
+                   'card7': {'PCI Bus': '0000:E3:00.0'}}
+        self.assertEqual(match_rocm_devices(['0000:e3:00.0'], payload), ['7'])
+        self.assertIsNone(match_rocm_devices(['0000:ff:00.0'], payload))
+
+    def test_ambiguous_bus_is_rejected(self):
+        from benchmarks.energy import match_rocm_devices
+        self.assertIsNone(match_rocm_devices(['0000:03:00.0'], {
+            'card0': {'PCI Bus': '0000:03:00.0'},
+            'card1': {'PCI Bus': '0000:03:00.0'}}))
+
+    def test_unverified_amd_mapping_does_not_query_power(self):
+        sampler = EnergySampler('amd')
+        with patch('benchmarks.energy.subprocess.check_output') as query:
+            self.assertIsNone(sampler._read())
+            query.assert_not_called()
+
+    def test_three_in_window_samples_allow_energy(self):
+        sampler = EnergySampler('unsupported', interval_s=1)
+        sampler.started = 0
+        sampler.samples = [(0, 100), (1, 100), (2, 100)]
+        with patch.object(sampler, '_sample'):
+            result = sampler.stop(started_s=0, ended_s=2)
+        self.assertEqual(result['energy_j'], 200)
+
+    def test_start_queries_bus_and_uses_verified_smi_device(self):
+        sampler = EnergySampler('amd', [0])
+        with patch('benchmarks.energy.hip_pci_devices', return_value=['0000:e3:00.0']), \
+             patch('benchmarks.energy.subprocess.check_output', side_effect=[
+                 '{"card7": {"PCI Bus": "0000:E3:00.0"}}',
+                 '{"card7": {"Average Graphics Package Power (W)": "250"}}']), \
+             patch('benchmarks.energy.threading.Thread'):
+            sampler.start()
+        self.assertTrue(sampler.mapping_verified)
+        self.assertEqual(sampler.device_ids, ['7'])
+        self.assertEqual(sampler.samples[0][1], 250)
+
+    def test_no_loaded_hip_runtime_stays_unavailable(self):
+        from benchmarks.energy import hip_pci_devices
+        with patch('benchmarks.energy.Path.read_text', return_value=''):
+            self.assertIsNone(hip_pci_devices([0]))

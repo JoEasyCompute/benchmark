@@ -53,6 +53,37 @@ def event(text='', finish=None, usage=None):
 
 
 class ServingTests(unittest.TestCase):
+    def test_fifo_admission_and_release_after_exception(self):
+        self.assertTrue(hasattr(serving, 'FifoLock'))
+        lock = serving.FifoLock()
+        order = []
+        threads = []
+        with lock:
+            for index in range(4):
+                def worker(value=index):
+                    with lock:
+                        order.append(value)
+                thread = threading.Thread(target=worker)
+                thread.start()
+                threads.append(thread)
+                deadline = time.monotonic() + 2
+                while True:
+                    with lock.condition:
+                        queued = lock.next_ticket
+                    if queued == index + 2:
+                        break
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.001)
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(order, list(range(4)))
+        with self.assertRaises(ValueError):
+            with lock:
+                raise ValueError('generation failed')
+        with lock:
+            pass
+
     def provider(self, url, **kwargs):
         return serving.HttpProvider(url, 'fixture', 'hello', 2, timeout=2, **kwargs)
 
