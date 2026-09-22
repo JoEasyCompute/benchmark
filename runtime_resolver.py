@@ -12,9 +12,9 @@ import sys
 
 from inspect_runtime import collect_host
 
-CATALOG_VERSION = '2026-09-13.1'
+CATALOG_VERSION = '2026-09-22.1'
 COMMON = {'transformers': '4.57.0', 'diffusers': '0.29.2', 'accelerate': '1.10.1', 'numpy': '1.26.4'}
-PROFILE_IDS = ('torch291-cu128', 'torch291-cu126', 'torch291-rocm72', 'existing-torch28-rocm64-compat')
+PROFILE_IDS = ('torch291-cu128', 'torch291-cu126', 'torch291-rocm72', 'existing-torch28-rocm64-compat', 'torch280-rocm64-on-rocm10')
 SOURCES = {
     'torch': 'https://pytorch.org/get-started/previous-versions/#v291',
     'cuda128': 'https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html',
@@ -31,6 +31,15 @@ def version(value):
 
 def make_profile(identifier, python_version):
     expected = dict(COMMON)
+    if identifier == 'torch280-rocm64-on-rocm10':
+        expected.update(torch='2.8.0+rocm6.4', torchvision='0.23.0+rocm6.4',
+                        torchaudio='2.8.0+rocm6.4')
+        return dict(id=identifier, backend='amd', torch_version='2.8.0',
+                    runtime_version='6.4', experimental=True, installable=True,
+                    expected_packages=expected,
+                    core_install=dict(index_url='https://download.pytorch.org/whl/rocm6.4',
+                        packages=[f'{name}=={expected[name]}' for name in ('torch', 'torchvision', 'torchaudio')]),
+                    sources=['https://pytorch.org/get-started/previous-versions/#v280'])
     if identifier in ('torch291-cu126', 'torch291-cu128'):
         tag = identifier.split('-')[1]
         expected.update(torch='2.9.1+' + tag, torchvision='0.24.1+' + tag,
@@ -85,6 +94,8 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
         installed_torch = str((host.get('installed_packages') or {}).get('torch') or '')
         if version(host.get('rocm_version')) and version(host.get('rocm_version'))[0] >= 10 and installed_torch.startswith('2.8.0+rocm6.4'):
             profile = 'existing-torch28-rocm64-compat'
+        elif version(host.get('rocm_version')) == (10, 0, 0) and not installed_torch:
+            profile = 'torch280-rocm64-on-rocm10'
         else:
             profile = 'torch291-rocm72'
     if profile != 'auto':
@@ -106,7 +117,15 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
                 errors.append(f"GPU {gpu.get('index')}: architecture {gpu.get('architecture')} is not covered by {candidate['id']}.")
     elif candidate and backend == 'amd':
         rocm = version(host.get('rocm_version'))
-        if candidate.get('experimental'):
+        if candidate['id'] == 'torch280-rocm64-on-rocm10':
+            if rocm != (10, 0, 0):
+                errors.append('Experimental installation requires host ROCm 10.0.0.')
+            if host.get('os_version') != '24.04' or py is None or py[:2] != (3, 12):
+                errors.append('Experimental installation requires Ubuntu 24.04 and Python 3.12.')
+            if any(gpu.get('architecture') != 'gfx1201' for gpu in gpus):
+                errors.append('Experimental installation is limited to gfx1201 GPUs.')
+            host_exceptions.append('Installing Torch 2.8/ROCm 6.4 wheels on ROCm 10 is experimental; this reproduces the earlier framework baseline, not a native ROCm 10 stack. Numerical validation is mandatory.')
+        elif candidate.get('experimental'):
             observed = host.get('installed_packages') or {}
             if not re.fullmatch(r'2\.8\.0\+rocm6\.4(?:[.a-zA-Z0-9_-]*)', str(observed.get('torch') or '')):
                 errors.append('Existing runtime profile requires an installed Torch 2.8.0+rocm6.4 build.')
@@ -157,7 +176,7 @@ def package_inventory():
 
 
 def install_commands(profile, python):
-    if profile.get('experimental'):
+    if profile.get('experimental') and not profile.get('installable'):
         raise ValueError('Existing experimental profiles are validation-only; they cannot install a new runtime.')
     core = profile['core_install']
     commands = [[python, '-m', 'pip', 'install', '--upgrade', 'pip', 'wheel']]
@@ -218,7 +237,7 @@ def main():
         parser.exit(2, '[RUNTIME][ERROR] Target venv Python differs from the resolved wheel ABI. Run setup using the target interpreter.\n')
     lock = target / 'runtime-lock.json'
     lock.write_text(json.dumps(plan, indent=2) + '\n')
-    if plan['profile'].get('experimental'):
+    if plan['profile'].get('experimental') and not plan['profile'].get('installable'):
         print(f"[RUNTIME] Retaining existing experimental packages in {target}; validating without installation", flush=True)
     else:
         print(f"[RUNTIME] Installing {plan['profile']['id']} into {target}", flush=True)

@@ -19,6 +19,30 @@ def nvidia_host(driver='570.86.16', arch='sm_120'):
 
 
 class RuntimeResolverTest(unittest.TestCase):
+    def test_fresh_rocm10_install_requires_acknowledgement_and_pins_wheels(self):
+        host = amd_host('6.8.0-139-generic')
+        host['rocm_version'] = '10.0.0'
+        self.assertEqual(resolve_runtime(host)['status'], 'blocked')
+        plan = resolve_runtime(host, allow_unverified_host=True)
+        self.assertEqual(plan['status'], 'compatible_with_warnings')
+        self.assertFalse(plan['host_qualified'])
+        self.assertEqual(plan['profile']['id'], 'torch280-rocm64-on-rocm10')
+        commands = install_commands(plan['profile'], '/venv/bin/python')
+        self.assertIn('torch==2.8.0+rocm6.4', commands[1])
+        self.assertIn('https://download.pytorch.org/whl/rocm6.4', commands[1])
+
+    def test_fresh_profile_cannot_override_unknown_hosts(self):
+        for key, value in [('rocm_version', '11.0.0'), ('python_version', '3.11.0')]:
+            host = amd_host()
+            host.update(rocm_version='10.0.0')
+            host[key] = value
+            plan = resolve_runtime(host, profile='torch280-rocm64-on-rocm10', allow_unverified_host=True)
+            self.assertEqual(plan['status'], 'blocked')
+        host = amd_host()
+        host.update(rocm_version='10.0.0')
+        host['gpus'][0]['architecture'] = 'gfx1100'
+        self.assertEqual(resolve_runtime(host, allow_unverified_host=True)['status'], 'blocked')
+
     def test_inspected_server_is_candidate_but_kernel_requires_acknowledgement(self):
         host = amd_host('6.8.0-137-generic')
         plan = resolve_runtime(host)

@@ -137,6 +137,22 @@ and validation agree. An acknowledged experimental existing stack is preserved
 for validation; it is not an installation recipe. Optional vLLM/xformers stacks
 must match the chosen runtime and are not installed automatically.
 
+For a fresh Ubuntu 24.04 / Python 3.12 / gfx1201 host with ROCm 10.0.0,
+the resolver provides an experimental installation profile using the official
+PyTorch 2.8.0, torchvision 0.23.0 and torchaudio 2.8.0 ROCm 6.4 wheels.
+This matches the framework family used in the earlier AMD runs; it is not native
+ROCm 10 support. Common dependencies follow the repository pins, so record and
+compare the complete software inventory. Existing Torch 2.8 environments remain
+unchanged. Installation requires acknowledgement and must pass numerical checks:
+
+```bash
+ALLOW_UNVERIFIED_HOST=1 GPU_BACKEND=amd bash env_setup.sh
+./run_all.sh --config configs/amd.yaml --gpus 0 --baseline --smoke --allow-unverified-host
+```
+
+The same `run_all.sh` command installs the stack automatically when missing.
+After smoke validation succeeds, omit `--smoke` for the full baseline.
+
 For mixed-vendor machines or a specific card, override from the command line:
 
 ```bash
