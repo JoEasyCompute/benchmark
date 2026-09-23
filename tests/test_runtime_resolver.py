@@ -19,6 +19,19 @@ def nvidia_host(driver='570.86.16', arch='sm_120'):
 
 
 class RuntimeResolverTest(unittest.TestCase):
+    def test_rocm10_repairs_cuda_or_cpu_stack_with_amd_wheels(self):
+        for installed in ('2.9.1+cu128', '2.8.0+cpu'):
+            with self.subTest(installed=installed):
+                host = amd_host('6.8.0-142-generic')
+                host.update(rocm_version='10.0.0', installed_packages={'torch': installed})
+                self.assertEqual(resolve_runtime(host)['status'], 'blocked')
+                plan = resolve_runtime(host, allow_unverified_host=True)
+                self.assertEqual(plan['profile']['id'], 'torch280-rocm64-on-rocm10')
+                self.assertEqual(plan['status'], 'compatible_with_warnings')
+                command = install_commands(plan['profile'], '/venv/bin/python')[1]
+                self.assertIn('--force-reinstall', command)
+                self.assertIn('torch==2.8.0+rocm6.4', command)
+
     def test_fresh_rocm10_install_requires_acknowledgement_and_pins_wheels(self):
         host = amd_host('6.8.0-139-generic')
         host['rocm_version'] = '10.0.0'

@@ -94,7 +94,8 @@ def resolve_runtime(host, profile='auto', allow_unverified_host=False):
         installed_torch = str((host.get('installed_packages') or {}).get('torch') or '')
         if version(host.get('rocm_version')) and version(host.get('rocm_version'))[0] >= 10 and installed_torch.startswith('2.8.0+rocm6.4'):
             profile = 'existing-torch28-rocm64-compat'
-        elif version(host.get('rocm_version')) == (10, 0, 0) and not installed_torch:
+        elif version(host.get('rocm_version')) == (10, 0, 0) and (
+                not installed_torch or re.search(r'\+(?:cu\d+|cpu)(?:\.|$)', installed_torch)):
             profile = 'torch280-rocm64-on-rocm10'
         else:
             profile = 'torch291-rocm72'
