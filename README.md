@@ -91,9 +91,11 @@ in the effective configuration. Combine it with
 
 ### Benchmark storage
 
-Mount a writable data volume at `/mnt/benchmark-scratch` before running the
-suite. For a different mounted volume, set `BENCHMARK_STORAGE_ROOT` to its
-mount point. The runner checks the mount and available space before setting
+The default storage path is `/mnt/benchmark-scratch`. If it is unmounted and
+`/var/lib/docker` is a separate mounted volume, the runner can create a
+dedicated per-user directory there and bind-mount it using noninteractive
+`sudo`. Otherwise, mount a writable data volume there or set
+`BENCHMARK_STORAGE_ROOT` to another existing mount point. The runner checks the mount and available space before setting
 up the GPU environment. It stores temporary files, Hugging Face and pip
 caches, and other application caches on that volume. Existing Hugging Face
 login tokens remain readable from their original location.
@@ -113,10 +115,10 @@ sweep with the large checkpoints. The floor is a preflight check and does
 not reserve space. `--dry-run` can inspect the config without mounting storage.
 Python virtual environments still live in the checkout.
 
-On a host with the data volume mounted at `/var/lib/docker`, bind-mount a
-dedicated benchmark directory from that volume at `/mnt/benchmark-scratch`.
-Keep it separate from Docker's managed directories and configure the bind
-mount to come up after the underlying volume at boot.
+The automatic mount uses `/var/lib/docker/<user>-benchmark-scratch`,
+separate from Docker-managed data. It can be recreated on the next run after
+a reboot. An administrator can also configure it to come up at boot, after
+the underlying Docker volume mounts.
 
 ### Standard LLM inference sweep
 

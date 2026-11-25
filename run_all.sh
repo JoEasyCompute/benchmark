@@ -96,17 +96,53 @@ check_storage_space() {
   fi
 }
 
+mount_default_benchmark_storage() {
+  local target="$BENCHMARK_STORAGE_ROOT"
+  local docker_root=/var/lib/docker source contents
+  [[ "$target" == /mnt/benchmark-scratch && ! -L "$target" ]] || return 1
+  mountpoint -q -- "$docker_root" && sudo -n true 2>/dev/null || return 1
+  check_storage_space "$docker_root" || return 1
+  source="$docker_root/$(id -un)-benchmark-scratch"
+  if sudo -n test -L "$source"; then
+    echo "[STORAGE][ERROR] Scratch source must not be a symlink: $source." >&2
+    return 1
+  fi
+  if ! sudo -n test -e "$source"; then
+    sudo -n install -d -m 0700 -o "$(id -u)" -g "$(id -g)" -- "$source" || return 1
+  fi
+  if ! sudo -n test -d "$source" ||
+     [[ "$(sudo -n stat -c %u -- "$source")" != "$(id -u)" ||
+        "$(sudo -n stat -c %d -- "$source")" != "$(sudo -n stat -c %d -- "$docker_root")" ]]; then
+    echo "[STORAGE][ERROR] Scratch source must be owned by the benchmark user and on the Docker volume." >&2
+    return 1
+  fi
+  if [[ ! -e "$target" ]]; then
+    sudo -n install -d -m 0755 -- "$target" || return 1
+  fi
+  # Never hide files already present under the unmounted destination.
+  if mountpoint -q -- "$target"; then
+    return 0
+  fi
+  if ! contents="$(find "$target" -mindepth 1 -maxdepth 1 -print -quit)" || [[ -n "$contents" ]]; then
+    echo "[STORAGE][ERROR] Refusing to mount over a non-empty or unreadable $target." >&2
+    return 1
+  fi
+  sudo -n mount --bind "$source" "$target" || return 1
+  mountpoint -q -- "$target" || return 1
+  echo "[STORAGE] Mounted $target from $source"
+}
+
 prepare_benchmark_storage() {
-  if ! mountpoint -q -- "$BENCHMARK_STORAGE_ROOT"; then
+  if [[ ! "$BENCHMARK_MIN_FREE_GIB" =~ ^[0-9]+$ ]]; then
+    echo "[STORAGE][ERROR] BENCHMARK_MIN_FREE_GIB must be a non-negative integer." >&2
+    return 1
+  fi
+  if ! mountpoint -q -- "$BENCHMARK_STORAGE_ROOT" && ! mount_default_benchmark_storage; then
     echo "[STORAGE][ERROR] Benchmark storage is not mounted at $BENCHMARK_STORAGE_ROOT." >&2
     echo "[STORAGE][ERROR] Mount a data volume there or set BENCHMARK_STORAGE_ROOT to its mount point." >&2
     return 1
   fi
   BENCHMARK_STORAGE_ROOT="$(cd -- "$BENCHMARK_STORAGE_ROOT" && pwd -P)"
-  if [[ ! "$BENCHMARK_MIN_FREE_GIB" =~ ^[0-9]+$ ]]; then
-    echo "[STORAGE][ERROR] BENCHMARK_MIN_FREE_GIB must be a non-negative integer." >&2
-    return 1
-  fi
   check_storage_space "$BENCHMARK_STORAGE_ROOT" || return 1
   export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/token}"
   export TMPDIR="$BENCHMARK_STORAGE_ROOT/tmp"
