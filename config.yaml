@@ -129,7 +129,4 @@ blender:
   enabled: true
   require_installed: false
   backend: auto
-  scenes:
-    # Provide local .blend scene paths if available
-    # - "/path/to/BMW27.blend"
-    # - "/path/to/classroom.blend"
+  scenes: [BMW27.blend, classroom.blend, barbershop_interior.blend]

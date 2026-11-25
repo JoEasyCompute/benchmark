@@ -202,7 +202,7 @@ def main():
     results = Path(env.get('RESULTS_JSON', str(results_dir / 'bench_results_cuda.json')))
     metrics = Path(env.get('METRICS_JSONL', str(results_dir / 'metrics.jsonl')))
     scenes = json.loads(env.get('BLENDER_SCENES_JSON', env.get('SCENES_JSON', '[]')))
-    if not isinstance(scenes, list) or any(not isinstance(s, str) for s in scenes):
+    if scenes is not None and (not isinstance(scenes, list) or any(not isinstance(s, str) for s in scenes)):
         raise ValueError('Blender scenes must be a JSON list of paths')
     scenes = scenes or ['BMW27.blend', 'classroom.blend']
     binary = env.get('BLENDER_BIN') or shutil.which('blender') or 'blender'

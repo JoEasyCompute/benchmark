@@ -7,3 +7,6 @@ __pycache__/
 results/
 .firecrawl/
 .omx/
+
+/assets/blender/barbershop_interior/
+/assets/blender/.barbershop-*/

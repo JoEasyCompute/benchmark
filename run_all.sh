@@ -313,6 +313,14 @@ if [[ "$BLENDER_ENABLED" == "1" ]]; then
     exit 1
   fi
   export BLENDER_BIN
+  export SCENES_DIR="$BASE_DIR/assets/blender"
+  export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
+  if ! python3 "$BENCH_DIR/blender_assets.py" --scenes-dir "$SCENES_DIR" \
+      --scenes-json "$BLENDER_SCENES_JSON" >>"$BLENDER_LOG" 2>&1; then
+    echo "[ERROR] Blender asset setup failed; inspect $BLENDER_LOG" >&2
+    tail -n 12 "$BLENDER_LOG" >&2
+    exit 1
+  fi
 fi
 LLM_INFER_WARMUP_S=5
 LLM_INFER_DURATION_S=30
@@ -664,10 +672,8 @@ run_and_log_allow_fail "optional_suites" python3 "$BASE_DIR/run_optional_suites.
 # --- 4) Blender Cycles ---
 if [[ "$BLENDER_ENABLED" == "1" ]]; then
   export BENCHMARK_PROFILE="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path benchmark_profile --default '"general"' --format text)"
-  export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"
-  export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
     export RESULTS_JSON="$RUN_DIR/results/blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}.json"

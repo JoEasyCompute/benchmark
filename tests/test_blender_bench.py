@@ -112,6 +112,17 @@ class BlenderBenchmarkTests(unittest.TestCase):
             self.assertEqual(row['status'], 'failed')
             self.assertNotIn('time_s', row)
 
+    def test_null_scenes_use_bundled_defaults(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {'BLENDER_SCENES_JSON': 'null', 'SCENES_DIR': temporary}
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(module, 'run_scene', return_value={'status': 'ok'}) as render:
+                self.assertEqual(module.main(), 0)
+            self.assertEqual([(call.args[1].name, call.args[2]) for call in render.call_args_list],
+                             [('BMW27.blend', 'single'), ('BMW27.blend', 'all'),
+                              ('classroom.blend', 'single'), ('classroom.blend', 'all')])
+
     def test_baseline_emits_single_mode_only(self):
         module = self.module()
         with tempfile.TemporaryDirectory() as temporary:

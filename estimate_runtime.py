@@ -160,7 +160,9 @@ def main():
         blend_min = blend_likely = blend_max = 0.0
         for scene in scenes:
             name = Path(scene).name.lower()
-            if "classroom" in name:
+            if name == "barbershop_interior.blend":
+                low, likely, high = 120.0, 300.0, 600.0
+            elif "classroom" in name:
                 low, likely, high = 70.0, 150.0, 300.0
             else:
                 low, likely, high = 25.0, 60.0, 150.0
