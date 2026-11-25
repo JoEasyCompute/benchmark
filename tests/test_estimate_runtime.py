@@ -17,6 +17,9 @@ class EstimateRuntimeTest(unittest.TestCase):
         config_text = textwrap.dedent(
             """
             repeat: 2
+            gpu_include: [0, 1, 2]
+            pearlhash:
+              enabled: true
             llm_train:
               dtype: bf16
               hidden_size: 1024
@@ -79,6 +82,9 @@ class EstimateRuntimeTest(unittest.TestCase):
             self.assertEqual(suites["llm_infer"]["multi_gpu_mode"], "replicated")
             self.assertEqual(suites["llm_infer"]["combos"], 2)
             self.assertEqual(suites["sd_infer"]["multi_gpu_mode"], "replicated")
+            pearlhash = [section for section in payload["sections"] if section["suite"] == "pearlhash"]
+            self.assertEqual([section["mode"] for section in pearlhash], ["single", "all"])
+            self.assertEqual([section["likely_s"] for section in pearlhash], [1860, 1860])
             self.assertIn("[ESTIMATE] total runtime:", result.stdout)
 
 

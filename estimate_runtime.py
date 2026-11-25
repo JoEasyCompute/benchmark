@@ -160,13 +160,14 @@ def main():
     for job in optional_jobs(cfg):
         suite = job['suite']
         if suite == 'pearlhash':
-            args = job['args']
+            job_args = job['args']
             duration, warmup, startup = (
-                int(args[args.index(f'--{key}') + 1])
+                int(job_args[job_args.index(f'--{key}') + 1])
                 for key in ('duration', 'warmup', 'startup-timeout')
             )
             active = duration + warmup
-            sections.append(dict(suite=suite, min_s=0, likely_s=(active + min(startup, 30))*repeat,
+            mode = job_args[job_args.index('--mode') + 1]
+            sections.append(dict(suite=suite, mode=mode, min_s=0, likely_s=(active + min(startup, 30))*repeat,
                                  max_s=(active + startup + 10)*repeat))
             continue
         if suite == 'llm_serve':
@@ -197,8 +198,11 @@ def main():
         f"(likely ~{fmt_minutes(totals['likely_s'])} min)"
     )
     for section in sections:
+        label = section['suite']
+        if 'mode' in section:
+            label += f" ({section['mode']})"
         print(
-            f"[ESTIMATE] {section['suite']}: {fmt_minutes(section['min_s'])}-"
+            f"[ESTIMATE] {label}: {fmt_minutes(section['min_s'])}-"
             f"{fmt_minutes(section['max_s'])} min (likely ~{fmt_minutes(section['likely_s'])} min)"
         )
 
