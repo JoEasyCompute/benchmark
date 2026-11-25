@@ -1,0 +1,40 @@
+# Inference-only profile for run_all.sh.
+gpu_backend: nvidia
+gpu_include: [0, 1, 2, 3, 4, 5, 6, 7]
+repeat: 3
+results_dir: results
+
+llm_train:
+  enabled: false
+  dtype: bf16
+  hidden_size: 1024
+  n_layers: 12
+  n_heads: 16
+  seq_len: 512
+  batch_size: 4
+  steps: 100
+
+llm_infer:
+  enabled: true
+  backend: vllm
+  model: Qwen/Qwen2.5-72B-Instruct
+  revision: "495f393"
+  dtype: bfloat16
+  prompt_len: 512
+  output_len: 128
+  batch_sizes: [1, 4]
+  tensor_parallel_sizes: [8]
+  vllm_version: "0.34.0"
+  max_model_len: 1024
+  enable_prefix_caching: false
+  sample_vram: true
+
+sd_infer:
+  enabled: false
+  model: stable-diffusion-v1-5/stable-diffusion-v1-5
+  steps: 20
+  sizes: [512]
+  per_gpu_batch: 1
+
+blender:
+  enabled: false

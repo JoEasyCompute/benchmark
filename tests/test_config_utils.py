@@ -48,6 +48,14 @@ class EffectiveConfigTests(unittest.TestCase):
         self.assertEqual(cfg['benchmark_profile'], 'general')
         self.assertEqual(cfg['gpu_include'], [3, 1])
 
+    def test_standard_training_adds_selected_gpu_count_once(self):
+        cfg = self.effective(include=list(range(8)))
+        self.assertEqual(cfg['llm_train']['world_sizes'], [1, 2, 4, 8])
+        cfg = self.effective(include=[3, 1])
+        self.assertEqual(cfg['llm_train']['world_sizes'], [1, 2, 4])
+        cfg = self.effective(smoke=True, include=list(range(8)))
+        self.assertEqual(cfg['llm_train']['world_sizes'], [1])
+
     def test_hardware_resolution_selects_first_detected_card_for_baseline(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'effective.yaml'

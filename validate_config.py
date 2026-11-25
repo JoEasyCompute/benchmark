@@ -38,7 +38,7 @@ def main():
     expect_keys(
         "root",
         cfg,
-        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "vision_infer", "kernel_bench", "llm_serve", "smoke_mode", "benchmark_profile"},
+        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "vision_infer", "kernel_bench", "llm_serve", "pearlhash", "smoke_mode", "benchmark_profile"},
         errors,
     )
     if cfg.get("gpu_backend", "auto") not in {"auto", "nvidia", "amd"}:
@@ -77,7 +77,7 @@ def main():
         expect_keys(
             "llm_train",
             llm_train,
-            {"enabled", "dtype", "world_sizes", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps", "pair_selection"},
+            {"enabled", "dtype", "world_sizes", "include_all_gpus", "hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps", "pair_selection"},
             errors,
         )
         if llm_train.get("dtype") not in {"bf16", "fp16", "fp32"}:
@@ -85,6 +85,8 @@ def main():
         world_sizes = llm_train.get("world_sizes", [1])
         if not isinstance(world_sizes, list) or not world_sizes or not all(is_pos_int(v) for v in world_sizes):
             errors.append("llm_train.world_sizes must be a non-empty list of positive integers")
+        if not isinstance(llm_train.get("include_all_gpus", False), bool):
+            errors.append("llm_train.include_all_gpus must be true or false")
         for key in ("hidden_size", "n_layers", "n_heads", "seq_len", "batch_size", "steps"):
             if not is_pos_int(llm_train.get(key)):
                 errors.append(f"llm_train.{key} must be a positive integer")
@@ -145,7 +147,8 @@ def main():
         expect_keys(
             "llm_infer",
             llm_infer,
-            {"enabled", "backend", "model", "revision", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes", "multi_gpu_mode"},
+            {"enabled", "backend", "model", "revision", "dtype", "prompt_len", "output_len", "batch_sizes", "tensor_parallel_sizes", "multi_gpu_mode",
+             "vllm_version", "max_model_len", "enable_prefix_caching", "sample_vram"},
             errors,
         )
         if llm_infer.get("backend", "transformers") not in {"transformers", "vllm"}:
@@ -159,6 +162,18 @@ def main():
         for key in ("prompt_len", "output_len"):
             if not is_pos_int(llm_infer.get(key)):
                 errors.append(f"llm_infer.{key} must be a positive integer")
+        if "vllm_version" in llm_infer and (
+            not isinstance(llm_infer["vllm_version"], str) or not llm_infer["vllm_version"].strip()
+        ):
+            errors.append("llm_infer.vllm_version must be a non-empty string")
+        if "max_model_len" in llm_infer:
+            lengths = [llm_infer.get(key) for key in ("prompt_len", "output_len")]
+            limit = llm_infer["max_model_len"]
+            if not is_pos_int(limit) or (all(map(is_pos_int, lengths)) and limit < sum(lengths)):
+                errors.append("llm_infer.max_model_len must cover the prompt and output token lengths")
+        for key in ("enable_prefix_caching", "sample_vram"):
+            if key in llm_infer and not isinstance(llm_infer[key], bool):
+                errors.append(f"llm_infer.{key} must be true or false")
         for key in ("batch_sizes", "tensor_parallel_sizes"):
             values = llm_infer.get(key)
             if not isinstance(values, list) or not values or not all(is_pos_int(v) for v in values):

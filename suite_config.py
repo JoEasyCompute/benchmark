@@ -13,6 +13,8 @@ OPTIONAL_DEFAULTS = {
     'kernel_bench': {'enabled': False, 'cases': ['gemm', 'attention', 'memory'],
                      'size': 2048, 'dtype': 'float32', 'iterations': 20, 'warmup': 3,
                      'heads': 8, 'head_dim': 64, 'min_duration_s': 5.0},
+    'pearlhash': {'enabled': False, 'pool': 'prl.kryptex.network:8048',
+                  'duration': 600, 'warmup': 300, 'interval': 10, 'startup_timeout': 120},
     'llm_serve': {'enabled': False, 'provider': 'transformers', 'endpoint': '',
                   'model': '', 'revision': '', 'dtype': 'float16', 'concurrency': [1, 4],
                   'prompt': 'A deterministic benchmark prompt.', 'output_len': 32,
@@ -40,6 +42,15 @@ def validate_optional_suites(cfg):
         values = suite_values(cfg, suite)
         if not isinstance(values['enabled'], bool):
             errors.append(f'{suite}.enabled must be boolean')
+        if suite == 'pearlhash':
+            pool = values['pool']
+            if not isinstance(pool, str) or not pool or any(c.isspace() or c in ';,' for c in pool):
+                errors.append('pearlhash.pool must be a single TLS pool endpoint')
+            for key in ('duration', 'interval', 'startup_timeout', 'warmup'):
+                lower = 0 if key == 'warmup' else 1
+                if type(values[key]) is not int or not lower <= values[key] <= 3600:
+                    errors.append(f'pearlhash.{key} must be an integer between {lower} and 3600')
+            continue
         for key in ('iterations', 'size', 'heads', 'head_dim', 'output_len'):
             if key in values and (type(values[key]) is not int or values[key] <= 0):
                 errors.append(f'{suite}.{key} must be a positive integer')
@@ -104,6 +115,8 @@ def smoke_optional_suites(cfg):
             values.update(batch_sizes=[1], sizes=[values['sizes'][0]], modes=[values['modes'][0]], iterations=2, min_duration_s=0)
         elif suite == 'kernel_bench':
             values.update(size=min(values['size'], 64), iterations=2, min_duration_s=0)
+        elif suite == 'pearlhash':
+            values.update(duration=20, interval=5, startup_timeout=min(values['startup_timeout'], 60))
         else:
             values.update(duration=1, concurrency=[1], output_len=min(values['output_len'], 8))
         cfg[suite] = values
@@ -124,6 +137,14 @@ def optional_jobs(cfg):
         elif suite == 'kernel_bench':
             combinations = [dict(case=case) for case in values['cases']]
             keys = ('size', 'dtype', 'iterations', 'warmup', 'heads', 'head_dim', 'min_duration_s')
+        elif suite == 'pearlhash':
+            selected = cfg.get('gpu_include') or []
+            combinations = [dict(mode='single', backend=cfg.get('gpu_backend', 'auto'),
+                                 physical_gpus=','.join(map(str, selected[:1])))]
+            if len(selected) > 1 and not cfg.get('smoke_mode') and cfg.get('benchmark_profile') != 'single_gpu_baseline':
+                combinations.append(dict(combinations[0], mode='all',
+                                         physical_gpus=','.join(map(str, selected))))
+            keys = ('pool', 'duration', 'warmup', 'interval', 'startup_timeout')
         else:
             combinations = [dict(concurrency=c) for c in values['concurrency']]
             keys = ('provider', 'model', 'revision', 'dtype', 'endpoint', 'prompt',

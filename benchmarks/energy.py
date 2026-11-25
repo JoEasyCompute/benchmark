@@ -103,14 +103,14 @@ def integrate_samples(samples, started, ended, max_gap):
 
 
 class EnergySampler:
-    def __init__(self, backend, device_indices=None, interval_s=0.5):
+    def __init__(self, backend, device_indices=None, interval_s=0.5, *, physical_device_ids=None):
         if interval_s <= 0:
             raise ValueError('Power interval must be positive')
         self.backend, self.interval = backend, interval_s
         self.device_indices = device_indices if device_indices is not None else [0]
-        self.device_ids = ([] if backend == 'amd' else
-                           physical_devices(backend, self.device_indices))
-        self.mapping_verified = backend != 'amd'
+        self.device_ids = (list(map(str, physical_device_ids)) if physical_device_ids is not None
+                           else [] if backend == 'amd' else physical_devices(backend, self.device_indices))
+        self.mapping_verified = backend != 'amd' or physical_device_ids is not None
         self.unavailable_reason = None
         self.samples = []
         self._stop = threading.Event()
@@ -151,7 +151,7 @@ class EnergySampler:
     def start(self):
         if hasattr(self, 'started'):
             raise RuntimeError('EnergySampler is single-use')
-        if self.backend == 'amd':
+        if self.backend == 'amd' and not self.mapping_verified:
             try:
                 buses = hip_pci_devices(self.device_indices)
                 raw = subprocess.check_output(['rocm-smi', '--showbus', '--json'], text=True,

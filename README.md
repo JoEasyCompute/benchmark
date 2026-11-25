@@ -69,7 +69,7 @@ multi-GPU all-reduce. Keep the existing `.venv` until this new environment passe
 those checks. `run_all.sh` records an inventory and runtime plan in every normal run;
 the explicit resolver command is the safe path for changing an environment.
 You can still run `bash env_setup.sh` manually if you want to preinstall dependencies ahead of time.
-Blender is intentionally not installed by `env_setup.sh`; use [install_blender.sh](./install_blender.sh) if you want full-suite host setup.
+For Blender-enabled runs, `run_all.sh` uses [install_blender.sh](./install_blender.sh) to verify or install Blender 5.3.0 before workloads begin.
 If the downloaded Blender binary reports missing desktop/X11 libraries, install
 them through the repository installer with `bash install_blender.sh --install-system-deps`.
 This is explicit because it uses `sudo apt-get` and changes host packages.
@@ -89,6 +89,92 @@ training/inference/SD execution, and records `benchmark_profile: single_gpu_base
 in the effective configuration. Combine it with
 `--smoke` to validate wiring without a full benchmark run.
 
+### Optional Qwen inference profiles
+
+The default suite uses Qwen3-8B. These inference-only profiles use pinned
+checkpoint revisions, 512 input tokens, 128 output tokens, and batch sizes 1 and 4.
+
+| Config | Model | GPU configuration |
+|---|---|---|
+| `configs/infer-qwen25-7b.yaml` | Qwen2.5-7B-Instruct, FP16 Transformers | One replica per selected GPU. Use `--gpus 0` for the single-card reference. |
+| `configs/infer-qwen3-32b.yaml` | Qwen3-32B, BF16 vLLM | Tensor parallelism at 4 and 8 GPUs |
+| `configs/infer-qwen25-72b.yaml` | Qwen2.5-72B-Instruct, BF16 vLLM | Tensor parallelism at 8 GPUs |
+
+```bash
+bash run_all.sh --config configs/infer-qwen25-7b.yaml --gpus 0
+bash run_all.sh --config configs/infer-qwen25-7b.yaml
+```
+
+Use an 8× RTX 4090 rig as the reference for the large profiles and repeat the
+same cases on faster rigs. Start with `--smoke` to check model loading at the first
+configured tensor-parallel size. The full profiles use physical GPU indices 0–7
+by default. Pass `--gpus` to select a different set of eight cards. The 4-GPU
+case uses the first four selected cards.
+
+Both large profiles pin vLLM 0.34.0. For the NVIDIA wheel, use a Linux host
+with a CUDA 13.0-compatible NVIDIA driver (580.65.06 or newer) and Python
+3.11–3.14. If the main suite runs under Python 3.10, put `python3.12` or
+`python3.11` on PATH for the vLLM environment. See the
+[vLLM 0.34.0 release notes](https://github.com/vllm-project/vllm/releases/tag/v0.34.0)
+and [NVIDIA's CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html).
+
+Before workloads start, `run_all.sh` checks the main Python stack against the
+resolved runtime and repairs version drift. For the large profiles, it creates
+or repairs `.venv-vllm-0.34.0` separately, checks the CUDA build and package
+dependencies, and verifies BF16 arithmetic and NCCL communication on the
+selected devices. Pass `VLLM_PYTHON` to use a separately managed interpreter.
+That interpreter is verified in place. Setup leaves system drivers unchanged.
+Use `--dry-run` to inspect the effective config without preparing environments.
+Preflight diagnostics are in `logs/vllm_preflight.log`.
+
+```bash
+bash run_all.sh --config configs/infer-qwen3-32b.yaml --smoke
+bash run_all.sh --config configs/infer-qwen3-32b.yaml
+bash run_all.sh --config configs/infer-qwen25-72b.yaml --smoke
+bash run_all.sh --config configs/infer-qwen25-72b.yaml
+```
+
+The large-model batch size is global across the shards. The profiles disable
+prefix caching, cap the context length at 1,024 tokens, and use vLLM 0.34.0’s automatic KV-cache sizing. Inspect throughput
+and p95 batch latency in the comparison report, sampled peak device-wide VRAM
+by GPU UUID in `results/metrics.jsonl`, and PCIe topology in `meta.json`.
+VRAM samples include other allocations on each device, so use idle GPUs and
+allow headroom for model initialization and KV cache. The smoke profile reduces
+the token lengths and batch size while retaining the first tensor-parallel size.
+
+### PearlHash mining benchmark
+
+The standard suite includes PearlHash and records a skip until the local miner,
+wallet, and GPU mapping are provided. Extract a pinned Linux release of
+[SRBMiner-MULTI](https://github.com/doktor83/SRBMiner-Multi/releases) into a
+versioned directory and use the same release on every machine. The suite records
+the miner version and binary SHA-256.
+
+Use SRBMiner's `--list-devices` to match its IDs to the benchmark's physical GPU
+indices by PCI bus address. Use the same GPU visibility as the benchmark run
+when checking the miner's IDs. This example assumes all eight indices match.
+
+```bash
+export SRBMINER_BIN="/absolute/path/to/SRBMiner-MULTI"
+export PEARL_WALLET="prl1..."
+export PEARL_GPU_MAP="0:0,1:1,2:2,3:3,4:4,5:5,6:6,7:7"
+bash run_all.sh --smoke
+bash run_all.sh
+```
+
+Use the wallet address without a worker suffix. The benchmark appends the
+hostname and connects to Kryptex over TLS. Full runs measure one selected GPU
+and, on multi-GPU configurations, all selected GPUs for 10 minutes each after
+a 5-minute warm-up. With three repeats that adds about 90 minutes plus miner
+startup. Smoke runs measure one GPU for 20 seconds.
+
+Find total and per-GPU hashrate and measured-window share counts in
+`results/metrics.jsonl` under the run directory. Board telemetry adds
+power and hashes per joule when available. Use `pearlhash.enabled: false` in
+your config to omit the workload.
+
+### Optional diagnostic suites
+
 Optional diagnostic suites are configured but disabled by default: `vision_infer`,
 `kernel_bench`, and `llm_serve`. Enable them explicitly after validating their
 runtime dependencies. Serving supports a local Transformers worker or a configured
@@ -101,7 +187,7 @@ Assumptions:
 - Linux benchmark host
 - NVIDIA drivers with `nvidia-smi` or AMD ROCm with `rocm-smi` are already installed
 - Python 3.10, 3.11, or 3.12 is available
-- Blender is a host-level prerequisite for full-suite runs; if it is missing and not required, the Blender benchmark is skipped
+- Blender-enabled runs require Blender 5.3.0 and working Cycles devices. Use `blender.enabled: false` for a run without Blender.
 
 ## Automatic Detection and Sample Configs
 
@@ -570,7 +656,8 @@ What it is not:
 
 Multi-GPU:
 - `run_all.sh` now launches this suite with DDP via `python -m torch.distributed.run` for each configured `llm_train.world_sizes` value
-- Training scaling is controlled by `llm_train.world_sizes` in `config.yaml`
+- Training scaling is controlled by `llm_train.world_sizes`. The standard config
+  also adds the selected GPU count via `llm_train.include_all_gpus`.
 - The root `gpu_include` list constrains which local GPU indices are visible to the run
 - The root `gpu_backend` selects `nvidia`, `amd`, or `auto`
 
@@ -695,9 +782,12 @@ What it does:
 - Compares one GPU vs all GPUs using the configured Blender backend (`CUDA` for NVIDIA, `HIP` for AMD)
 
 Notes:
+- The standard runner matches the selected physical GPUs to Cycles devices by PCI
+  address. Each scene renders once on the first selected GPU and once on all
+  selected GPUs per repeat. A missing Cycles device fails the all-GPU result.
 - Scene selection now comes from `config.yaml` when `blender.scenes` is provided; otherwise it falls back to bundled scenes
 - It writes structured rows directly to `metrics.jsonl` and also keeps a standalone JSON file in the run results directory
-- It is skipped if `blender` is unavailable unless Blender is marked required in config/preflight
+- Preflight verifies Blender 5.3.0 and checks every selected GPU with Cycles before the benchmark begins.
 
 New rendering outputs include `render_time_s` (also stored as `time_s`),
 `end_to_end_time_s` and `startup_load_time_s`. The render timer surrounds Blender's
@@ -894,7 +984,7 @@ Important caveat:
 - `llm_infer.backend` defaults to `transformers` so inference results are comparable across mixed GPU vendors. The default model is currently `Qwen/Qwen3-8B`.
 - `llm_infer.multi_gpu_mode` supports `single` and `replicated`. `replicated` is the default and runs one worker per visible GPU for comparable multi-GPU aggregate throughput.
 - Set the backend to `vllm` only when you intentionally want the vLLM-specific benchmark.
-- `blender.require_installed: true` and/or `preflight.blender_strict: true` turns missing Blender from a warning into a hard preflight error
+- The stand-alone requirements report treats missing Blender as an error when `blender.require_installed` or `preflight.blender_strict` is enabled.
 
 ## Outputs
 
@@ -1035,37 +1125,34 @@ Machine-state inspection:
 System requirements:
 - `check_system_requirements.py` verifies the Linux GPU host assumptions and required binaries such as `nvidia-smi` or `rocm-smi` and `stdbuf`.
 - Missing required host tools are a hard stop before benchmark execution begins.
-- If Blender is enabled and required, a missing `blender` is a hard stop. Optional checks cover Cycles, vision/kernel APIs, serving dependencies and power tooling.
+- For Blender-enabled runs, an installation, version, or Cycles device check failure stops the run. See `logs/blender_preflight.log`.
 - Preflight runs `ldd` on Blender and reports missing shared objects before attempting a render.
 
 ## Blender Install
 
-For hosts that should run the full suite, install a pinned Blender build separately from the Python environment:
+The installer defaults to **Blender 5.3.0** on Linux x86-64. Use it to
+install or upgrade ahead of a benchmark:
 
 ```bash
 bash install_blender.sh
 ```
 
-Defaults:
-- Blender version: `4.5.12` (default; required for AMD RDNA4/R9700-class Cycles support)
-- install root: `~/.local/opt/blender-4.5.12`
-- symlink: `~/.local/bin/blender`
+The installer verifies the [official release checksum](https://mirror.blender.org/release/Blender5.3/)
+and checks the staged executable before switching the launcher in
+`~/.local/bin/blender`. It installs to `~/.local/opt/blender-5.3.0`
+alongside older versions. With `--ensure`, it reuses a working 5.3.0
+executable already on PATH and returns its absolute path.
 
-`run_all.sh` prepends `~/.local/bin` and `~/bin` to `PATH`, and `check_system_requirements.py` also checks those locations directly, so the installed Blender binary is discoverable even in non-login shell sessions.
-
-Example with explicit version:
+On minimal Ubuntu/Debian hosts, install the runtime libraries explicitly:
 
 ```bash
-BLENDER_VERSION=4.5.12 bash install_blender.sh
+bash install_blender.sh --install-system-deps
 ```
 
-The installer downloads Blender from the official archive:
-- `https://download.blender.org/release/Blender4.5/blender-4.5.12-linux-x64.tar.xz`
-
-Recommended practice:
-- use the same Blender version on every benchmark host
-- use Blender 4.4 or newer for AMD RDNA4/Radeon AI PRO R9700/R9700S cards; Blender 4.2 does not list RX 90x0 support
-- set `blender.require_installed: true` once Blender is part of your required comparison suite
+The benchmark calls the installer with `--ensure` and validates the selected
+CUDA or HIP GPUs in Cycles. On NVIDIA, Blender 5.3's CUDA backend requires
+a driver from the 580 series or newer. A failed check stops the run before
+workloads start. Use `blender.enabled: false` for profiles without Blender.
 
 Post-run validation:
 - `validate_run_artifacts.py` checks a completed run folder for missing artifacts, backend mismatches, missing suite rows, failed/skipped rows, and AMD power-metric caveats before you compare runs across vendors.

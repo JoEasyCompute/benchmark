@@ -31,6 +31,36 @@ class BlenderBenchmarkTests(unittest.TestCase):
         self.assertEqual([d.use for d in devices], [True, False])
         self.assertEqual(len(module.select_devices(devices, 'CUDA', 'all')), 2)
 
+    def test_all_mode_matches_exact_selected_pci_devices(self):
+        module = self.module()
+        devices = [SimpleNamespace(type='CUDA', id=f'CUDA_NVIDIA GPU_0000:{bus}:00', use=True)
+                   for bus in ('65', '01', '82')]
+        requested = ['00000000:82:00.0', '00000000:01:00.0']
+        selected = module.select_devices(devices, 'CUDA', 'all', requested)
+        self.assertEqual(selected, [devices[2], devices[1]])
+        self.assertEqual([d.use for d in devices], [False, True, True])
+        self.assertEqual(module.select_devices(devices, 'CUDA', 'single', requested), [devices[2]])
+
+    def test_all_mode_rejects_missing_requested_gpu(self):
+        module = self.module()
+        devices = [SimpleNamespace(type='HIP', id='HIP_AMD GPU_0000:01:00', use=True)]
+        with self.assertRaisesRegex(ValueError, '65:00'):
+            module.select_devices(devices, 'HIP', 'all', ['0000:01:00.0', '0000:65:00.0'])
+
+    def test_preflight_rejects_a_selected_device_with_an_unsupported_driver(self):
+        module = self.module()
+        device = SimpleNamespace(type='CUDA', id='CUDA_GPU_0000:65:00', name='Test GPU',
+                                 use=False, meets_driver_requirement=False)
+        prefs = SimpleNamespace(get_devices_for_type=lambda backend: [device])
+        bpy = SimpleNamespace(context=SimpleNamespace(preferences=SimpleNamespace(
+            addons={'cycles': SimpleNamespace(preferences=prefs)})))
+        with patch.dict('sys.modules', {'bpy': bpy}), \
+             patch.dict(os.environ, {'BLENDER_GPU_BACKEND': 'CUDA',
+                                     'BLENDER_PHYSICAL_GPU_IDS': '2'}), \
+             patch.object(module, 'gpu_inventory', return_value=[('2', '0000:65:00.0')]):
+            with self.assertRaisesRegex(ValueError, 'driver requirement not met'):
+                module.check_cycles()
+
     def test_settings_hash_changes_with_render_work(self):
         module = self.module()
         self.assertNotEqual(module.settings_hash({'samples': 32}),

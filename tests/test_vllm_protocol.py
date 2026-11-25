@@ -1,4 +1,5 @@
 import itertools
+import subprocess
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -33,6 +34,15 @@ class VllmProtocolTest(unittest.TestCase):
         self.assertEqual(row['backend'], 'vllm')
         self.assertEqual(row['generated_tokens'], row['requests'] * 2)
         self.assertIsNone(row['gen_tokens_per_watt'])
+
+    def test_vram_samples_match_ids_and_preserve_maximum(self):
+        output = ['GPU-B, 70\nGPU-A, 50', 'GPU-A, 65\nGPU-B, 60', 'GPU-A, 99']
+        sampler = benchmark.VramSampler(['GPU-A', 'GPU-B'])
+        with patch.object(subprocess, 'check_output', side_effect=output):
+            for _ in output:
+                sampler.sample()
+        self.assertEqual(sampler.peaks, {'GPU-A': 65, 'GPU-B': 70})
+        self.assertEqual(sampler.sample_count, 2)
 
     def test_short_generation_fails(self):
         with self.assertRaises(ValueError):

@@ -159,6 +159,16 @@ def main():
 
     for job in optional_jobs(cfg):
         suite = job['suite']
+        if suite == 'pearlhash':
+            args = job['args']
+            duration, warmup, startup = (
+                int(args[args.index(f'--{key}') + 1])
+                for key in ('duration', 'warmup', 'startup-timeout')
+            )
+            active = duration + warmup
+            sections.append(dict(suite=suite, min_s=0, likely_s=(active + min(startup, 30))*repeat,
+                                 max_s=(active + startup + 10)*repeat))
+            continue
         if suite == 'llm_serve':
             duration = float(job['args'][job['args'].index('--duration') + 1])
             likely = duration + 30

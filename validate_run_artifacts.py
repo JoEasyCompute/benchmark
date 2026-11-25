@@ -58,7 +58,7 @@ def metric_issues(rows, cfg):
         if row.get('suite') in ('llm_train_real', 'vision_infer', 'kernel_bench'):
             if not row.get('correctness_check') and not row.get('correctness_passed'):
                 warnings.append(f'{row.get("suite")} row lacks correctness evidence')
-    for suite in ('llm_train_real', 'vision_infer', 'kernel_bench', 'llm_serve', 'blender'):
+    for suite in ('llm_train_real', 'vision_infer', 'kernel_bench', 'llm_serve', 'blender', 'pearlhash'):
         if (cfg.get(suite) or {}).get('enabled', False) and suite not in present:
             errors.append(f'enabled suite missing from metrics.jsonl: {suite}')
     return errors, warnings

@@ -91,6 +91,14 @@ def write_effective_config(src_path, dst_path, smoke_mode, baseline=False,
         if (cfg.get('llm_train_real') or {}).get('enabled'):
             cfg['llm_train_real']['warmup_steps'] = 1
 
+    if not (smoke_mode or baseline):
+        train = cfg.get("llm_train") or {}
+        gpu_count = len(cfg.get("gpu_include") or [])
+        if train.get("include_all_gpus") and gpu_count:
+            sizes = train.setdefault("world_sizes", [1])
+            if gpu_count not in sizes:
+                sizes.append(gpu_count)
+
     output_path = Path(dst_path)
     output_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 

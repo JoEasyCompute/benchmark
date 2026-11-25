@@ -245,6 +245,22 @@ if ! python3 "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}" >/dev/null; 
   echo "[ERROR] Runtime compatibility blocked; inspect $RUNTIME_PLAN" >&2
   exit 1
 fi
+if ! python3 "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}" --check-installed ||
+   ! python3 -m pip check >"$RUN_DIR/logs/runtime_pip_check.log" 2>&1; then
+  echo "[SETUP] Repairing packages to match the resolved $GPU_BACKEND runtime"
+  repair_flags=(--backend "$GPU_BACKEND" --gpus "$SELECTED_GPU_CSV" --install --venv "$VENV_DIR")
+  if [[ "$ALLOW_UNVERIFIED_HOST" == "1" ]]; then repair_flags+=(--allow-unverified-host); fi
+  if ! python3 "$BASE_DIR/runtime_resolver.py" "${repair_flags[@]}" >"$RUN_DIR/logs/runtime_repair.log" 2>&1; then
+    echo "[ERROR] Runtime repair failed; inspect $RUN_DIR/logs/runtime_repair.log" >&2
+    exit 1
+  fi
+  python3 "$BASE_DIR/inspect_runtime.py" --backend "$GPU_BACKEND" --gpus "$SELECTED_GPU_CSV" --json-out "$HOST_INVENTORY"
+  if ! python3 "$BASE_DIR/runtime_resolver.py" "${resolver_flags[@]}" --check-installed ||
+     ! python3 -m pip check >"$RUN_DIR/logs/runtime_pip_check.log" 2>&1; then
+    echo "[ERROR] Runtime package checks still fail after repair; inspect $RUN_DIR/logs/runtime_repair.log and $RUN_DIR/logs/runtime_pip_check.log" >&2
+    exit 1
+  fi
+fi
 # Host acknowledgement never bypasses the package, device, or arithmetic checks.
 RUNTIME_VALIDATION="$RUN_DIR/runtime_validation.json"
 echo "[RUNTIME] Checking packages and arithmetic on all $VISIBLE_GPU_COUNT selected GPU(s)"
@@ -252,6 +268,47 @@ if ! python3 "$BASE_DIR/verify_runtime.py" --lock "$RUNTIME_PLAN" --distributed 
     --json-out "$RUNTIME_VALIDATION" >"$RUN_DIR/logs/runtime_validation.log" 2>&1; then
   echo "[ERROR] Runtime validation failed; inspect $RUNTIME_VALIDATION and $RUN_DIR/logs/runtime_validation.log" >&2
   exit 1
+fi
+# Check and reconcile the separate pinned vLLM stack before any workload starts.
+LLM_INFER_BACKEND="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.backend --default '"transformers"' --format text)"
+LLM_INFER_PYTHON=python3
+if [[ "$LLM_INFER_BACKEND" == "vllm" ]] && \
+   [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.enabled --default 'true' --format bool-int)" == "1" ]]; then
+  VLLM_VERSION="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.vllm_version --default '""' --format text)"
+  if [[ -n "${VLLM_PYTHON:-}" ]]; then
+    LLM_INFER_PYTHON="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$VLLM_PYTHON")"
+  fi
+  if [[ -n "$VLLM_VERSION" ]]; then
+    VLLM_VENV="$BASE_DIR/.venv-vllm-$VLLM_VERSION"
+    vllm_flags=(--version "$VLLM_VERSION" --venv "$VLLM_VENV" --host-json "$HOST_INVENTORY")
+    if [[ -n "${VLLM_PYTHON:-}" ]]; then
+      vllm_flags+=(--python "$LLM_INFER_PYTHON")
+    else
+      LLM_INFER_PYTHON="$VLLM_VENV/bin/python"
+    fi
+    echo "[RUNTIME] Checking vLLM $VLLM_VERSION against the selected GPUs"
+    if ! python3 "$BASE_DIR/setup_vllm.py" "${vllm_flags[@]}" >"$RUN_DIR/logs/vllm_preflight.log" 2>&1; then
+      echo "[ERROR] vLLM preflight failed; inspect $RUN_DIR/logs/vllm_preflight.log" >&2
+      tail -n 12 "$RUN_DIR/logs/vllm_preflight.log" >&2
+      exit 1
+    fi
+  fi
+fi
+BLENDER_BIN=""
+BLENDER_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.enabled --default 'true' --format bool-int)"
+if [[ "$BLENDER_ENABLED" == "1" ]]; then
+  export BLENDER_GPU_BACKEND
+  export BLENDER_PHYSICAL_GPU_IDS="$SELECTED_GPU_CSV"
+  echo "[RUNTIME] Checking the pinned Blender release and selected Cycles devices"
+  BLENDER_LOG="$RUN_DIR/logs/blender_preflight.log"
+  if ! BLENDER_BIN="$(bash "$BASE_DIR/install_blender.sh" --ensure 2>"$BLENDER_LOG")" ||
+     ! "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
+         --python "$BENCH_DIR/blender_render.py" -- --check-cycles >>"$BLENDER_LOG" 2>&1; then
+    echo "[ERROR] Blender preflight failed; inspect $BLENDER_LOG" >&2
+    tail -n 12 "$BLENDER_LOG" >&2
+    exit 1
+  fi
+  export BLENDER_BIN
 fi
 LLM_INFER_WARMUP_S=5
 LLM_INFER_DURATION_S=30
@@ -310,7 +367,11 @@ except Exception:
 cpu = cmd("lscpu")
 mem = cmd("free -h")
 osrel = cmd("cat /etc/os-release")
-blender_version = cmd("blender --version | head -n1")
+blender_version = None
+if os.environ.get("BLENDER_BIN"):
+    blender_version = subprocess.check_output(
+        [os.environ["BLENDER_BIN"], "--version"], text=True, timeout=30).splitlines()[0]
+gpu_topology = cmd("nvidia-smi topo -m") if backend == "nvidia" else ""
 data = {
     "ts": int(time.time()),
     "platform": platform.platform(),
@@ -321,6 +382,7 @@ data = {
     "visible_device_env": visible_env_var,
     "visible_devices": os.environ.get(visible_env_var),
     "gpu_smi": gpu,
+    "gpu_topology": gpu_topology or None,
     "cpu_lscpu": cpu,
     "mem_free": mem,
     "os_release": osrel,
@@ -541,7 +603,6 @@ fi
 
 # --- 2) LLM Inference ---
 if [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.enabled --default 'true' --format bool-int)" == "1" ]]; then
-LLM_INFER_BACKEND="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer.backend --default '"transformers"' --format text)"
 LLM_INFER_SCRIPT="$BENCH_DIR/llm_infer_hf.py"
 LLM_INFER_LOG_NAME="llm_infer_transformers"
 if [[ "$LLM_INFER_BACKEND" == "vllm" ]]; then
@@ -550,7 +611,7 @@ if [[ "$LLM_INFER_BACKEND" == "vllm" ]]; then
 fi
 for rep in $(seq 1 "$REPEAT_COUNT"); do
   start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
-  run_and_log_allow_fail "${LLM_INFER_LOG_NAME}_r${rep}" python3 "$LLM_INFER_SCRIPT" --config "$RUN_CONFIG_PATH" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
+  run_and_log_allow_fail "${LLM_INFER_LOG_NAME}_r${rep}" "$LLM_INFER_PYTHON" "$LLM_INFER_SCRIPT" --config "$RUN_CONFIG_PATH" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_infer" "$rep" "$REPEAT_COUNT"
 done
 
@@ -591,14 +652,12 @@ fi
 
 run_and_log_allow_fail "optional_suites" python3 "$BASE_DIR/run_optional_suites.py" --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR"
 
-# --- 4) Blender CUDA Bench (if Blender available) ---
-if command -v blender >/dev/null 2>&1; then
+# --- 4) Blender Cycles ---
+if [[ "$BLENDER_ENABLED" == "1" ]]; then
   export BENCHMARK_PROFILE="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path benchmark_profile --default '"general"' --format text)"
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export RESULTS_DIR="$RUN_DIR/results"
   export METRICS_JSONL="$RUN_DIR/results/metrics.jsonl"
-  export BLENDER_GPU_BACKEND
-  export BLENDER_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.enabled --default 'true' --format bool-int)"
   export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
   for rep in $(seq 1 "$REPEAT_COUNT"); do
     start_line="$(jsonl_line_count "$RUN_DIR/results/metrics.jsonl")"
@@ -608,8 +667,6 @@ if command -v blender >/dev/null 2>&1; then
     run_and_log_allow_fail "blender_bench_${BLENDER_GPU_BACKEND,,}_r${rep}" bash "$BENCH_DIR/blender_bench_cuda.sh"
     annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "blender" "$rep" "$REPEAT_COUNT"
   done
-else
-  echo "[SKIP] Blender not found in PATH"
 fi
 
 # --- 5) Consolidate → CSV ---

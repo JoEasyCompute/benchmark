@@ -16,58 +16,95 @@ def settings_hash(settings):
     return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
 
 
-def select_devices(devices, backend, mode):
-    selected = []
-    for device in devices:
-        device.use = device.type == backend and (mode == 'all' or not selected)
-        if device.use:
-            selected.append(device)
+def pci_address(value):
+    # Cycles 4.5 CUDA/HIP IDs omit the PCI function suffix.
+    buses = re.findall(r'[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}', value)
+    return buses[0].lower().lstrip('0') if len(buses) == 1 else None
+
+
+def select_devices(devices, backend, mode, requested_pci=None):
+    selected = [device for device in devices if device.type == backend]
+    if requested_pci is not None:
+        available = selected
+        selected = []
+        requested = requested_pci[:1] if mode == 'single' else requested_pci
+        for pci in requested:
+            bus = pci_address(pci)
+            matches = [device for device in available if bus and pci_address(device.id) == bus]
+            if len(matches) != 1 or matches[0] in selected:
+                raise ValueError(f'Blender {backend} did not enumerate exactly one device at {pci}')
+            selected.append(matches[0])
+    elif mode == 'single':
+        selected = selected[:1]
     if not selected:
         raise ValueError('No available Blender GPU for backend ' + backend)
+    for device in selected:
+        if not getattr(device, 'meets_driver_requirement', True):
+            raise ValueError(f'Blender {backend} driver requirement not met for {device.name}')
+    for device in devices:
+        device.use = device in selected
     return selected
+
+
+def gpu_inventory(backend):
+    if backend == 'HIP':
+        raw = subprocess.check_output(['rocm-smi', '--showbus', '--json'], text=True, timeout=5)
+        return [(card[4:], values['PCI Bus']) for card, values in json.loads(raw).items()
+                if card.startswith('card') and card[4:].isdigit()
+                and isinstance(values, dict) and isinstance(values.get('PCI Bus'), str)]
+    raw = subprocess.check_output(['nvidia-smi', '--query-gpu=index,pci.bus_id',
+                                   '--format=csv,noheader,nounits'], text=True, timeout=5)
+    return [tuple(item.strip() for item in line.split(','))
+            for line in raw.splitlines() if line.count(',') == 1]
 
 
 def telemetry_devices(selected, inventory):
     """Match Cycles PCI identifiers to telemetry IDs, never device-list order."""
     result = []
     for device in selected:
-        buses = re.findall(r'[0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]', device.id)
-        if len(buses) != 1:
-            return None
-        bus = buses[0].lower().lstrip('0')
-        matches = [identifier for identifier, pci in inventory
-                   if pci.lower().lstrip('0') == bus]
+        bus = pci_address(device.id)
+        matches = [identifier for identifier, pci in inventory if bus and pci_address(pci) == bus]
         if len(matches) != 1 or matches[0] in result:
             return None
         result.append(matches[0])
     return result
 
 
-def energy_sampler(selected, backend):
+def energy_sampler(selected, backend, inventory=None):
     if backend not in ('CUDA', 'OPTIX', 'HIP'):
         return None
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from energy import EnergySampler
-        if backend == 'HIP':
-            raw = subprocess.check_output(['rocm-smi', '--showbus', '--json'], text=True, timeout=5)
-            payload = json.loads(raw)
-            inventory = [(card[4:], values['PCI Bus']) for card, values in payload.items()
-                         if card.startswith('card') and card[4:].isdigit()
-                         and isinstance(values, dict) and isinstance(values.get('PCI Bus'), str)]
-        else:
-            raw = subprocess.check_output(['nvidia-smi', '--query-gpu=uuid,pci.bus_id',
-                                           '--format=csv,noheader,nounits'], text=True, timeout=5)
-            inventory = [tuple(item.strip() for item in line.split(','))
-                         for line in raw.splitlines() if line.count(',') == 1]
-        ids = telemetry_devices(selected, inventory)
-        if not ids:
-            return None
-        sampler = EnergySampler('amd' if backend == 'HIP' else 'nvidia')
-        sampler.device_ids = ids
-        return sampler
+        ids = telemetry_devices(selected, gpu_inventory(backend) if inventory is None else inventory)
+        if ids:
+            return EnergySampler('amd' if backend == 'HIP' else 'nvidia', physical_device_ids=ids)
     except (ImportError, OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def configure_devices(bpy, backend, mode):
+    prefs = bpy.context.preferences.addons['cycles'].preferences
+    prefs.compute_device_type = backend
+    devices = prefs.get_devices_for_type(backend)
+    inventory = requested_pci = None
+    if 'BLENDER_PHYSICAL_GPU_IDS' in os.environ:
+        inventory = gpu_inventory(backend)
+        buses = dict(inventory)
+        requested_pci = []
+        for index in os.environ['BLENDER_PHYSICAL_GPU_IDS'].split(','):
+            bus = buses.get(index, '')
+            if not bus or sum(pci_address(pci) == pci_address(bus) for _, pci in inventory) != 1:
+                raise ValueError(f'Cannot resolve PCI address for physical GPU {index}')
+            requested_pci.append(bus)
+    return select_devices(devices, backend, mode, requested_pci), inventory
+
+
+def check_cycles():
+    import bpy
+    backend = os.environ['BLENDER_GPU_BACKEND']
+    selected, _ = configure_devices(bpy, backend, 'all')
+    print(f'Blender {bpy.app.version_string} found {len(selected)} qualified {backend} GPU(s)')
 
 
 def render_in_blender():
@@ -76,10 +113,7 @@ def render_in_blender():
     output = Path(os.environ['BLENDER_TIMING_OUTPUT'])
     try:
         backend = os.environ.get('BLENDER_GPU_BACKEND', 'CUDA')
-        prefs = bpy.context.preferences.addons['cycles'].preferences
-        prefs.compute_device_type = backend
-        prefs.get_devices()
-        selected = select_devices(prefs.devices, backend, os.environ['BLENDER_BENCH_MODE'])
+        selected, inventory = configure_devices(bpy, backend, os.environ['BLENDER_BENCH_MODE'])
         scene = bpy.context.scene
         scene.render.engine = 'CYCLES'
         scene.cycles.device = 'GPU'
@@ -95,7 +129,7 @@ def render_in_blender():
                         seed=scene.cycles.seed, frame=scene.frame_current,
                         max_bounces=scene.cycles.max_bounces,
                         use_persistent_data=scene.render.use_persistent_data)
-        sampler = energy_sampler(selected, backend)
+        sampler = energy_sampler(selected, backend, inventory)
         if sampler:
             sampler.start()
         start = time.perf_counter()
@@ -194,7 +228,9 @@ def main():
 
 
 if __name__ == '__main__':
-    if '--inside-blender' in sys.argv:
+    if '--check-cycles' in sys.argv:
+        check_cycles()
+    elif '--inside-blender' in sys.argv:
         render_in_blender()
     else:
         raise SystemExit(main())

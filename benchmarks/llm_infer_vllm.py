@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+from contextlib import nullcontext
 import importlib
+from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 import shutil
 import statistics
 import subprocess
 import time
+import threading
 import traceback
 from typing import List
 
 import yaml
-from energy import EnergySampler
+from energy import EnergySampler, physical_devices
 from benchmark_protocol import SEED, resolve_revision, text_hash
 
 try:
@@ -157,7 +160,7 @@ def probe_vllm_runtime(backend: str) -> str | None:
         )
 
 
-def write_skip_row(cfg, reason: str, detail: str):
+def write_skip_row(cfg, reason: str, detail: str, **case):
     row = {
         "benchmark_schema_version": 2,
         "suite": "llm_infer",
@@ -168,16 +171,74 @@ def write_skip_row(cfg, reason: str, detail: str):
         "dtype": cfg.get("dtype", "float16"),
         "gpu_name": detect_gpu_name(),
         "detail": detail,
+        **case,
     }
     write_metric(row)
     print(f"[SKIP] {detail}")
 
 
+class VramSampler:
+    """Observe device-wide memory without querying GPUs in the timed generation loop."""
+
+    def __init__(self, device_ids):
+        self.device_ids = device_ids
+        self.peaks = {}
+        self.sample_count = 0
+        self.done = threading.Event()
+        self.worker = threading.Thread(target=self.poll, daemon=True)
+
+    def sample(self):
+        try:
+            raw = subprocess.check_output(
+                ['nvidia-smi', '--query-gpu=uuid,memory.used', '--format=csv,noheader,nounits',
+                 '--id=' + ','.join(self.device_ids)], text=True, stderr=subprocess.DEVNULL, timeout=2)
+            values = {}
+            for line in raw.splitlines():
+                uuid, used = (part.strip() for part in line.split(','))
+                if uuid in values or int(used) < 0:
+                    return
+                values[uuid] = int(used)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return
+        if (len(values) != len(self.device_ids)
+                or (self.peaks and values.keys() != self.peaks.keys())
+                or (all(i.startswith('GPU-') for i in self.device_ids)
+                    and set(self.device_ids) != values.keys())):
+            return
+        for uuid, used in values.items():
+            self.peaks[uuid] = max(self.peaks.get(uuid, 0), used)
+        self.sample_count += 1
+
+    def poll(self):
+        while not self.done.is_set():
+            self.sample()
+            self.done.wait(0.5)
+
+    def __enter__(self):
+        self.worker.start()
+        return self
+
+    def __exit__(self, *args):
+        self.done.set()
+        self.worker.join()
+
+
+def installed_version(package):
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return None
+
+
 def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_tokens: int, requested_prompt_len: int,
-              out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float, revision=None):
-    llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=8192, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
-        tensor_parallel_size=tp, gpu_memory_utilization=gpu_mem_util, trust_remote_code=True, disable_log_stats=True,
-        revision=revision, tokenizer_revision=revision, seed=SEED)
+              out_len: int, warmup_s: int, duration_s: int, gpu_mem_util: float | None, revision=None,
+              max_model_len=8192, enable_prefix_caching=None):
+    cache_options = {} if enable_prefix_caching is None else {'enable_prefix_caching': enable_prefix_caching}
+    if gpu_mem_util is not None:
+        cache_options['gpu_memory_utilization'] = gpu_mem_util
+    llm = LLM(enforce_eager=True, disable_custom_all_reduce=True, max_model_len=max_model_len, model=model, dtype=dtype, # 'auto' | 'half' | 'float16' | 'bfloat16' | 'float' | 'float32'
+        tensor_parallel_size=tp, trust_remote_code=True, disable_log_stats=True,
+        revision=revision, tokenizer_revision=revision, seed=SEED, **cache_options)
     sp = SamplingParams(
         temperature=0.0,
         max_tokens=out_len,
@@ -232,7 +293,7 @@ def run_combo(model: str, dtype: str, tp: int, bs: int, prompt: str, prompt_toke
         "timing_method": "vllm_blocking_generate_v1",
         "multi_gpu_mode": "tensor_parallel" if tp > 1 else "single",
         "gpu_count": tp,
-        "per_gpu_batch_size": bs,
+        "global_batch_size": bs,
         "status": "ok",
         "gpu_backend": detect_backend(),
         "model": model,
@@ -270,7 +331,7 @@ def main():
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--duration", type=int, default=30)
-    ap.add_argument("--gpu-mem", type=float, default=0.95, help="gpu_memory_utilization for vLLM")
+    ap.add_argument("--gpu-mem", type=float, help="Override GPU memory utilization for vLLM")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)["llm_infer"]
@@ -290,16 +351,46 @@ def main():
     out_len = int(cfg.get("output_len", 128))
     batch_sizes: List[int] = list(map(int, cfg.get("batch_sizes", [1,4,16,64])))
     tp_sizes: List[int] = list(map(int, cfg.get("tensor_parallel_sizes", [1])))
+    actual_version = installed_version('vllm')
+    gpu_mem = args.gpu_mem
+    if gpu_mem is None and actual_version != '0.34.0':
+        gpu_mem = 0.95
+    expected_version = cfg.get('vllm_version')
+    if expected_version and expected_version != actual_version:
+        write_skip_row(cfg, 'vllm_version_mismatch',
+                       f'Profile requires vLLM {expected_version}; found {actual_version}')
+        return
+
     revision = resolve_revision(model, cfg.get('revision'))
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, revision=revision)
     prompt, actual_prompt_tokens = make_prompt(tokenizer, prompt_len)
 
+    software = {f'inference_{package}_version': installed_version(package)
+                for package in ('torch', 'transformers')}
     failures = 0
+    visible = os.environ.get('HIP_VISIBLE_DEVICES' if backend == 'amd' else 'CUDA_VISIBLE_DEVICES')
     for tp in tp_sizes:
+        if visible and tp > len(visible.split(',')):
+            write_skip_row(cfg, 'insufficient_gpus', f'Tensor parallel size {tp} exceeds visible GPU count',
+                           tensor_parallel=tp)
+            continue
         for bs in batch_sizes:
             try:
-                row = run_combo(model, dtype, tp, bs, prompt, actual_prompt_tokens, prompt_len, out_len,
-                                args.warmup, args.duration, args.gpu_mem, revision=revision)
+                max_model_len = cfg.get('max_model_len', 8192)
+                prefix_caching = cfg.get('enable_prefix_caching')
+                sampler = None
+                if cfg.get('sample_vram') and backend == 'nvidia':
+                    sampler = VramSampler(physical_devices(backend, list(range(tp))))
+                with sampler if sampler else nullcontext():
+                    row = run_combo(model, dtype, tp, bs, prompt, actual_prompt_tokens, prompt_len,
+                                    out_len, args.warmup, args.duration, gpu_mem,
+                                    revision=revision, max_model_len=max_model_len,
+                                    enable_prefix_caching=prefix_caching)
+                row.update(vllm_version=actual_version, max_model_len=max_model_len,
+                           gpu_memory_utilization=gpu_mem, enable_prefix_caching=prefix_caching, **software)
+                if sampler:
+                    row.update(vram_peak_mib_by_gpu=sampler.peaks, vram_sample_count=sampler.sample_count,
+                               vram_max_gpu_peak_mib=max(sampler.peaks.values(), default=None))
                 write_metric(row)
                 print(json.dumps(row, indent=2))
             except Exception as e:

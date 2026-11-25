@@ -19,6 +19,7 @@ SUMMARY_METRIC_KEYS = {
     "reqs_per_s",
     "generated_tokens",
     "gen_tokens_per_s",
+    "hashrate_hs", "hashes_per_joule", "accepted_shares", "rejected_shares",
     "mean_power_w",
     "gen_tokens_per_watt",
     "energy_j",
@@ -46,6 +47,7 @@ SUMMARY_METRIC_KEYS = {
     "batch_latency_ms_mean",
     "batch_latency_ms_p50",
     "batch_latency_ms_p95",
+    "vram_max_gpu_peak_mib", "vram_sample_count",
     "batch_latency_per_item_proxy_ms_mean",
     "batch_latency_per_item_proxy_ms_p50",
     "batch_latency_per_item_proxy_ms_p95",
@@ -80,7 +82,8 @@ def summarize_rows(rows):
                 (k, json.dumps(v, sort_keys=True))
                 for k, v in row.items()
                 if k not in SUMMARY_METRIC_KEYS and k not in {
-                    "repeat_index", "repeat_count", "power_sampler_available", "power_unavailable_reason"}
+                    "repeat_index", "repeat_count", "power_sampler_available", "power_unavailable_reason",
+                    "per_gpu_hashrate_hs", "vram_peak_mib_by_gpu"}
             )
         )
         groups.setdefault(group_key, []).append(row)

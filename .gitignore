@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-vllm*/
+.venv-vllm*.lock
 results/
 .firecrawl/
 .omx/

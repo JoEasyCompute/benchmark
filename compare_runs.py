@@ -62,6 +62,8 @@ SUITE_KEY_FIELDS = {
         "timing_method",
         "mode",
     ),
+    "pearlhash": ("algorithm", "mode", "pool", "miner_version", "miner_sha256",
+                  "warmup_s", "duration_s", "sample_interval_s"),
     "vision_infer": ("model", "weights", "weights_sha256", "model_revision", "torchvision_version",
                      "preprocessing_sha256", "input_sha256", "input_size", "dtype", "mode",
                      "batch_size", "iterations", "min_duration_s", "seed", "timing_method"),
@@ -79,24 +81,26 @@ SUITE_KEY_FIELDS['blender'] += ('blender_version', 'render_settings_sha256')
 
 SUITE_METRICS = {
     "llm_train": ("tokens_per_sec_mean", "steps_per_sec_mean"),
-    "llm_infer": ("gen_tokens_per_s_mean", "reqs_per_s_mean"),
+    "llm_infer": ("gen_tokens_per_s_mean", "reqs_per_s_mean", "batch_latency_ms_p95_mean"),
     "sd_infer": ("images_per_sec_mean",),
     "blender": ("time_s_mean",),
+    "pearlhash": ("hashrate_hs_mean", "hashes_per_joule_mean"),
     "vision_infer": ("images_per_sec_mean",),
     "kernel_bench": ("throughput_mean",),
     "llm_serve": ("generated_tokens_per_s_mean", "reqs_per_s_mean", "ttft_ms_mean_mean", "latency_ms_p95_mean"),
     "llm_train_real": ("tokens_per_sec_mean", "steps_per_sec_mean"),
 }
-SUITE_CATEGORIES = {'kernel_bench': 'Kernel diagnostics', 'llm_serve': 'Serving and latency'}
+SUITE_CATEGORIES = {'kernel_bench': 'Kernel diagnostics', 'llm_serve': 'Serving and latency',
+                    'pearlhash': 'Mining'}
 
-LOWER_IS_BETTER_METRICS = {"time_s_mean", "ttft_ms_mean_mean", "latency_ms_p95_mean"}
+LOWER_IS_BETTER_METRICS = {"batch_latency_ms_p95_mean", "time_s_mean", "ttft_ms_mean_mean", "latency_ms_p95_mean"}
 THROUGHPUT_METRICS = {
     "tokens_per_sec_mean",
     "steps_per_sec_mean",
     "gen_tokens_per_s_mean",
     "reqs_per_s_mean",
     "images_per_sec_mean",
-    "generated_tokens_per_s_mean", "throughput_mean",
+    "generated_tokens_per_s_mean", "throughput_mean", "hashrate_hs_mean",
 }
 REQUIRED_FILES = ("meta.json", "effective_config.yaml", "metrics_summary.json")
 TIE_EPSILON_PCT = 1.0
@@ -181,6 +185,11 @@ def row_key(row: dict) -> tuple[tuple[str, object], ...]:
         if "per_gpu_batch_size" in row:
             row.setdefault("per_gpu_batch", row["per_gpu_batch_size"])
     fields = suite_key_fields(suite)
+    if suite == "llm_infer" and row.get("backend") == "vllm" and "global_batch_size" in row:
+        fields = tuple(field for field in fields if field != "per_gpu_batch_size")
+        fields += ("global_batch_size", "vllm_version", "max_model_len",
+                   "gpu_memory_utilization", "enable_prefix_caching",
+                   "inference_torch_version", "inference_transformers_version")
     return tuple((field, json.dumps(row[field], sort_keys=True) if isinstance(row[field], (list, dict))
                   else row[field]) for field in fields if field in row)
 
@@ -241,8 +250,9 @@ def build_groups(runs: list[dict], allowed_suites: set[str] | None = None) -> di
                 continue
             row = dict(row)
             row["_run_label"] = run["label"]
-            row["_torch_version"] = run["software_versions"].get("torch")
-            row["_transformers_version"] = run["software_versions"].get("transformers")
+            row["_torch_version"] = row.get("inference_torch_version") or run["software_versions"].get("torch")
+            row["_transformers_version"] = (row.get("inference_transformers_version")
+                                              or run["software_versions"].get("transformers"))
             key = row_key(row)
             entries = groups.setdefault(suite, {}).setdefault(key, {})
             if run["label"] in entries:
@@ -378,6 +388,8 @@ def compare_quality(
         field for row in rows_present
         for field in suite_key_fields(suite)
         if dict(row_key(row)).get(field) in (None, "")
+        and not (field == 'per_gpu_batch_size' and row.get('backend') == 'vllm'
+                 and row.get('global_batch_size') is not None)
     })
     if any(not isinstance(row.get('gpu_count'), int) or row.get('gpu_count', 0) <= 0
            for row in rows_present) and not (suite == 'blender' and all(row.get('mode') == 'single' for row in rows_present)):
@@ -633,7 +645,7 @@ def compute_executive_summary(payload: dict) -> dict:
         saw_partial_only = False
         for group in suite_payload["groups"]:
             counts[group["quality"]] = counts.get(group["quality"], 0) + 1
-            if suite == 'kernel_bench':
+            if suite in ('kernel_bench', 'pearlhash'):
                 continue
             for metric, metric_payload in group["metrics"].items():
                 winner = metric_payload.get("winner")

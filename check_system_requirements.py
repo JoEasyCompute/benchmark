@@ -140,7 +140,7 @@ def main():
     blender_require_installed = bool(blender_cfg.get("require_installed", False))
     blender_strict = bool((cfg.get("preflight", {}) or {}).get("blender_strict", False))
     if blender_enabled:
-        blender_path = find_binary("blender")
+        blender_path = os.environ.get("BLENDER_BIN") or find_binary("blender")
         payload["checks"].append({"binary": "blender", "path": blender_path})
         if not blender_path:
             message = "blender not found on PATH"

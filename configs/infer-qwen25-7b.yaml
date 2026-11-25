@@ -1,0 +1,37 @@
+# Inference-only profile for run_all.sh.
+gpu_backend: auto
+gpu_include: []
+repeat: 3
+results_dir: results
+
+llm_train:
+  enabled: false
+  dtype: bf16
+  hidden_size: 1024
+  n_layers: 12
+  n_heads: 16
+  seq_len: 512
+  batch_size: 4
+  steps: 100
+
+llm_infer:
+  enabled: true
+  backend: transformers
+  model: Qwen/Qwen2.5-7B-Instruct
+  revision: "a09a354"
+  dtype: float16
+  prompt_len: 512
+  output_len: 128
+  batch_sizes: [1, 4]
+  tensor_parallel_sizes: [1]
+  multi_gpu_mode: replicated
+
+sd_infer:
+  enabled: false
+  model: stable-diffusion-v1-5/stable-diffusion-v1-5
+  steps: 20
+  sizes: [512]
+  per_gpu_batch: 1
+
+blender:
+  enabled: false

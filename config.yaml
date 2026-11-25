@@ -12,6 +12,7 @@ llm_train:
   enabled: true
   dtype: bf16          # or fp16; both fine on 4090
   world_sizes: [1, 2, 4]
+  include_all_gpus: true
   hidden_size: 1024
   n_layers: 12
   n_heads: 16
@@ -95,6 +96,14 @@ llm_serve:
   warmup: 1
   timeout: 120
   output_len: 32
+
+pearlhash:
+  enabled: true          # skips without local miner, wallet, and GPU mapping
+  pool: "prl.kryptex.network:8048"
+  warmup: 300
+  duration: 600
+  interval: 10
+  startup_timeout: 120
 
 blender:
   enabled: true

@@ -35,7 +35,7 @@ class ExpandedSmokeTest(unittest.TestCase):
                     '--config', str(config), '--run-dir', str(run)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 rows = [json.loads(line) for line in (run / 'results/metrics.jsonl').read_text().splitlines()]
-                self.assertEqual(len(rows), 5)
+                self.assertEqual(len(rows), 6)
                 self.assertTrue(all(row['status'] == 'skipped' and row['repeat_index'] == 1 for row in rows))
                 subprocess.run([sys.executable, str(ROOT / 'harness.py')], cwd=run,
                                check=True, capture_output=True)
@@ -47,5 +47,5 @@ class ExpandedSmokeTest(unittest.TestCase):
                                      '--out-dir', str(base / 'report')], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads((base / 'report/comparison.json').read_text())
-            self.assertEqual(set(report['suites']), {'vision_infer', 'kernel_bench', 'llm_serve'})
+            self.assertEqual(set(report['suites']), {'vision_infer', 'kernel_bench', 'llm_serve', 'pearlhash'})
             self.assertEqual(report['executive_summary']['suite_decisions'], [])
