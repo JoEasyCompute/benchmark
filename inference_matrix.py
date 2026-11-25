@@ -28,12 +28,15 @@ def inference_cases(cfg, gpu_count):
                       prompt_len=64 if smoke else 512, output_len=32 if smoke else 128,
                       batch_sizes=[1] if smoke else [1, 4])
         if 'tensor_parallel_sizes' in entry:
-            if baseline:
-                continue
             sizes = entry['tensor_parallel_sizes']
+            if baseline:
+                sizes = [size for size in sizes if size == 1]
+            elif smoke:
+                sizes = [size for size in sizes if size <= gpu_count] or sizes
             for size in sizes[:1] if smoke else sizes:
                 cases.append(dict(common, backend='vllm', dtype='bfloat16',
-                                  multi_gpu_mode='tensor_parallel', tensor_parallel_sizes=[size],
+                                  multi_gpu_mode='single' if size == 1 else 'tensor_parallel',
+                                  tensor_parallel_sizes=[size],
                                   vllm_version=VLLM_VERSION, max_model_len=1024,
                                   enable_prefix_caching=False, sample_vram=True))
         else:
@@ -48,11 +51,13 @@ def inference_cases(cfg, gpu_count):
     return cases
 
 
-def matrix_preflight(host_path, log_path):
+def matrix_preflight(host_path, log_path, backend):
+    suffix = '-rocm' if backend == 'amd' else ''
+    venv = ROOT / f'.venv-vllm-{VLLM_VERSION}{suffix}'
     command = [sys.executable, str(ROOT / 'setup_vllm.py'), '--version', VLLM_VERSION,
-               '--venv', str(ROOT / f'.venv-vllm-{VLLM_VERSION}'), '--host-json', str(host_path)]
+               '--venv', str(venv), '--host-json', str(host_path)]
     override = os.environ.get('VLLM_PYTHON')
-    python = str(Path(override).absolute()) if override else str(ROOT / f'.venv-vllm-{VLLM_VERSION}/bin/python')
+    python = str(Path(override).absolute()) if override else str(venv / 'bin/python')
     if override:
         command.extend(['--python', python])
     with log_path.open('w') as log:
@@ -66,13 +71,13 @@ def prepare_runtime(cfg, run_dir):
     gpu_count = len(cfg.get('gpu_include') or [])
     cases = inference_cases(cfg, gpu_count)
     python = None
-    if cfg.get('gpu_backend') == 'nvidia' and any(
+    if cfg.get('gpu_backend') in ('nvidia', 'amd') and any(
         case['backend'] == 'vllm' and case['tensor_parallel_sizes'][0] <= gpu_count for case in cases
     ):
         python = matrix_preflight(run_dir / 'host_inventory.json',
-                                  run_dir / 'logs/inference_matrix_vllm_preflight.log')
+                                  run_dir / 'logs/inference_matrix_vllm_preflight.log', cfg['gpu_backend'])
         if not python:
-            print('[WARN] Large-model vLLM cases will be skipped; see logs/inference_matrix_vllm_preflight.log')
+            print('[WARN] vLLM cases will be skipped; see logs/inference_matrix_vllm_preflight.log')
     (run_dir / 'inference_matrix_runtime.json').write_text(json.dumps({'vllm_python': python}) + '\n')
 
 
@@ -98,9 +103,7 @@ def execute(cfg, run_dir, warmup, duration):
                 common['image_size'] = case['image_size']
             reason = None
             if case['backend'] == 'vllm':
-                if backend != 'nvidia':
-                    reason = 'The pinned vLLM matrix deployment uses CUDA'
-                elif tp > len(selected):
+                if tp > len(selected):
                     reason = f'Tensor parallel size {tp} requires at least {tp} selected GPUs'
                 elif not vllm_python:
                     reason = 'vLLM preflight failed; see logs/inference_matrix_vllm_preflight.log'

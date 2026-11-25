@@ -12,9 +12,9 @@ class InferenceMatrixTest(unittest.TestCase):
     def test_default_matrix_covers_text_vision_and_tensor_parallel(self):
         cfg = load_config(Path(__file__).parents[1] / 'config.yaml')
         cases = inference_cases(cfg, 8)
-        self.assertEqual(len({case['model'] for case in cases}), 8)
+        self.assertEqual(len({case['model'] for case in cases}), 9)
         self.assertEqual([case['tensor_parallel_sizes'][0] for case in cases if case['backend'] == 'vllm'],
-                         [4, 8, 8])
+                         [1, 2, 4, 8, 4, 8, 8])
         self.assertEqual({case.get('image_size') for case in cases if case.get('image_size')}, {224, 448})
         text = [case for case in cases if case['model'] == 'Qwen/Qwen2.5-7B-Instruct']
         self.assertEqual([case['multi_gpu_mode'] for case in text], ['single', 'replicated'])
@@ -25,7 +25,9 @@ class InferenceMatrixTest(unittest.TestCase):
         cases = inference_cases(cfg, 1)
         self.assertTrue(all(case['batch_sizes'] == [1] for case in cases))
         self.assertTrue(all(case['multi_gpu_mode'] == 'single' for case in cases))
-        self.assertFalse(any(case['backend'] == 'vllm' for case in cases))
+        self.assertEqual([(case['model'], case['tensor_parallel_sizes'])
+                          for case in cases if case['backend'] == 'vllm'],
+                         [('Qwen/Qwen3-8B', [1])])
 
     def test_execution_continues_after_gated_and_unsupported_cases(self):
         cfg = dict(gpu_include=[0, 1], gpu_backend='amd', repeat=1, llm_infer_matrix=[
@@ -53,4 +55,18 @@ class InferenceMatrixTest(unittest.TestCase):
         self.assertEqual([row['status'] for row in rows], ['skipped'] * 3 + ['ok'] * 2)
         self.assertEqual(runner.call_count, 2)
         self.assertIn('Hugging Face authorization', rows[0]['detail'])
-        self.assertIn('uses CUDA', rows[2]['detail'])
+        self.assertIn('requires at least 8', rows[2]['detail'])
+
+    def test_standard_vllm_cases_match_on_cuda_and_rocm(self):
+        cfg = load_config(Path(__file__).parents[1] / 'config.yaml')
+        def vllm_cases(backend):
+            return [case for case in inference_cases(dict(cfg, gpu_backend=backend), 8)
+                    if case['backend'] == 'vllm']
+        self.assertEqual(vllm_cases('nvidia'), vllm_cases('amd'))
+        with tempfile.TemporaryDirectory() as folder:
+            run_dir = Path(folder)
+            with patch('inference_matrix.matrix_preflight', return_value='/amd/bin/python') as prepare:
+                prepare_runtime(dict(cfg, gpu_backend='amd', gpu_include=[0, 1]), run_dir)
+            self.assertEqual(prepare.call_args.args[-1], 'amd')
+            self.assertEqual(json.loads((run_dir / 'inference_matrix_runtime.json').read_text()),
+                             {'vllm_python': '/amd/bin/python'})

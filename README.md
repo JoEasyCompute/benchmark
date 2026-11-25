@@ -89,6 +89,35 @@ training/inference/SD execution, and records `benchmark_profile: single_gpu_base
 in the effective configuration. Combine it with
 `--smoke` to validate wiring without a full benchmark run.
 
+### Benchmark storage
+
+Mount a writable data volume at `/mnt/benchmark-scratch` before running the
+suite. For a different mounted volume, set `BENCHMARK_STORAGE_ROOT` to its
+mount point. The runner checks the mount and available space before setting
+up the GPU environment. It stores temporary files, Hugging Face and pip
+caches, and other application caches on that volume. Existing Hugging Face
+login tokens remain readable from their original location.
+
+```bash
+BENCHMARK_STORAGE_ROOT=/mnt/gpu-data bash run_all.sh
+```
+
+Without an override, new runs go under `/mnt/benchmark-scratch/results/`.
+A relative `results_dir` is resolved under the storage mount. An absolute
+`results_dir` explicitly selects a different output location and gets its own
+space check. Historical results in the checkout remain available for reports.
+
+The default free-space floor is 20 GiB. Set `BENCHMARK_MIN_FREE_GIB` to raise
+it for a cold model cache. Allow several hundred GiB for a full eight-GPU
+sweep with the large checkpoints. The floor is a preflight check and does
+not reserve space. `--dry-run` can inspect the config without mounting storage.
+Python virtual environments still live in the checkout.
+
+On a host with the data volume mounted at `/var/lib/docker`, bind-mount a
+dedicated benchmark directory from that volume at `/mnt/benchmark-scratch`.
+Keep it separate from Docker's managed directories and configure the bind
+mount to come up after the underlying volume at boot.
+
 ### Standard LLM inference sweep
 
 `run_all.sh` runs the original Qwen3-8B baseline plus the checkpoints in
@@ -98,13 +127,12 @@ in the effective configuration. Combine it with
 |---|---|
 | Text | Qwen2.5 7B Instruct, Llama 3.1 8B Instruct, Mistral 7B Instruct v0.3, Gemma 2 9B Instruct, and Qwen2.5 Coder 7B Instruct. Each runs on one GPU and with one replica per selected GPU. |
 | Image and text | Qwen2-VL 7B Instruct with one deterministic 224px or 448px image per request, on one GPU and with one replica per selected GPU. |
-| Sharded text | Qwen3 32B on 4 and 8 GPUs, and Qwen2.5 72B Instruct on 8 GPUs, using the pinned NVIDIA vLLM runtime. |
+| vLLM text | Qwen3-8B on 1, 2, 4, and 8 GPUs, Qwen3-32B on 4 and 8 GPUs, and Qwen2.5-72B-Instruct on 8 GPUs. The same matrix applies to CUDA and ROCm. |
 
 Additional cases use batches of 1 and 4 and request 512 text prompt tokens
 and 128 generated tokens. Chat formatting and image tokens are recorded in
-the measured prompt length. Text replica batches are per GPU. Sharded batches
-are global. Smoke runs take the first case per workload, with short prompts
-and batch size 1. The single-GPU baseline excludes the sharded cases.
+the measured prompt length. Text replica batches are per GPU. vLLM batches are global. Smoke runs take the first case per workload, with short prompts
+and batch size 1. The single-GPU baseline keeps Qwen3-8B vLLM at TP=1.
 
 Accept the checkpoint terms on Hugging Face and provide `HF_TOKEN` or log in
 on the benchmark host for gated checkpoints such as Llama and Gemma. A gated
@@ -112,7 +140,7 @@ model without access, a missing GPU count, or a failed vLLM preflight yields a
 skip row and lets the remaining workloads continue. Each successful row carries
 the resolved checkpoint revision. The large-model rows use the same pinned
 vLLM version and tensor-parallel sizes for cross-host comparisons. An
-eight-GPU host schedules 17 additional configurations across the matrix
+eight-GPU host schedules 21 additional configurations across the matrix
 before counting batches and repeats. Inspect the planned workload with
 `bash run_all.sh --dry-run` and find measured or skipped cases in
 `results/metrics.jsonl` inside the run directory. Set `llm_infer_matrix: []`
@@ -147,10 +175,15 @@ with a CUDA 13.0-compatible NVIDIA driver (580.65.06 or newer) and Python
 [vLLM 0.34.0 release notes](https://github.com/vllm-project/vllm/releases/tag/v0.34.0)
 and [NVIDIA's CUDA compatibility guide](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html).
 
+On AMD, vLLM 0.34.0 uses the official `+rocm100` wheel on Linux x86-64 with
+Python 3.12, glibc 2.35 or newer, and a compatible AMD host driver. Its bundled
+ROCm user-space dependencies are installed in `.venv-vllm-0.34.0-rocm`.
+[ROCm installation guide](https://github.com/vllm-project/vllm/blob/v0.34.0/docs/getting_started/installation/gpu.rocm.inc.md)
+
 Before workloads start, `run_all.sh` checks the main Python stack against the
 resolved runtime and repairs version drift. For the large profiles, it creates
-or repairs `.venv-vllm-0.34.0` separately, checks the CUDA build and package
-dependencies, and verifies BF16 arithmetic and NCCL communication on the
+or repairs the vendor-specific vLLM environment, checks the GPU build and package
+dependencies, and verifies BF16 arithmetic and NCCL or RCCL communication on the
 selected devices. Pass `VLLM_PYTHON` to use a separately managed interpreter.
 That interpreter is verified in place. Setup leaves system drivers unchanged.
 Use `--dry-run` to inspect the effective config without preparing environments.
@@ -436,7 +469,7 @@ Copy the exact run folder printed by the runner into `RUN_DIR` below; replace th
 example path rather than choosing a folder solely because it is newest:
 
 ```bash
-RUN_DIR="results/your-smoke-run-id"
+RUN_DIR="/mnt/benchmark-scratch/results/your-smoke-run-id"
 python validate_run_artifacts.py "$RUN_DIR" --expected-backend nvidia
 ```
 
@@ -627,7 +660,7 @@ Important caveat:
 
 1. Reads the selected config, bootstrapping PyYAML when needed, and resolves GPU/backend choices.
 2. Installs/repairs the chosen CUDA/ROCm stack if needed, activates it, and reads `results_dir`.
-3. Creates a unique run directory under `results/` using timestamp, hostname, GPU count, and GPU model.
+3. Creates a unique run directory under the configured storage results directory using timestamp, hostname, GPU count, and GPU model.
 4. Writes an `effective_config.yaml` for the run, applying smoke-mode overrides when requested.
 5. Writes a system snapshot to `meta.json`.
 6. Runs the benchmark scripts in sequence.
@@ -778,8 +811,8 @@ llm_infer:
 For a single-card run, set `gpu_include: [0]`, `repeat: 5` and training
 `world_sizes: [1]`, then run `bash run_all.sh --smoke` followed by `bash run_all.sh`.
 Do not add `--baseline`, which overrides this backend to Transformers. This suite
-requires a working vLLM install for the selected vendor; AMD setup does not provide
-one. It measures offline batching, while the serving suite below measures
+requires a working vLLM install for the selected vendor. The standard matrix
+configures its pinned install automatically. It measures offline batching, while the serving suite below measures
 concurrent clients and streaming arrivals.
 
 ### 3. Stable Diffusion
@@ -1027,7 +1060,7 @@ Important caveat:
 Each `run_all.sh` execution creates a run folder like:
 
 ```text
-results/<timestamp>_<host>_<gpu-tag>/
+/mnt/benchmark-scratch/results/<timestamp>_<host>_<gpu-tag>/
 ```
 
 Typical contents:

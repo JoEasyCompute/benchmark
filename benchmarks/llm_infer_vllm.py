@@ -147,11 +147,11 @@ def dependency_error_message() -> str | None:
     return None
 
 
-def probe_vllm_runtime(backend: str) -> str | None:
+def probe_vllm_runtime(backend: str, release=None) -> str | None:
     if backend != "amd":
         return None
     try:
-        importlib.import_module("vllm._C")
+        importlib.import_module("vllm._rocm_C" if release == "0.34.0" else "vllm._C")
         return None
     except Exception as exc:
         return (
@@ -340,7 +340,9 @@ def main():
     if dep_error is not None:
         write_skip_row(cfg, "dependency_unavailable", dep_error)
         return
-    runtime_error = probe_vllm_runtime(backend)
+    build_version = installed_version('vllm')
+    actual_version = build_version.split('+', 1)[0] if build_version else None
+    runtime_error = probe_vllm_runtime(backend, actual_version)
     if runtime_error is not None:
         write_skip_row(cfg, "unsupported_runtime", runtime_error)
         return
@@ -351,7 +353,6 @@ def main():
     out_len = int(cfg.get("output_len", 128))
     batch_sizes: List[int] = list(map(int, cfg.get("batch_sizes", [1,4,16,64])))
     tp_sizes: List[int] = list(map(int, cfg.get("tensor_parallel_sizes", [1])))
-    actual_version = installed_version('vllm')
     gpu_mem = args.gpu_mem
     if gpu_mem is None and actual_version != '0.34.0':
         gpu_mem = 0.95
@@ -386,7 +387,7 @@ def main():
                                     out_len, args.warmup, args.duration, gpu_mem,
                                     revision=revision, max_model_len=max_model_len,
                                     enable_prefix_caching=prefix_caching)
-                row.update(vllm_version=actual_version, max_model_len=max_model_len,
+                row.update(vllm_version=actual_version, vllm_build_version=build_version, max_model_len=max_model_len,
                            gpu_memory_utilization=gpu_mem, enable_prefix_caching=prefix_caching, **software)
                 if sampler:
                     row.update(vram_peak_mib_by_gpu=sampler.peaks, vram_sample_count=sampler.sample_count,

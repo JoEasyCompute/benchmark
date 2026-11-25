@@ -115,7 +115,7 @@ def main():
 
     for case in inference_cases(cfg, gpu_count):
         tp = case['tensor_parallel_sizes'][0]
-        if case['backend'] == 'vllm' and (cfg.get('gpu_backend') == 'amd' or tp > gpu_count):
+        if case['backend'] == 'vllm' and tp > gpu_count:
             continue
         count = len(case['batch_sizes']) * repeat
         mode = f"{case['model']} {case['multi_gpu_mode']}"

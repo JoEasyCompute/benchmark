@@ -190,8 +190,7 @@ def row_key(row: dict) -> tuple[tuple[str, object], ...]:
     if suite == "llm_infer" and row.get("backend") == "vllm" and "global_batch_size" in row:
         fields = tuple(field for field in fields if field != "per_gpu_batch_size")
         fields += ("global_batch_size", "vllm_version", "max_model_len",
-                   "gpu_memory_utilization", "enable_prefix_caching",
-                   "inference_torch_version", "inference_transformers_version")
+                   "gpu_memory_utilization", "enable_prefix_caching")
     return tuple((field, json.dumps(row[field], sort_keys=True) if isinstance(row[field], (list, dict))
                   else row[field]) for field in fields if field in row)
 

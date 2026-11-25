@@ -69,6 +69,8 @@ llm_infer_matrix:
   - model: Qwen/Qwen2-VL-7B-Instruct
     revision: "eed1309"
     image_sizes: [224, 448]
+  - model: Qwen/Qwen3-8B
+    tensor_parallel_sizes: [1, 2, 4, 8]
   - model: Qwen/Qwen3-32B
     revision: "9216db5"
     tensor_parallel_sizes: [4, 8]

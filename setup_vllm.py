@@ -18,27 +18,39 @@ def check_host(host, release):
         return
     if host.get('system', 'Linux') != 'Linux':
         raise ValueError('The pinned vLLM 0.34.0 profiles require Linux')
-    if host.get('backend', 'nvidia') != 'nvidia':
-        raise ValueError('The pinned vLLM 0.34.0 profiles use the NVIDIA CUDA 13.0 wheel')
+    backend = host.get('backend', 'nvidia')
     gpus = host.get('gpus') or []
     if not gpus:
-        raise ValueError('No selected NVIDIA GPUs were found for vLLM')
+        raise ValueError('No selected GPUs were found for vLLM')
+    if backend == 'amd':
+        if host.get('machine', 'x86_64') != 'x86_64':
+            raise ValueError('The official vLLM ROCm wheel requires x86-64')
+        if (version(host.get('glibc_version')) or (2, 35, 0)) < (2, 35, 0):
+            raise ValueError('The official vLLM ROCm stack requires glibc 2.35 or newer')
+        return
     for gpu in gpus:
         if (version(gpu.get('driver_version')) or ()) < (580, 65, 6):
             raise ValueError(f"GPU {gpu['index']} requires NVIDIA driver 580.65.06 or newer "
                              f"for CUDA 13.0; found {gpu.get('driver_version')}")
 
 
-def packages_ready(python, release):
+def packages_ready(python, release, backend):
     code = '''
 from importlib.metadata import version
 import sys
 installed_vllm = version('vllm')
-if installed_vllm != sys.argv[1]:
-    raise RuntimeError(f'Expected vLLM {sys.argv[1]}, found {installed_vllm}')
+release, backend = sys.argv[1:]
+expected = release + '+rocm100' if backend == 'amd' and release == '0.34.0' else release
+if installed_vllm != expected:
+    raise RuntimeError(f'Expected vLLM {expected}, found {installed_vllm}')
 import torch, transformers, yaml
 from vllm import LLM, SamplingParams
-if sys.argv[1] == '0.34.0':
+if backend == 'amd':
+    if not torch.version.hip:
+        raise RuntimeError('Expected ROCm Torch')
+    if release == '0.34.0':
+        import vllm._rocm_C
+elif release == '0.34.0':
     if torch.__version__.split('+')[0] != '2.14.0':
         raise RuntimeError(f'Expected Torch 2.14.0, found {torch.__version__}')
     if not torch.version.cuda or not torch.version.cuda.startswith('13.'):
@@ -46,7 +58,7 @@ if sys.argv[1] == '0.34.0':
     import vllm._C_stable_libtorch
 '''
     try:
-        for command in ([python, '-c', code, release], [python, '-m', 'pip', 'check']):
+        for command in ([python, '-c', code, release, backend], [python, '-m', 'pip', 'check']):
             if subprocess.run(command, timeout=90).returncode:
                 return False
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -55,27 +67,38 @@ if sys.argv[1] == '0.34.0':
     return True
 
 
-def ensure_packages(target, release, python_override=None):
+def ensure_packages(target, release, python_override=None, backend='nvidia'):
     if python_override:
-        if not packages_ready(python_override, release):
+        if not packages_ready(python_override, release, backend):
             raise ValueError(f'VLLM_PYTHON must provide a working vLLM {release} environment')
         return python_override
 
     python = str(target / 'bin/python')
     if not target.exists():
         creator = sys.executable
-        if release == '0.34.0' and not (3, 11) <= sys.version_info[:2] < (3, 15):
+        if backend == 'amd' and release == '0.34.0':
+            creator = sys.executable if sys.version_info[:2] == (3, 12) else shutil.which('python3.12')
+            if not creator:
+                raise ValueError('Install Python 3.12 to create the pinned vLLM ROCm environment')
+        elif release == '0.34.0' and not (3, 11) <= sys.version_info[:2] < (3, 15):
             creator = shutil.which('python3.12') or shutil.which('python3.11')
             if not creator:
                 raise ValueError('Install Python 3.11 or 3.12 to create the vLLM 0.34.0 environment')
         subprocess.run([creator, '-m', 'venv', str(target)], check=True)
     if not (target / 'pyvenv.cfg').is_file():
         raise ValueError(f'{target} is not a virtual environment')
-    if not packages_ready(python, release):
+    if not packages_ready(python, release, backend):
         print(f'[SETUP] Installing/repairing vLLM {release} in {target}', flush=True)
+        pin = release
+        index = []
+        if backend == 'amd':
+            if release != '0.34.0':
+                raise ValueError('Automatic ROCm setup is available for vLLM 0.34.0')
+            pin += '+rocm100'
+            index = ['--extra-index-url', f'https://wheels.vllm.ai/rocm/{release}/rocm100']
         subprocess.run([python, '-m', 'pip', 'install', '--upgrade', '--force-reinstall',
-                        '--only-binary=vllm', f'vllm=={release}', 'PyYAML'], check=True)
-        if not packages_ready(python, release):
+                        '--only-binary=vllm', *index, f'vllm=={pin}', 'PyYAML'], check=True)
+        if not packages_ready(python, release, backend):
             raise ValueError(f'vLLM {release} package checks still fail after repair')
     return python
 
@@ -118,7 +141,7 @@ def main():
         with lock as handle:
             if handle is not None:
                 fcntl.flock(handle, fcntl.LOCK_EX)
-            python = ensure_packages(args.venv, args.version, args.python)
+            python = ensure_packages(args.venv, args.version, args.python, host.get('backend', 'nvidia'))
             verify_devices(python, host)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         parser.exit(1, f'[vLLM][ERROR] {exc}\n')

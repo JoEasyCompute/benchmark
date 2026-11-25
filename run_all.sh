@@ -34,7 +34,9 @@ Defaults to config.yaml and automatic backend selection when gpu_backend is auto
 --gpus IDS     Select physical GPU indices within any inherited visibility mask.
 --baseline     Use one detected/selected GPU and five repeats.
 --smoke        Reduce enabled workloads and use one repeat.
---dry-run      Print resolved config; do not install the GPU stack or run workloads.
+--dry-run      Print resolved config without preparing storage or running workloads.
+BENCHMARK_STORAGE_ROOT  Mounted storage for results and caches (default /mnt/benchmark-scratch).
+BENCHMARK_MIN_FREE_GIB  Minimum available storage in GiB (default 20).
 --allow-unverified-host  Continue when OS/kernel is outside the published runtime matrix.
 HELP
       exit 0
@@ -83,6 +85,57 @@ if [[ ! -f "$BASE_CONFIG_PATH" ]]; then
   exit 2
 fi
 BASE_CONFIG_PATH="$(cd -- "$(dirname -- "$BASE_CONFIG_PATH")" && pwd)/$(basename -- "$BASE_CONFIG_PATH")"
+
+check_storage_space() {
+  local path="$1" available
+  available="$(LC_ALL=C df -Pk "$path" | awk 'NR == 2 {print $4}')"
+  if ! awk -v free="$available" -v minimum="$BENCHMARK_MIN_FREE_GIB" \
+      'BEGIN {exit !(free ~ /^[0-9]+$/ && free >= minimum * 1024 * 1024)}'; then
+    echo "[STORAGE][ERROR] Need at least ${BENCHMARK_MIN_FREE_GIB} GiB free at $path." >&2
+    return 1
+  fi
+}
+
+prepare_benchmark_storage() {
+  if ! mountpoint -q -- "$BENCHMARK_STORAGE_ROOT"; then
+    echo "[STORAGE][ERROR] Benchmark storage is not mounted at $BENCHMARK_STORAGE_ROOT." >&2
+    echo "[STORAGE][ERROR] Mount a data volume there or set BENCHMARK_STORAGE_ROOT to its mount point." >&2
+    return 1
+  fi
+  BENCHMARK_STORAGE_ROOT="$(cd -- "$BENCHMARK_STORAGE_ROOT" && pwd -P)"
+  if [[ ! "$BENCHMARK_MIN_FREE_GIB" =~ ^[0-9]+$ ]]; then
+    echo "[STORAGE][ERROR] BENCHMARK_MIN_FREE_GIB must be a non-negative integer." >&2
+    return 1
+  fi
+  check_storage_space "$BENCHMARK_STORAGE_ROOT" || return 1
+  export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/token}"
+  export TMPDIR="$BENCHMARK_STORAGE_ROOT/tmp"
+  export HF_HOME="$BENCHMARK_STORAGE_ROOT/huggingface"
+  export HF_HUB_CACHE="$HF_HOME/hub"
+  export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
+  export HF_XET_CACHE="$HF_HOME/xet"
+  export PIP_CACHE_DIR="$BENCHMARK_STORAGE_ROOT/pip"
+  export XDG_CACHE_HOME="$BENCHMARK_STORAGE_ROOT/cache"
+  if ! mkdir -p -m 700 -- "$TMPDIR" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME"; then
+    echo "[STORAGE][ERROR] Cannot prepare cache directories on $BENCHMARK_STORAGE_ROOT." >&2
+    return 1
+  fi
+  local directory probe
+  for directory in "$TMPDIR" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$PIP_CACHE_DIR" "$XDG_CACHE_HOME"; do
+    if ! probe="$(mktemp "$directory/.benchmark-write.XXXXXX")"; then
+      echo "[STORAGE][ERROR] Cannot write to $directory." >&2
+      return 1
+    fi
+    rm -f -- "$probe"
+  done
+  echo "[STORAGE] Using $BENCHMARK_STORAGE_ROOT"
+}
+
+BENCHMARK_STORAGE_ROOT="${BENCHMARK_STORAGE_ROOT:-/mnt/benchmark-scratch}"
+BENCHMARK_MIN_FREE_GIB="${BENCHMARK_MIN_FREE_GIB:-20}"
+if [[ "$DRY_RUN" == "0" ]]; then
+  prepare_benchmark_storage
+fi
 
 python_env_ready() {
   local py_bin="$1" backend="$2"
@@ -150,6 +203,11 @@ MACHINE_STATE_STRICT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_
 # Determine results root from config.yaml (fallback: results)
 RESULTS_ROOT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path results_dir --default '"results"' --format text)"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
+if [[ "$RESULTS_ROOT" != /* ]]; then
+  RESULTS_ROOT="$BENCHMARK_STORAGE_ROOT/$RESULTS_ROOT"
+fi
+mkdir -p -- "$RESULTS_ROOT"
+check_storage_space "$RESULTS_ROOT"
 REPEAT_COUNT="$(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path repeat --default '1' --format text)"
 REPEAT_COUNT="${REPEAT_COUNT:-1}"
 readarray -t GPU_INCLUDE_VALUES < <(python3 "$CONFIG_UTILS" get --config "$EFFECTIVE_CONFIG_TMP" --path gpu_include --default '[]' --format lines)
@@ -223,7 +281,7 @@ GPU_TAG="${GPU_TAG:0:30}"
 
 # Final run id
 RUN_ID="${DATE}_${HOST}_${GPU_TAG}"
-RUN_DIR="$BASE_DIR/${RESULTS_ROOT}/${RUN_ID}"
+RUN_DIR="$RESULTS_ROOT/$RUN_ID"
 mkdir -p "$RUN_DIR"/{logs,results}
 echo "[INFO] Run folder: $RUN_DIR"
 
@@ -280,6 +338,7 @@ if [[ "$LLM_INFER_BACKEND" == "vllm" ]] && \
   fi
   if [[ -n "$VLLM_VERSION" ]]; then
     VLLM_VENV="$BASE_DIR/.venv-vllm-$VLLM_VERSION"
+    if [[ "$GPU_BACKEND" == "amd" ]]; then VLLM_VENV+="-rocm"; fi
     vllm_flags=(--version "$VLLM_VERSION" --venv "$VLLM_VENV" --host-json "$HOST_INVENTORY")
     if [[ -n "${VLLM_PYTHON:-}" ]]; then
       vllm_flags+=(--python "$LLM_INFER_PYTHON")
@@ -342,7 +401,7 @@ fi
 
 # --- System metadata snapshot ---
 meta_file="$RUN_DIR/meta.json"
-python3 - "$GPU_BACKEND" "$GPU_SYSTEM_TOOL" "$VISIBLE_ENV_VAR" "${SELECTED_GPU_CSV:-}" <<'PY' >"$meta_file"
+python3 - "$GPU_BACKEND" "$GPU_SYSTEM_TOOL" "$VISIBLE_ENV_VAR" "${SELECTED_GPU_CSV:-}" "$BENCHMARK_STORAGE_ROOT" <<'PY' >"$meta_file"
 import json, os, subprocess, platform, time
 from importlib.metadata import PackageNotFoundError, version
 import sys
@@ -390,6 +449,7 @@ data = {
     "kernel": platform.release(),
     "python": platform.python_version(),
     "gpu_backend": backend,
+    "benchmark_storage_root": sys.argv[5],
     "selected_gpu_indices": visible_csv.split(',') if visible_csv else [],
     "visible_device_env": visible_env_var,
     "visible_devices": os.environ.get(visible_env_var),

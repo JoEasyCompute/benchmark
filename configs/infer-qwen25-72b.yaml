@@ -1,5 +1,5 @@
 # Inference-only profile for run_all.sh.
-gpu_backend: nvidia
+gpu_backend: auto
 gpu_include: [0, 1, 2, 3, 4, 5, 6, 7]
 repeat: 3
 results_dir: results

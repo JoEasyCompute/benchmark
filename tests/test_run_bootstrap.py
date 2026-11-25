@@ -62,12 +62,16 @@ class BootstrapTest(unittest.TestCase):
             tools.mkdir()
             for name, text in (
                 ('nvidia-smi', '#!/bin/sh\nexit 1\n'),
+                ('mountpoint', '#!/bin/sh\nexit 0\n'),
                 ('rocm-smi', '#!/bin/sh\nprintf \'{"card1":{"Device ID":"0xab"}}\\n\'\n'),
             ):
                 tool = tools / name
                 tool.write_text(text)
                 tool.chmod(0o755)
-            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'])
+            scratch = Path(directory) / 'scratch'
+            scratch.mkdir()
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                       BENCHMARK_STORAGE_ROOT=str(scratch), BENCHMARK_MIN_FREE_GIB='0')
             env.pop('HIP_VISIBLE_DEVICES', None)
             env.pop('CUDA_VISIBLE_DEVICES', None)
             result = subprocess.run(['bash', str(project / 'run_all.sh'), '--baseline'],
@@ -75,6 +79,18 @@ class BootstrapTest(unittest.TestCase):
             self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
             choice = (project / '.venv/setup-choice').read_text().splitlines()
             self.assertEqual(choice, ['amd', str(project / '.venv')])
+            self.assertTrue((scratch / 'tmp').is_dir())
+            self.assertTrue((scratch / 'huggingface/hub').is_dir())
+
+    def test_runner_rejects_missing_storage_before_gpu_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing")
+            env = dict(os.environ, BENCHMARK_STORAGE_ROOT=missing)
+            result = subprocess.run(['bash', str(ROOT / 'run_all.sh')], env=env,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Benchmark storage is not mounted', result.stderr)
+            self.assertFalse(Path(missing).exists())
 
     def test_manual_setup_no_gpu_fails_before_environment_creation(self):
         with tempfile.TemporaryDirectory(prefix='benchmark-setup-') as directory:
