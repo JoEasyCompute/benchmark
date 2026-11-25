@@ -88,12 +88,12 @@ class BlenderBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             scene = pathlib.Path(temporary) / 'quoted "scene.blend'
             scene.write_bytes(b'scene')
-            def process(command, env, check):
+            def process(command, env):
                 pathlib.Path(env['BLENDER_TIMING_OUTPUT']).write_text(json.dumps({
                     'status': 'ok', 'render_time_s': 2.5, 'time_s': 2.5,
                     'startup_load_time_s': 1.0, 'num_gpus': 1}))
-                return SimpleNamespace(returncode=0)
-            with patch.object(module.subprocess, 'run', side_effect=process), \
+                return 0, None
+            with patch.object(module, 'run_renderer', side_effect=process), \
                     patch.object(module.time, 'monotonic', side_effect=[10.0, 14.0]):
                 row = module.run_scene('blender', scene, 'single', {})
             self.assertEqual(row['time_s'], 2.5)
@@ -102,12 +102,30 @@ class BlenderBenchmarkTests(unittest.TestCase):
             self.assertNotIn('warm', row)
             self.assertEqual(json.loads(json.dumps(row))['scene'], scene.name)
 
+    def test_cycles_error_invalidates_successful_process(self):
+        module = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            scene = directory / 'scene.blend'
+            scene.write_bytes(b'scene')
+            blender = directory / 'blender'
+            blender.write_text('''#!/bin/sh
+echo '00:15.457 cycles | ERROR Failed to load 2 image files'
+echo '{"status":"ok","num_gpus":1,"render_time_s":2}' > "$BLENDER_TIMING_OUTPUT"
+''')
+            blender.chmod(0o755)
+            row = module.run_scene(str(blender), scene, 'single', dict(os.environ))
+            self.assertEqual(row['rc'], 0)
+            self.assertEqual(row['status'], 'failed')
+            self.assertIn('Failed to load 2 image files', row['error'])
+            self.assertNotIn('render_time_s', row)
+
     def test_failed_process_never_has_render_time(self):
         module = self.module()
         with tempfile.TemporaryDirectory() as temporary:
             scene = pathlib.Path(temporary) / 'scene.blend'
             scene.write_bytes(b'scene')
-            with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
+            with patch.object(module, 'run_renderer', return_value=(1, None)):
                 row = module.run_scene('blender', scene, 'single', {})
             self.assertEqual(row['status'], 'failed')
             self.assertNotIn('time_s', row)

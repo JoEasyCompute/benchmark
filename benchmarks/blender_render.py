@@ -155,6 +155,19 @@ def render_in_blender():
     output.write_text(json.dumps(row, allow_nan=False))
 
 
+def run_renderer(command, env):
+    """Preserve Blender output and catch render errors that leave exit code zero."""
+    error = None
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors='replace') as process:
+        for line in process.stdout:
+            print(line, end='', flush=True)
+            match = re.search(r'\|\s*ERROR\b\s*(.*)', line)
+            if match and error is None:
+                error = match.group(1).strip() or 'Blender logged an error'
+        return process.wait(), error
+
+
 def run_scene(binary, scene, mode, env):
     row = dict(suite='blender', scene=scene.name, mode=mode,
                backend=env.get('BLENDER_GPU_BACKEND', 'CUDA'),
@@ -174,11 +187,14 @@ def run_scene(binary, scene, mode, env):
                            BLENDER_PROCESS_START=str(time.monotonic()))
         start = float(process_env['BLENDER_PROCESS_START'])
         try:
-            proc = subprocess.run([binary, '-b', str(scene), '--python', str(Path(__file__).resolve()),
-                                   '--', '--inside-blender'], env=process_env, check=False)
-            row.update(end_to_end_time_s=time.monotonic()-start, rc=proc.returncode)
-            if proc.returncode:
-                raise ValueError('Blender process failed with exit code ' + str(proc.returncode))
+            returncode, render_error = run_renderer(
+                [binary, '-b', str(scene), '--python', str(Path(__file__).resolve()),
+                 '--', '--inside-blender'], process_env)
+            row.update(end_to_end_time_s=time.monotonic()-start, rc=returncode)
+            if render_error:
+                raise ValueError(render_error)
+            if returncode:
+                raise ValueError('Blender process failed with exit code ' + str(returncode))
             measurement = json.loads(output.read_text())
             if measurement.get('status') != 'ok':
                 raise ValueError(measurement.get('error', 'Blender render failed'))

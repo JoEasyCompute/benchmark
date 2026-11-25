@@ -131,4 +131,4 @@ blender:
   enabled: true
   require_installed: false
   backend: auto
-  scenes: [BMW27.blend, classroom.blend, barbershop_interior.blend]
+  scenes: [BMW27.blend, classroom.blend, junkshop.blend]

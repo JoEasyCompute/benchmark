@@ -8,5 +8,6 @@ results/
 .firecrawl/
 .omx/
 
+/assets/blender/junkshop/
+/assets/blender/.junkshop-*/
 /assets/blender/barbershop_interior/
-/assets/blender/.barbershop-*/

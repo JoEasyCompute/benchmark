@@ -847,14 +847,18 @@ Notes:
 - The standard runner matches the selected physical GPUs to Cycles devices by PCI
   address. Each scene renders once on the first selected GPU and once on all
   selected GPUs per repeat. A missing Cycles device fails the all-GPU result.
-- The standard config runs BMW27, Classroom, and the Agent 327 Barbershop Interior.
-  The runner downloads and verifies the [Blender Open Data Barbershop archive](https://download.blender.org/release/BlenderBenchmark2.0/scenes/barbershop_interior.tar.bz2)
+- The standard config runs BMW27, Classroom, and the Junkshop.
+  The runner downloads and verifies the [Blender Open Data Junkshop archive](https://download.blender.org/release/BlenderBenchmark2.0/scenes/junkshop.tar.bz2)
   on the first run that selects it, then reuses the files in
-  `assets/blender/barbershop_interior/`. Download errors are recorded in
+  `assets/blender/junkshop/`. Download errors are recorded in
   `logs/blender_preflight.log`. Smoke mode uses the first configured scene. An
   empty or null `blender.scenes` value uses the two bundled scenes.
-- Barbershop uses the archive's scene settings and frame 1. The single-card
+- Junkshop uses the archive's scene settings and frame 1. The single-card
   qualification target is an RTX 4090 with 24 GB VRAM.
+- Junkshop replaces the earlier Barbershop archive, which was missing external
+  textures. Exclude Barbershop results from runs that logged missing textures,
+  even if their result status was `ok`. The runner now rejects renders that
+  log a Blender error even when Blender exits successfully.
 - It writes structured rows directly to `metrics.jsonl` and also keeps a standalone JSON file in the run results directory
 - Preflight verifies Blender 5.3.0 and checks every selected GPU with Cycles before the benchmark begins.
 
