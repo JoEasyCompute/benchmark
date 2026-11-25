@@ -36,11 +36,37 @@ version_matches() {
   printf '%s\n' "$title"
 }
 
+install_optix_system_library() {
+  local driver_version package version status graphics_package
+  command -v nvidia-smi >/dev/null || return 0
+  driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | sort -u)" || return 0
+  [[ "$driver_version" =~ ^[0-9]+([.][0-9]+)+$ ]] || return 0
+  if ldconfig -p 2>/dev/null | grep -F 'libnvoptix.so.1' >/dev/null; then
+    return 0
+  fi
+
+  # Match the running driver and reuse the installed compute package's
+  # naming scheme and Debian version, including server or branch suffixes.
+  while read -r package version status; do
+    [[ "$status" == "installed" ]] || continue
+    case "${version#*:}" in
+      "$driver_version"|"$driver_version"-*|"$driver_version"+*) ;;
+      *) continue ;;
+    esac
+    graphics_package="${package/libnvidia-compute/libnvidia-gl}"
+    echo "[BLENDER] Installing OptiX runtime for NVIDIA driver $driver_version"
+    sudo apt-get install -y --no-install-recommends --no-remove "$graphics_package=$version"
+    return
+  done < <(dpkg-query -W -f='${binary:Package} ${Version} ${db:Status-Status}\n' 'libnvidia-compute*' 2>/dev/null)
+  echo "[BLENDER][WARN] OptiX library missing; no installed NVIDIA compute package matches driver $driver_version." >&2
+}
+
 if [[ "$INSTALL_SYSTEM_DEPS" == "1" ]]; then
   [[ "$(uname -s)" == "Linux" ]] && command -v apt-get >/dev/null && command -v sudo >/dev/null ||
     { echo "[BLENDER][ERROR] --install-system-deps requires Linux, apt-get, and sudo." >&2; exit 1; }
   sudo apt-get update
   sudo apt-get install -y libsm6 libxrender1 libxi6 libxfixes3 libxkbcommon0 libgl1
+  install_optix_system_library
 fi
 
 if [[ "$ENSURE" == "1" ]]; then

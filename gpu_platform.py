@@ -174,9 +174,10 @@ def resolve_config(cfg, backend_override=None, gpu_override=None, environ=None):
     render = resolved.setdefault('blender', {})
     selected_render = render.get('backend', 'auto')
     expected = blender_backend(backend).lower()
-    if selected_render not in ('auto', expected):
-        raise ValueError(f'Blender backend {selected_render} conflicts with selected {backend}; use auto or {expected}')
-    render['backend'] = expected
+    supported = ('auto', 'cuda', 'optix') if backend == 'nvidia' else ('auto', 'hip')
+    if selected_render not in supported:
+        raise ValueError(f'Blender backend {selected_render} conflicts with selected {backend}; use {", ".join(supported)}')
+    render['backend'] = expected if backend == 'amd' else selected_render
     return resolved
 
 

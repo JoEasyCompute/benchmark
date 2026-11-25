@@ -13,7 +13,7 @@ try:
 except ModuleNotFoundError:
     raise SystemExit("[SYSTEM][ERROR] Missing dependency: PyYAML. Run env_setup.sh or activate the project venv.")
 
-from gpu_platform import blender_backend, detect_backend, system_tool
+from gpu_platform import detect_backend, system_tool
 REQUIRED_BINS = ("stdbuf", "tee", "hostname")
 OPTIONAL_BINS = ("lscpu", "free")
 
@@ -148,7 +148,7 @@ def main():
                 payload["errors"].append(f"{message}; Blender benchmark is enabled and required")
             else:
                 payload["warnings"].append(f"{message}; Blender benchmark will be skipped")
-        payload["checks"].append({"blender_backend": blender_backend(backend)})
+        payload["checks"].append({"blender_backend": blender_cfg.get("backend", "auto")})
 
         if blender_path:
             missing_libs = check_shared_libs(blender_path)

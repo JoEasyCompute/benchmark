@@ -33,7 +33,7 @@ class GpuDetectionTest(unittest.TestCase):
             resolved = gpu.resolve_config(original, backend_override='nvidia', gpu_override='1',
                                           environ={'CUDA_VISIBLE_DEVICES': '1,2'})
             self.assertEqual(resolved['gpu_include'], [1])
-            self.assertEqual(resolved['blender']['backend'], 'cuda')
+            self.assertEqual(resolved['blender']['backend'], 'auto')
             with self.assertRaises(ValueError):
                 gpu.resolve_config(original, backend_override='nvidia', gpu_override='0',
                                    environ={'CUDA_VISIBLE_DEVICES': '1,2'})

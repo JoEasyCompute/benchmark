@@ -104,6 +104,8 @@ def check_cycles():
     import bpy
     backend = os.environ['BLENDER_GPU_BACKEND']
     selected, _ = configure_devices(bpy, backend, 'all')
+    if '--require-rtx' in sys.argv and any('RTX' not in d.name.upper().split() for d in selected):
+        raise ValueError('Automatic OptiX requires RTX cards for every selected GPU')
     print(f'Blender {bpy.app.version_string} found {len(selected)} qualified {backend} GPU(s)')
 
 

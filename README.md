@@ -647,7 +647,7 @@ Backend selection comes from `--backend` or `gpu_backend` in the selected config
 What "supported" means in the current codebase:
 - `run_all.sh` selects backend-specific visible-device env vars and host tooling
 - benchmark result rows now include `gpu_backend` so cross-vendor comparisons remain explicit in `metrics.jsonl`, `metrics.csv`, and summaries
-- Blender switches between `CUDA` and `HIP` based on the selected backend
+- Blender auto mode uses OptiX on eligible NVIDIA RTX selections, falls back to CUDA, and uses HIP on AMD
 
 Important caveat:
 - practical support still depends on your installed ROCm/CUDA stack, PyTorch build, vLLM build, Diffusers stack, and Blender build on the target machine
@@ -843,7 +843,7 @@ File: [benchmarks/blender_bench_cuda.sh](./benchmarks/blender_bench_cuda.sh)
 What it does:
 - Runs Blender in background mode against the configured scenes
 - Measures the blocking Blender render operation separately from process and startup/loading time
-- Compares one GPU vs all GPUs using the configured Blender backend (`CUDA` for NVIDIA, `HIP` for AMD)
+- Compares one GPU vs all selected GPUs with a single Cycles backend for every scene and repeat
 
 Notes:
 - The standard runner matches the selected physical GPUs to Cycles devices by PCI
@@ -1224,10 +1224,19 @@ On minimal Ubuntu/Debian hosts, install the runtime libraries explicitly:
 bash install_blender.sh --install-system-deps
 ```
 
-The benchmark calls the installer with `--ensure` and validates the selected
-CUDA or HIP GPUs in Cycles. On NVIDIA, Blender 5.3's CUDA backend requires
-a driver from the 580 series or newer. A failed check stops the run before
-workloads start. Use `blender.enabled: false` for profiles without Blender.
+The benchmark calls the installer with `--ensure` and checks all selected GPU
+PCI addresses in Cycles before timing. With `blender.backend: auto` (the
+default), AMD uses HIP. NVIDIA uses OptiX if Blender qualifies every selected
+GPU and all are RTX cards. If that check fails, the runner checks CUDA instead.
+Blender 5.3's CUDA backend requires a driver from the 580 series or newer.
+
+Set `blender.backend` to `optix` or `cuda` on NVIDIA, or `hip` on AMD, to
+require a specific backend. If that backend fails preflight, the run stops.
+The chosen backend and any fallback are recorded in
+`logs/blender_preflight.log`. On apt-based NVIDIA hosts,
+`bash install_blender.sh --install-system-deps` can install the OptiX library
+matching the running driver. Use `blender.enabled: false` for profiles without
+Blender.
 
 Post-run validation:
 - `validate_run_artifacts.py` checks a completed run folder for missing artifacts, backend mismatches, missing suite rows, failed/skipped rows, and AMD power-metric caveats before you compare runs across vendors.

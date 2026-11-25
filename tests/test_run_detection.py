@@ -50,7 +50,7 @@ class RunDetectionTest(unittest.TestCase):
         config = yaml.safe_load(result.stdout)
         self.assertEqual(config['gpu_backend'], 'nvidia')
         self.assertEqual(config['gpu_include'], [2])
-        self.assertEqual(config['blender']['backend'], 'cuda')
+        self.assertEqual(config['blender']['backend'], 'auto')
 
     def test_mixed_vendor_needs_override_and_override_works(self):
         result = self.run_dry(nvidia='0', amd='1')

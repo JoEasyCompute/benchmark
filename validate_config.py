@@ -249,8 +249,8 @@ def main():
             errors.append("blender.enabled must be true or false")
         if "require_installed" in blender and not isinstance(blender["require_installed"], bool):
             errors.append("blender.require_installed must be true or false")
-        if blender.get("backend", "auto") not in {"auto", "cuda", "hip"}:
-            errors.append("blender.backend must be one of auto, cuda, hip")
+        if blender.get("backend", "auto") not in {"auto", "cuda", "optix", "hip"}:
+            errors.append("blender.backend must be one of auto, cuda, optix, hip")
         scenes = blender.get("scenes", [])
         if scenes is not None and (not isinstance(scenes, list) or not all(isinstance(x, str) for x in scenes)):
             errors.append("blender.scenes must be a list of strings")

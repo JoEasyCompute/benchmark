@@ -400,13 +400,31 @@ if [[ "$BLENDER_ENABLED" == "1" ]]; then
   export BLENDER_PHYSICAL_GPU_IDS="$SELECTED_GPU_CSV"
   echo "[RUNTIME] Checking the pinned Blender release and selected Cycles devices"
   BLENDER_LOG="$RUN_DIR/logs/blender_preflight.log"
+  check_blender_backend() {
+    local backend="$1"
+    shift
+    BLENDER_GPU_BACKEND="$backend" "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
+      --python "$BENCH_DIR/blender_render.py" -- --check-cycles "$@" >>"$BLENDER_LOG" 2>&1
+  }
+
+  select_blender_backend() {
+    if [[ "$GPU_BACKEND" == "nvidia" && "$BLENDER_BACKEND_CFG" == "auto" ]]; then
+      if check_blender_backend OPTIX --require-rtx; then
+        BLENDER_GPU_BACKEND=OPTIX
+        return 0
+      fi
+      echo "[BLENDER] OptiX preflight failed for the selected GPUs. Trying CUDA (details in $BLENDER_LOG)." | tee -a "$BLENDER_LOG"
+    fi
+    check_blender_backend "$BLENDER_GPU_BACKEND"
+  }
+
   if ! BLENDER_BIN="$(bash "$BASE_DIR/install_blender.sh" --ensure 2>"$BLENDER_LOG")" ||
-     ! "$BLENDER_BIN" --background --factory-startup --python-exit-code 1 \
-         --python "$BENCH_DIR/blender_render.py" -- --check-cycles >>"$BLENDER_LOG" 2>&1; then
+     ! select_blender_backend; then
     echo "[ERROR] Blender preflight failed; inspect $BLENDER_LOG" >&2
     tail -n 12 "$BLENDER_LOG" >&2
     exit 1
   fi
+  echo "[BLENDER] Selected Cycles backend: $BLENDER_GPU_BACKEND" | tee -a "$BLENDER_LOG"
   export BLENDER_BIN
   export SCENES_DIR="$BASE_DIR/assets/blender"
   export BLENDER_SCENES_JSON="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.scenes --default '[]' --format json)"
