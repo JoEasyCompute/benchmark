@@ -218,8 +218,16 @@ def write_skip_row(cfg, batch_size: int, tensor_parallel: int, reason: str, deta
     print(f"[SKIP] {detail}")
 
 
-def load_model(model_name: str, dtype_name: str, device: str, revision=None):
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, revision=revision)
+def load_model(model_name: str, dtype_name: str, device: str, revision=None, image_size=0):
+    model_class = AutoModelForCausalLM
+    if image_size:
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(model_name, revision=revision)
+        tokenizer = processor.tokenizer
+        model_class = AutoModelForImageTextToText
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, revision=revision)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -227,7 +235,7 @@ def load_model(model_name: str, dtype_name: str, device: str, revision=None):
     dtype = dtype_for_config(dtype_name)
     if dtype is not None:
         model_kwargs["dtype"] = dtype
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model = model_class.from_pretrained(model_name, **model_kwargs)
     model.to(device)
     model.eval()
     if getattr(model, "generation_config", None) is not None:
@@ -237,7 +245,21 @@ def load_model(model_name: str, dtype_name: str, device: str, revision=None):
         for attr in ("temperature", "top_p", "top_k", "min_p"):
             if hasattr(model.generation_config, attr):
                 setattr(model.generation_config, attr, None)
-    return tokenizer, model
+    return (processor if image_size else tokenizer), model
+
+
+def encode_image_batch(processor, prompt, image_size, batch_size, device, dtype):
+    from PIL import Image, ImageDraw
+
+    image = Image.new('RGB', (image_size, image_size), '#264653')
+    canvas = ImageDraw.Draw(image)
+    canvas.rectangle((0, 0, image_size // 2 - 1, image_size // 2 - 1), fill='#e9c46a')
+    canvas.ellipse((image_size // 2, image_size // 2, image_size - 1, image_size - 1), fill='#2a9d8f')
+    messages = [{'role': 'user', 'content': [{'type': 'image'}, {'type': 'text', 'text': prompt}]}]
+    formatted = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    encoded = processor(text=[formatted] * batch_size, images=[image] * batch_size,
+                        return_tensors='pt', padding=True).to(device, dtype=dtype)
+    return encoded, formatted
 
 
 def run_combo(
@@ -253,6 +275,7 @@ def run_combo(
     device_index: int = 0,
     revision=None,
     measurement_window=None,
+    image_size=0,
 ):
     if torch is None:
         raise RuntimeError("PyTorch is unavailable")
@@ -263,13 +286,21 @@ def run_combo(
     device = f"cuda:{device_index}"
     torch.manual_seed(SEED)
     load_started = time.perf_counter()
-    tokenizer, model = load_model(model_name, dtype_name, device, revision)
+    loader_options = dict(image_size=image_size) if image_size else {}
+    encoder, model = load_model(model_name, dtype_name, device, revision, **loader_options)
     torch.cuda.synchronize()
     load_seconds = time.perf_counter() - load_started
 
-    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-    input_ids = encoded["input_ids"].repeat(batch_size, 1).to(device)
-    attention_mask = encoded["attention_mask"].repeat(batch_size, 1).to(device)
+    if image_size:
+        inputs, prompt = encode_image_batch(encoder, prompt, image_size, batch_size, device, dtype_for_config(dtype_name))
+        tokenizer = encoder.tokenizer
+        prompt_tokens = inputs['input_ids'].shape[1]
+    else:
+        tokenizer = encoder
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        inputs = {key: encoded[key].repeat(batch_size, 1).to(device)
+                  for key in ("input_ids", "attention_mask")}
+    input_ids = inputs['input_ids']
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         pad_id = tokenizer.eos_token_id
@@ -278,8 +309,7 @@ def run_combo(
     def generate_once():
         with torch.no_grad():
             outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                **inputs,
                 **generate_kwargs,
             )
         torch.cuda.synchronize()
@@ -335,6 +365,7 @@ def run_combo(
         "tensor_parallel": 1,
         "batch_size": batch_size,
         "prompt_len": prompt_tokens,
+        **({"image_size": image_size} if image_size else {}),
         "requested_prompt_len": requested_prompt_len,
         "output_len": out_len,
         "warmup_s": warmup_s,
@@ -365,7 +396,7 @@ def run_combo(
 
     del model
     del input_ids
-    del attention_mask
+    del inputs
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     row.update(energy)
@@ -386,6 +417,7 @@ def run_worker(
     device_index: int,
     revision=None,
     measurement_window=None,
+    image_size=0,
 ):
     try:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -402,6 +434,7 @@ def run_worker(
             device_index=device_index,
             revision=revision,
             measurement_window=measurement_window,
+            **({"image_size": image_size} if image_size else {}),
         )
         q.put(row)
     except Exception as exc:
@@ -492,6 +525,8 @@ def aggregate_rows(rows, worker_count: int, batch_size: int, mode: str):
         "workers_ok": len(ok_rows),
         "workers_failed": len(failed_rows),
     }
+    if ref_row.get("image_size"):
+        aggregate["image_size"] = ref_row["image_size"]
     if failed_rows:
         aggregate["error"] = " | ".join(
             f"gpu{row.get('gpu_index', '?')}: {row.get('error', 'unknown error')}" for row in failed_rows
@@ -527,7 +562,9 @@ def main():
     revision = resolve_revision(model_name, cfg.get("revision"))
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, revision=revision)
     user_prompt, _ = make_prompt(tokenizer, prompt_len)
-    prompt = render_chat_prompt(tokenizer, user_prompt)
+    image_size = int(cfg.get("image_size", 0))
+    prompt = user_prompt if image_size else render_chat_prompt(tokenizer, user_prompt)
+    image_options = {"image_size": image_size} if image_size else {}
     actual_prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
 
     for tp in tp_sizes:
@@ -557,6 +594,7 @@ def main():
                         args.warmup,
                         args.duration,
                         revision=revision,
+                        **image_options,
                     )
                     row["multi_gpu_mode"] = actual_mode
                     row["gpu_count"] = 1
@@ -582,6 +620,7 @@ def main():
                                 device_index=device_index,
                                 revision=revision,
                                 measurement_window=measurement_window,
+                                **image_options,
                             ),
                             daemon=True,
                         )

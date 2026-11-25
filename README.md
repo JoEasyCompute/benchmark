@@ -89,9 +89,38 @@ training/inference/SD execution, and records `benchmark_profile: single_gpu_base
 in the effective configuration. Combine it with
 `--smoke` to validate wiring without a full benchmark run.
 
+### Standard LLM inference sweep
+
+`run_all.sh` runs the original Qwen3-8B baseline plus the checkpoints in
+`llm_infer_matrix` in `config.yaml`.
+
+| Workload | Standard cases |
+|---|---|
+| Text | Qwen2.5 7B Instruct, Llama 3.1 8B Instruct, Mistral 7B Instruct v0.3, Gemma 2 9B Instruct, and Qwen2.5 Coder 7B Instruct. Each runs on one GPU and with one replica per selected GPU. |
+| Image and text | Qwen2-VL 7B Instruct with one deterministic 224px or 448px image per request, on one GPU and with one replica per selected GPU. |
+| Sharded text | Qwen3 32B on 4 and 8 GPUs, and Qwen2.5 72B Instruct on 8 GPUs, using the pinned NVIDIA vLLM runtime. |
+
+Additional cases use batches of 1 and 4 and request 512 text prompt tokens
+and 128 generated tokens. Chat formatting and image tokens are recorded in
+the measured prompt length. Text replica batches are per GPU. Sharded batches
+are global. Smoke runs take the first case per workload, with short prompts
+and batch size 1. The single-GPU baseline excludes the sharded cases.
+
+Accept the checkpoint terms on Hugging Face and provide `HF_TOKEN` or log in
+on the benchmark host for gated checkpoints such as Llama and Gemma. A gated
+model without access, a missing GPU count, or a failed vLLM preflight yields a
+skip row and lets the remaining workloads continue. Each successful row carries
+the resolved checkpoint revision. The large-model rows use the same pinned
+vLLM version and tensor-parallel sizes for cross-host comparisons. An
+eight-GPU host schedules 17 additional configurations across the matrix
+before counting batches and repeats. Inspect the planned workload with
+`bash run_all.sh --dry-run` and find measured or skipped cases in
+`results/metrics.jsonl` inside the run directory. Set `llm_infer_matrix: []`
+to run the original inference baseline by itself.
+
 ### Optional Qwen inference profiles
 
-The default suite uses Qwen3-8B. These inference-only profiles use pinned
+These profiles run specific cases from the standard sweep on their own. They use pinned
 checkpoint revisions, 512 input tokens, 128 output tokens, and batch sizes 1 and 4.
 
 | Config | Model | GPU configuration |
@@ -981,7 +1010,7 @@ Main sections:
 
 Important caveat:
 - `llm_train_real` is optional and disabled by default because it adds significant runtime and depends on model availability.
-- `llm_infer.backend` defaults to `transformers` so inference results are comparable across mixed GPU vendors. The default model is currently `Qwen/Qwen3-8B`.
+- `llm_infer.backend` defaults to `transformers` so inference results are comparable across mixed GPU vendors. The reference model is `Qwen/Qwen3-8B`. The standard config also runs the [inference matrix](#standard-llm-inference-sweep).
 - `llm_infer.multi_gpu_mode` supports `single` and `replicated`. `replicated` is the default and runs one worker per visible GPU for comparable multi-GPU aggregate throughput.
 - Set the backend to `vllm` only when you intentionally want the vLLM-specific benchmark.
 - The stand-alone requirements report treats missing Blender as an error when `blender.require_installed` or `preflight.blender_strict` is enabled.

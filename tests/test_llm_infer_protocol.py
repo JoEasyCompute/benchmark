@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 import llm_infer_hf as bench
@@ -60,6 +60,25 @@ class InferenceProtocolTest(unittest.TestCase):
         self.assertGreater(row['time_s'], 0)
         self.assertEqual(calls[-1]['min_new_tokens'], 4)
         self.assertEqual(calls[-1]['pad_token_id'], 0)
+
+    def test_multimodal_batch_passes_one_fixed_image_per_prompt(self):
+        try:
+            import PIL
+        except ImportError:
+            self.skipTest('Pillow is unavailable')
+        processor = Mock()
+        processor.apply_chat_template.return_value = 'formatted'
+        batch = processor.return_value.to.return_value
+        inputs, prompt = bench.encode_image_batch(processor, 'Describe the image', 224, 2,
+                                                  'cuda:0', 'float16')
+        self.assertIs(inputs, batch)
+        self.assertEqual(prompt, 'formatted')
+        self.assertEqual(processor.call_args.kwargs['text'], ['formatted', 'formatted'])
+        images = processor.call_args.kwargs['images']
+        self.assertEqual([image.size for image in images], [(224, 224), (224, 224)])
+        self.assertEqual(images[0].tobytes(), images[1].tobytes())
+        self.assertEqual(processor.apply_chat_template.call_args.args[0][0]['content'][0],
+                         {'type': 'image'})
 
     def test_aggregate_uses_common_window_latest_completion(self):
         rows = [dict(status='ok', time_s=seconds, requests=count,

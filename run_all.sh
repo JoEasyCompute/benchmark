@@ -294,6 +294,10 @@ if [[ "$LLM_INFER_BACKEND" == "vllm" ]] && \
     fi
   fi
 fi
+LLM_INFER_MATRIX="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path llm_infer_matrix --default '[]' --format json)"
+if [[ "$LLM_INFER_MATRIX" != "[]" ]]; then
+  python3 "$BASE_DIR/inference_matrix.py" --prepare-runtime --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR"
+fi
 BLENDER_BIN=""
 BLENDER_ENABLED="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path blender.enabled --default 'true' --format bool-int)"
 if [[ "$BLENDER_ENABLED" == "1" ]]; then
@@ -615,8 +619,13 @@ for rep in $(seq 1 "$REPEAT_COUNT"); do
   annotate_jsonl_rows "$RUN_DIR/results/metrics.jsonl" "$start_line" "llm_infer" "$rep" "$REPEAT_COUNT"
 done
 
-# --- 3) Stable Diffusion Inference ---
 fi
+if [[ "$LLM_INFER_MATRIX" != "[]" ]]; then
+  run_and_log_allow_fail "llm_infer_matrix" python3 "$BASE_DIR/inference_matrix.py" \
+    --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR" --warmup "$LLM_INFER_WARMUP_S" --duration "$LLM_INFER_DURATION_S"
+fi
+
+# --- 3) Stable Diffusion Inference ---
 if [[ "$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.enabled --default 'true' --format bool-int)" == "1" ]]; then
 readarray -t SD_SIZES < <(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.sizes --default '[512]' --format lines)
 SD_MODEL="$(python3 "$CONFIG_UTILS" get --config "$RUN_CONFIG_PATH" --path sd_infer.model --default '"stabilityai/stable-diffusion-2-1"' --format text)"

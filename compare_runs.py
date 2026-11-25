@@ -185,6 +185,8 @@ def row_key(row: dict) -> tuple[tuple[str, object], ...]:
         if "per_gpu_batch_size" in row:
             row.setdefault("per_gpu_batch", row["per_gpu_batch_size"])
     fields = suite_key_fields(suite)
+    if suite == "llm_infer" and "image_size" in row:
+        fields += ("image_size",)
     if suite == "llm_infer" and row.get("backend") == "vllm" and "global_batch_size" in row:
         fields = tuple(field for field in fields if field != "per_gpu_batch_size")
         fields += ("global_batch_size", "vllm_version", "max_model_len",

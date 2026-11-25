@@ -11,6 +11,7 @@ except ModuleNotFoundError:
 
 from gpu_platform import detect_backend, query_gpu_ids
 from suite_config import optional_jobs
+from inference_matrix import inference_cases
 
 
 def visible_gpu_count():
@@ -111,6 +112,19 @@ def main():
     infer_total = {k: combos * repeat * v for k, v in infer_per_combo.items()}
     sections.append({"suite": "llm_infer", "backend": infer_backend, "multi_gpu_mode": infer_multi_gpu_mode, "combos": combos, **infer_total})
     add_range(totals, infer_total["min_s"], infer_total["likely_s"], infer_total["max_s"])
+
+    for case in inference_cases(cfg, gpu_count):
+        tp = case['tensor_parallel_sizes'][0]
+        if case['backend'] == 'vllm' and (cfg.get('gpu_backend') == 'amd' or tp > gpu_count):
+            continue
+        count = len(case['batch_sizes']) * repeat
+        mode = f"{case['model']} {case['multi_gpu_mode']}"
+        if case['backend'] == 'vllm':
+            mode += f" TP={tp}"
+        if case.get('image_size'):
+            mode += f" {case['image_size']}px"
+        sections.append(dict(suite='llm_infer', mode=mode, combos=len(case['batch_sizes']),
+                             min_s=35 * count, likely_s=55 * count, max_s=95 * count))
 
     sd_infer = cfg.get("sd_infer", {})
     sd_mode = (sd_infer.get("multi_gpu_mode", "single") or "single").lower()

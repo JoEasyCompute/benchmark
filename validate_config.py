@@ -38,7 +38,7 @@ def main():
     expect_keys(
         "root",
         cfg,
-        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "sd_infer", "blender", "vision_infer", "kernel_bench", "llm_serve", "pearlhash", "smoke_mode", "benchmark_profile"},
+        {"gpu_backend", "gpu_include", "repeat", "results_dir", "preflight", "llm_train", "llm_train_real", "llm_infer", "llm_infer_matrix", "sd_infer", "blender", "vision_infer", "kernel_bench", "llm_serve", "pearlhash", "smoke_mode", "benchmark_profile"},
         errors,
     )
     if cfg.get("gpu_backend", "auto") not in {"auto", "nvidia", "amd"}:
@@ -178,6 +178,34 @@ def main():
             values = llm_infer.get(key)
             if not isinstance(values, list) or not values or not all(is_pos_int(v) for v in values):
                 errors.append(f"llm_infer.{key} must be a non-empty list of positive integers")
+
+    matrix = cfg.get("llm_infer_matrix", [])
+    if not isinstance(matrix, list):
+        errors.append("llm_infer_matrix must be a list")
+    else:
+        seen = set()
+        for index, entry in enumerate(matrix):
+            label = f"llm_infer_matrix[{index}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label} must be a mapping")
+                continue
+            expect_keys(label, entry, {"model", "revision", "image_sizes", "tensor_parallel_sizes"}, errors)
+            model = entry.get("model")
+            if not isinstance(model, str) or not model.strip() or model in seen:
+                errors.append(f"{label}.model must be a unique non-empty model ID")
+            else:
+                seen.add(model)
+            if not isinstance(entry.get("revision", "main"), str) or not entry.get("revision", "main").strip():
+                errors.append(f"{label}.revision must be a non-empty string")
+            if "image_sizes" in entry and "tensor_parallel_sizes" in entry:
+                errors.append(f"{label} cannot combine image_sizes and tensor_parallel_sizes")
+            for key in ("image_sizes", "tensor_parallel_sizes"):
+                if key in entry:
+                    values = entry[key]
+                    if not isinstance(values, list) or not values or any(not is_pos_int(v) for v in values):
+                        errors.append(f"{label}.{key} must contain positive integers")
+                    elif len(set(values)) != len(values):
+                        errors.append(f"{label}.{key} must not contain duplicates")
 
     sd_infer = cfg.get("sd_infer")
     if not isinstance(sd_infer, dict):
