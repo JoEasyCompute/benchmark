@@ -120,7 +120,7 @@ llm_serve:
   output_len: 32
 
 pearlhash:
-  enabled: true          # skips without local miner, wallet, and GPU mapping
+  enabled: true          # downloads SRBMiner and maps selected GPUs by PCI address
   pool: "prl.kryptex.network:8048"
   warmup: 300
   duration: 600

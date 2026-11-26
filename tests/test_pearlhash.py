@@ -1,6 +1,6 @@
 import unittest
 
-from benchmarks.pearlhash import read_sample, summarize
+from benchmarks.pearlhash import map_pci_devices, read_sample, summarize
 from suite_config import optional_jobs, smoke_optional_suites, validate_optional_suites
 
 
@@ -13,6 +13,16 @@ class PearlHashTest(unittest.TestCase):
         cfg['smoke_mode'] = True
         smoke_optional_suites(cfg)
         self.assertEqual(len(optional_jobs(cfg)), 1)
+
+    def test_maps_miner_ids_by_pci_not_listing_order(self):
+        listing = ("\x1b[32mGPU7\x1b[0m [CUDA][1] [0000:26:00.0] : NVIDIA GPU\n"
+                   "GPU3 [CUDA][0] [0000:01:00.0] : NVIDIA GPU\n")
+        inventory = {0: "00000000:01:00.0", 1: "00000000:26:00.0"}
+        self.assertEqual(map_pci_devices(listing, inventory, [1, 0]), [7, 3])
+        with self.assertRaises(ValueError):
+            map_pci_devices(listing + "GPU8 [CUDA][2] [0000:26:00.0] : NVIDIA GPU\n", inventory, [1])
+        with self.assertRaises(ValueError):
+            map_pci_devices(listing, inventory, [2])
 
     def test_selects_only_pearlhash_and_reports_per_gpu_rates(self):
         payload = {'algorithms': [

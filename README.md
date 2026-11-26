@@ -208,29 +208,25 @@ the token lengths and batch size while retaining the first tensor-parallel size.
 
 ### PearlHash mining benchmark
 
-The standard suite includes PearlHash and records a skip until the local miner,
-wallet, and GPU mapping are provided. Extract a pinned Linux release of
-[SRBMiner-MULTI](https://github.com/doktor83/SRBMiner-Multi/releases) into a
-versioned directory and use the same release on every machine. The suite records
-the miner version and binary SHA-256.
+The standard suite includes PearlHash. Each run downloads the latest official
+Linux release of [SRBMiner-MULTI](https://github.com/doktor83/SRBMiner-Multi/releases),
+verifies the archive SHA-256 against GitHub release metadata, and uses that
+same release for every mode and repeat. Result rows record the release tag
+for automatic downloads, the miner-reported version, and the binary SHA-256.
+For comparisons across runs, set `SRBMINER_BIN` to a pinned executable.
 
-Use SRBMiner's `--list-devices` to match its IDs to the benchmark's physical GPU
-indices by PCI bus address. Use the same GPU visibility as the benchmark run
-when checking the miner's IDs. This example assumes all eight indices match.
+The default Pearl wallet is
+`prl1p7zz6lr8ydjdsznwagr5xf08ry4z23rpzmqmalzrg4pkjrcm8xl2s5jegp4`.
+Set `PEARL_WALLET` to override it. Supply only the address. The benchmark
+appends the hostname as the pool worker suffix and connects to Kryptex over
+TLS.
 
-```bash
-export SRBMINER_BIN="/absolute/path/to/SRBMiner-MULTI"
-export PEARL_WALLET="prl1..."
-export PEARL_GPU_MAP="0:0,1:1,2:2,3:3,4:4,5:5,6:6,7:7"
-bash run_all.sh --smoke
-bash run_all.sh
-```
-
-Use the wallet address without a worker suffix. The benchmark appends the
-hostname and connects to Kryptex over TLS. Full runs measure one selected GPU
-and, on multi-GPU configurations, all selected GPUs for 10 minutes each after
-a 5-minute warm-up. With three repeats that adds about 90 minutes plus miner
-startup. Smoke runs measure one GPU for 20 seconds.
+The runner matches SRBMiner IDs to all selected physical GPUs by PCI address.
+Set `PEARL_GPU_MAP` to explicit `physical:miner` pairs only if needed.
+Full runs measure the first selected GPU, then all selected GPUs on multi-GPU
+hosts, for 10 minutes each after a 5-minute warmup. With three repeats on a
+multi-GPU host, this adds about 90 minutes plus miner startup. Smoke runs
+measure one GPU for 20 seconds.
 
 Find total and per-GPU hashrate and measured-window share counts in
 `results/metrics.jsonl` under the run directory. Board telemetry adds
