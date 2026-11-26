@@ -39,15 +39,15 @@ def sha256_file(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def resolve_miner(metrics_path):
+def resolve_miner(metrics_path, miner_cache=None):
     override = os.environ.get('SRBMINER_BIN')
     if override:
         return Path(override).expanduser().resolve(strict=True), None
 
     # Optional jobs run sequentially. Keep one release for both modes and all
     # repeats of this benchmark run, even if upstream publishes a new release.
-    directory = Path(metrics_path).resolve().parent
-    cache = directory / '.srbminer'
+    cache = Path(miner_cache).resolve() if miner_cache else Path(metrics_path).resolve().parent / '.srbminer'
+    directory = cache.parent
     if not cache.exists():
         with urlopen(f'https://api.github.com/repos/{RELEASE_REPO}/releases/latest', timeout=20) as response:
             release = json.load(response)
@@ -130,9 +130,13 @@ def resolve_miner_ids(binary, backend, physical_ids):
         # benchmark logs do not suppress the GPU/PCI records.
         command = [str(binary), '--list-devices', '--disable-cpu', *miner_gpu_flags(backend)]
         with tempfile.TemporaryDirectory(prefix='pearlhash-devices-') as directory:
-            listing = subprocess.check_output(['script', '-qec', shlex.join(command), '/dev/null'],
-                                              cwd=directory, stdin=subprocess.DEVNULL,
-                                              text=True, timeout=20)
+            probe = subprocess.run(['script', '-qec', shlex.join(command), '/dev/null'],
+                                   cwd=directory, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, timeout=20)
+        if probe.returncode:
+            detail = ANSI_ESCAPE.sub('', probe.stdout).strip()[-1000:]
+            raise RuntimeError(f'SRBMiner device listing exited {probe.returncode}: {detail}')
+        listing = probe.stdout
         return map_pci_devices(listing, physical_pci_inventory(backend), physical_ids)
     if not re.fullmatch(r'[0-9]+:[0-9]+(?:,[0-9]+:[0-9]+)*', mapping):
         raise ValueError('PEARL_GPU_MAP must contain physical:miner ID pairs')
@@ -241,7 +245,7 @@ def run(args, row):
         return
     wallet = os.environ.get('PEARL_WALLET') or DEFAULT_WALLET
     physical_ids = [int(value) for value in args.physical_gpus.split(',')]
-    binary, release = resolve_miner(args.metrics_path)
+    binary, release = resolve_miner(args.metrics_path, args.miner_cache)
     row['miner_sha256'] = sha256_file(binary)
     if release:
         row['miner_release'] = release
@@ -283,6 +287,7 @@ def main():
     for key in ('pool', 'mode', 'backend', 'metrics-path'):
         parser.add_argument(f'--{key}', required=True)
     parser.add_argument('--physical-gpus', default='')
+    parser.add_argument('--miner-cache')
     args = parser.parse_args()
     if args.warmup < 0 or min(args.duration, args.interval, args.startup_timeout) < 1:
         parser.error('Invalid timing settings')

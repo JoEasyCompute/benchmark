@@ -538,7 +538,13 @@ run_and_log () {
   local name="$1"; shift
   local logfile="$RUN_DIR/logs/${name}.log"
   echo "[RUN] $name → $logfile"
-  ( set -o pipefail; (cd "$RUN_DIR" && stdbuf -oL -eL "$@") 2>&1 | tee "$logfile" )
+  local -a buffering=(stdbuf -oL -eL)
+  # The optional Python runner uses -u. Its child workloads must run
+  # without the stdbuf library injected by LD_PRELOAD.
+  if [[ "$name" == optional_suites ]]; then
+    buffering=()
+  fi
+  ( set -o pipefail; (cd "$RUN_DIR" && "${buffering[@]}" "$@") 2>&1 | tee "$logfile" )
 }
 
 RUN_FAILURE_COUNT=0
@@ -781,7 +787,7 @@ done
 
 fi
 
-run_and_log_allow_fail "optional_suites" python3 "$BASE_DIR/run_optional_suites.py" --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR"
+run_and_log_allow_fail "optional_suites" python3 -u "$BASE_DIR/run_optional_suites.py" --config "$RUN_CONFIG_PATH" --run-dir "$RUN_DIR"
 
 # --- 4) Blender Cycles ---
 if [[ "$BLENDER_ENABLED" == "1" ]]; then

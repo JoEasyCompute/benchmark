@@ -34,8 +34,10 @@ def execute_jobs(cfg, run_dir, runner=subprocess.run):
             print(f'[RUN] {name}', flush=True)
             with tempfile.TemporaryDirectory(prefix='benchmark-metrics-') as directory:
                 metrics = Path(directory) / 'metrics.jsonl'
-                command = [sys.executable, str(ROOT / 'benchmarks' / job['script']),
-                           *job['args'], '--metrics-path', str(metrics)]
+                command = [sys.executable, str(ROOT / 'benchmarks' / job['script']), *job['args']]
+                if job['suite'] == 'pearlhash':
+                    command.extend(['--miner-cache', str(run_dir / '.srbminer')])
+                command.extend(['--metrics-path', str(metrics)])
                 rows = []
                 with (run_dir / 'logs' / f'{name}.log').open('w') as log:
                     result = runner(command, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT, check=False)
